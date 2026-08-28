@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import selectors
 import subprocess
 import time
 from pathlib import Path
@@ -24,16 +25,31 @@ USBGPU_BUILD_RETRY_INTERVAL = 2.0
 
 def build_usbgpu_model(spinner: Spinner) -> bool:
   """Build the optional big model without making the normal build depend on it."""
-  from openpilot.selfdrive.modeld.big_model import active_model_path
+  from openpilot.selfdrive.modeld.big_model import active_manifest, active_model_path, model_cache_dir
+  from openpilot.selfdrive.modeld.big_model_status import write_big_model_status
   from openpilot.selfdrive.modeld.helpers import modeld_pkl_path, usbgpu_pcie_not_ready, usbgpu_present
   from openpilot.system.hardware.usbgpu import check_usbgpu
 
-  if not usbgpu_present() or active_model_path() is None:
+  model_path = active_model_path()
+  manifest = active_manifest()
+  if model_path is None or manifest is None:
+    return False
+
+  status_values = {
+    "model_id": manifest.model_id,
+    "sha256": manifest.sha256,
+    "downloaded_bytes": manifest.size,
+    "total_bytes": manifest.size,
+  }
+  if not usbgpu_present():
+    write_big_model_status(model_cache_dir(), "waiting_for_ignition",
+                           detail="turn ignition on, then restart to compile", **status_values)
     return False
 
   pkl_path = Path(modeld_pkl_path(usbgpu=True))
   manifest_path = Path(get_manifest_path(pkl_path))
   if manifest_path.is_file():
+    write_big_model_status(model_cache_dir(), "compiled", **status_values)
     return True
 
   readiness_error = check_usbgpu(timeout=10.0)
@@ -41,6 +57,7 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
     message = f"USB eGPU not ready for optional model compilation: {readiness_error}"
     print(message)
     spinner.update(message)
+    write_big_model_status(model_cache_dir(), "waiting_for_ignition", detail=readiness_error, **status_values)
     return False
 
   env = os.environ.copy()
@@ -48,27 +65,46 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
   env['PYTHONUNBUFFERED'] = '1'
   target = os.path.relpath(manifest_path, BASEDIR)
   all_output: list[bytes] = []
+  compile_started_at = time.time()
   for attempt in range(1, USBGPU_BUILD_ATTEMPTS + 1):
     # Never delete generated PKL artifacts here. A compiled model must survive
     # transient eGPU/hub failures and subsequent boot attempts. Model versions
     # use SHA-derived names, and compile_modeld overwrites its raw working PKL
     # when an incomplete build is retried.
-    spinner.update("Compiling optional USB eGPU big model")
+    spinner.update("Happy Birthday eGPU model\nCompiling · 00:00 · keep ignition on")
+    write_big_model_status(model_cache_dir(), "compiling", started_at=compile_started_at,
+                           detail=f"compile attempt {attempt}/{USBGPU_BUILD_ATTEMPTS}", **status_values)
     process = subprocess.Popen(["scons", "-j1", "--cache-populate", target], cwd=BASEDIR, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert process.stdout is not None
     output: list[bytes] = []
-    for line in iter(process.stdout.readline, b''):
-      line = line.rstrip()
-      if line:
-        output.append(line)
-        line_text = line.decode('utf8', 'replace')
-        print(line_text)
-        spinner.update(line_text)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    last_heartbeat = 0.0
+    last_status_heartbeat = 0.0
+    while process.poll() is None:
+      for _key, _events in selector.select(timeout=1.0):
+        line = process.stdout.readline().rstrip()
+        if line:
+          output.append(line)
+          print(line.decode('utf8', 'replace'))
+      now = time.time()
+      if now - last_heartbeat >= 1.0:
+        elapsed = max(0, int(now - compile_started_at))
+        elapsed_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        spinner.update(f"Happy Birthday eGPU model\nCompiling · {elapsed_text} · keep ignition on")
+        last_heartbeat = now
+      if now - last_status_heartbeat >= 10.0:
+        write_big_model_status(model_cache_dir(), "compiling", started_at=compile_started_at,
+                               detail=f"compile attempt {attempt}/{USBGPU_BUILD_ATTEMPTS}", **status_values)
+        last_status_heartbeat = now
     process.wait()
+    selector.close()
+    output.extend(line.rstrip() for line in process.stdout.readlines() if line.rstrip())
     all_output.extend(output)
 
     if process.returncode == 0 and manifest_path.is_file():
+      write_big_model_status(model_cache_dir(), "compiled", **status_values)
       return True
 
     error_text = b"\n".join(output).decode('utf8', 'replace')
@@ -84,6 +120,7 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
   add_file_handler(cloudlog)
   cloudlog.error("optional USB eGPU model build failed\n" + b"\n".join(all_output).decode('utf8', 'replace'))
   spinner.update("USB eGPU model unavailable; using the internal model")
+  write_big_model_status(model_cache_dir(), "error", detail="compile failed; using internal model", **status_values)
   return False
 
 def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
