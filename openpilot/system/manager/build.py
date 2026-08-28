@@ -24,6 +24,8 @@ USBGPU_BUILD_RETRY_INTERVAL = 2.0
 USBGPU_READINESS_ATTEMPTS = 3
 USBGPU_READINESS_RETRY_INTERVAL = 2.0
 USBGPU_TRANSIENT_READINESS_ERRORS = {"12V / PCIe not ready", "USB link errors"}
+USBGPU_ENUMERATION_WAIT_SECONDS = 20.0
+USBGPU_ENUMERATION_POLL_INTERVAL = 1.0
 
 
 def build_usbgpu_model(spinner: Spinner) -> bool:
@@ -44,7 +46,21 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
     "downloaded_bytes": manifest.size,
     "total_bytes": manifest.size,
   }
-  if not usbgpu_present():
+  present = usbgpu_present()
+  if not present:
+    wait_started = time.monotonic()
+    write_big_model_status(model_cache_dir(), "waiting_for_ignition",
+                           detail="waiting for eGPU USB re-enumeration", **status_values)
+    while time.monotonic() - wait_started < USBGPU_ENUMERATION_WAIT_SECONDS:
+      elapsed = int(time.monotonic() - wait_started)
+      spinner.update(f"Happy Birthday eGPU model\nWaiting for USB · {elapsed:02d}s")
+      time.sleep(USBGPU_ENUMERATION_POLL_INTERVAL)
+      present = usbgpu_present()
+      if present:
+        print(f"USB eGPU returned after {time.monotonic() - wait_started:.1f}s; continuing optional model compilation")
+        break
+
+  if not present:
     write_big_model_status(model_cache_dir(), "waiting_for_ignition",
                            detail="turn ignition on, then restart to compile", **status_values)
     return False
