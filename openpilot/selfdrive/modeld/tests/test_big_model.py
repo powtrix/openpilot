@@ -202,7 +202,7 @@ def test_web_surface_is_hidden_without_egpu_history_and_restart_is_gated():
   assert '"UsbGpuEverPresent"' in source
   assert 'payload.get("engaged")' in source
   assert 'await asyncio.to_thread(usbgpu_present)' in source
-  assert 'await asyncio.to_thread(check_usbgpu, timeout=10.0, require_clean_link=False)' in source
+  assert 'await asyncio.to_thread(check_usbgpu, timeout=30.0, require_clean_link=False)' in source
   assert 'params.put_bool("DoReboot", True)' in source
 
 

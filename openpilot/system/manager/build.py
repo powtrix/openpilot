@@ -23,7 +23,8 @@ USBGPU_BUILD_ATTEMPTS = 6
 USBGPU_BUILD_RETRY_INTERVAL = 2.0
 USBGPU_READINESS_ATTEMPTS = 3
 USBGPU_READINESS_RETRY_INTERVAL = 2.0
-USBGPU_TRANSIENT_READINESS_ERRORS = {"12V / PCIe not ready", "USB link errors"}
+USBGPU_READINESS_TIMEOUT = 30.0
+USBGPU_TRANSIENT_READINESS_ERRORS = {"12V / PCIe not ready", "USB link errors", "GPU check timed out"}
 USBGPU_ENUMERATION_WAIT_SECONDS = 20.0
 USBGPU_ENUMERATION_POLL_INTERVAL = 1.0
 
@@ -73,10 +74,14 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
 
   readiness_error = None
   for readiness_attempt in range(1, USBGPU_READINESS_ATTEMPTS + 1):
+    check_message = (f"Happy Birthday eGPU model\nChecking GPU · " +
+                     f"{readiness_attempt}/{USBGPU_READINESS_ATTEMPTS} · up to {USBGPU_READINESS_TIMEOUT:.0f}s")
+    spinner.update(check_message)
+    write_big_model_status(model_cache_dir(), "checking", detail=check_message.replace("\n", " "), **status_values)
     # A successful GPU workload proves the compile path is usable. The xHCI
     # LEC can still record recoverable packet retries, which the interactive
     # diagnostic reports strictly but must not block an optional compilation.
-    readiness_error = check_usbgpu(timeout=10.0, require_clean_link=False)
+    readiness_error = check_usbgpu(timeout=USBGPU_READINESS_TIMEOUT, require_clean_link=False)
     if readiness_error is None:
       break
     if readiness_error not in USBGPU_TRANSIENT_READINESS_ERRORS or readiness_attempt >= USBGPU_READINESS_ATTEMPTS:

@@ -79,7 +79,9 @@ async def api_compile_restart(_request: web.Request) -> web.Response:
 
   if not await asyncio.to_thread(usbgpu_present):
     return web.json_response({"ok": False, "error": "turn ignition on and wait for eGPU power"}, status=409)
-  readiness_error = await asyncio.to_thread(check_usbgpu, timeout=10.0, require_clean_link=False)
+  # Cold tinygrad/LLVM startup can exceed ten seconds on a busy TICI. Match the
+  # boot-time readiness window so the Web action does not reject a healthy GPU.
+  readiness_error = await asyncio.to_thread(check_usbgpu, timeout=30.0, require_clean_link=False)
   if readiness_error is not None:
     return web.json_response({"ok": False, "error": readiness_error}, status=409)
 
