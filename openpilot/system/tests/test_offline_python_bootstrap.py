@@ -217,7 +217,7 @@ def test_model_compiler_uses_isolated_agnos_core() -> None:
 def test_optional_egpu_build_retries_transient_pcie_link_startup() -> None:
   source = (Path(BASEDIR) / "openpilot/system/manager/build.py").read_text(encoding="utf-8")
 
-  assert "check_usbgpu(timeout=10.0)" in source
+  assert "check_usbgpu(timeout=10.0, require_clean_link=False)" in source
   assert "USB eGPU not ready for optional model compilation" in source
   assert "USBGPU_BUILD_ATTEMPTS = 6" in source
   assert "USBGPU_READINESS_ATTEMPTS = 3" in source
