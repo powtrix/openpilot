@@ -53,6 +53,10 @@ def manifest_for(data: bytes, model_id: str = "big-400") -> dict:
   }
 
 
+def test_default_manifest_uses_happy_birthday_catalog():
+  assert big_model.DEFAULT_MANIFEST_URL == "https://upload.shind0.synology.me/models/comma4-big-hb/manifest.json"
+
+
 def test_manifest_resolves_relative_https_url():
   manifest = BigModelManifest.from_dict(manifest_for(b"model"), "https://example.com/models/manifest.json")
   assert manifest.url == "https://example.com/models/big_driving_supercombo.onnx"

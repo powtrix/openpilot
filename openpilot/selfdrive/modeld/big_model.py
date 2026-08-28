@@ -25,7 +25,8 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
-DEFAULT_MANIFEST_URL = "https://upload.shind0.synology.me/models/comma4-big/manifest.json"
+# Keep the Happy Birthday model opt-in through the carrot-egpu-hb branch.
+DEFAULT_MANIFEST_URL = "https://upload.shind0.synology.me/models/comma4-big-hb/manifest.json"
 MAX_MANIFEST_SIZE = 64 * 1024
 MAX_MODEL_SIZE = 4 * 1024 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024
