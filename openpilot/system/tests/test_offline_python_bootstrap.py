@@ -220,6 +220,9 @@ def test_optional_egpu_build_retries_transient_pcie_link_startup() -> None:
   assert "check_usbgpu(timeout=10.0)" in source
   assert "USB eGPU not ready for optional model compilation" in source
   assert "USBGPU_BUILD_ATTEMPTS = 6" in source
+  assert "USBGPU_READINESS_ATTEMPTS = 3" in source
+  assert 'USBGPU_TRANSIENT_READINESS_ERRORS = {"12V / PCIe not ready", "USB link errors"}' in source
+  assert "USB eGPU transient readiness error" in source
   assert "usbgpu_pcie_not_ready(error_text)" in source
   assert "USB eGPU PCIe link not ready; retrying" in source
 

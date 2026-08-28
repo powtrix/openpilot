@@ -21,6 +21,9 @@ TOTAL_SCONS_NODES = 2705
 MAX_BUILD_PROGRESS = 100
 USBGPU_BUILD_ATTEMPTS = 6
 USBGPU_BUILD_RETRY_INTERVAL = 2.0
+USBGPU_READINESS_ATTEMPTS = 3
+USBGPU_READINESS_RETRY_INTERVAL = 2.0
+USBGPU_TRANSIENT_READINESS_ERRORS = {"12V / PCIe not ready", "USB link errors"}
 
 
 def build_usbgpu_model(spinner: Spinner) -> bool:
@@ -52,7 +55,19 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
     write_big_model_status(model_cache_dir(), "compiled", **status_values)
     return True
 
-  readiness_error = check_usbgpu(timeout=10.0)
+  readiness_error = None
+  for readiness_attempt in range(1, USBGPU_READINESS_ATTEMPTS + 1):
+    readiness_error = check_usbgpu(timeout=10.0)
+    if readiness_error is None:
+      break
+    if readiness_error not in USBGPU_TRANSIENT_READINESS_ERRORS or readiness_attempt >= USBGPU_READINESS_ATTEMPTS:
+      break
+    message = (f"USB eGPU transient readiness error: {readiness_error}; retrying in "
+               f"{USBGPU_READINESS_RETRY_INTERVAL:.0f}s ({readiness_attempt}/{USBGPU_READINESS_ATTEMPTS})")
+    print(message)
+    spinner.update(message)
+    write_big_model_status(model_cache_dir(), "waiting_for_ignition", detail=message, **status_values)
+    time.sleep(USBGPU_READINESS_RETRY_INTERVAL)
   if readiness_error is not None:
     message = f"USB eGPU not ready for optional model compilation: {readiness_error}"
     print(message)
