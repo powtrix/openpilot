@@ -305,7 +305,7 @@ def create_acc_cancel(packer, CP, CAN, cruise_info_copy):
   })
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
 
-def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
+def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active, *, openpilot_longitudinal):
 
 
   if CS.lfahda_cluster is not None:
@@ -317,7 +317,10 @@ def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
     rx_counter = None
     values["LFA_OptUsmSta"] = 2
     values["HDA_OptUsmSta"] = 2
-  values["HDA_CntrlModSta"] = 2 if long_active else 0
+  # Stock longitudinal owns the HDA state. Preserve the camera value instead
+  # of replacing an active OEM HDA session with CC.longActive=False.
+  if openpilot_longitudinal:
+    values["HDA_CntrlModSta"] = 2 if long_active else 0
   values["HDA_LFA_SymSta"] = 2 if lat_active else 0
   return [packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values, rx_counter=rx_counter)]
 

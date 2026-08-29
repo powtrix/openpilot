@@ -42,6 +42,19 @@ CANFD_JERK_ERROR_FILTER_TIME = 0.4
 CANFD_JERK_ERROR_DEADBAND = 0.25
 CANFD_JERK_ERROR_FULL_SCALE = 0.5
 CANFD_JERK_RELEASE_THRESHOLD = 0.1
+KA4_STOCK_SCC_MAX_STANDSTILL_GRACE = 30.0
+KA4_STOCK_SCC_OEM_REARM_INTERVAL = 3.0
+# The stock SCC normally raises InfoDisplay after roughly three seconds. Stop
+# re-arming early enough that the final OEM interval expires at about 30 s.
+KA4_STOCK_SCC_REARM_CUTOFF = KA4_STOCK_SCC_MAX_STANDSTILL_GRACE - KA4_STOCK_SCC_OEM_REARM_INTERVAL
+KA4_STOCK_SCC_MIN_REARM_INTERVAL = 2.5
+KA4_STOCK_SCC_INFO_DISPLAY_INACTIVE_DWELL = 0.2
+KA4_STOCK_SCC_LEAD_STABLE_DWELL = 0.3
+KA4_STOCK_SCC_KEEPALIVE_REQUEST_TIMEOUT = 0.5
+KA4_STOCK_SCC_POST_KEEPALIVE_BUTTON_QUIET = 0.25
+KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE = 20.0
+KA4_STOCK_SCC_MAX_STOPPED_LEAD_SPEED = 0.2
+KA4_STOCK_SCC_VALID_LEAD_STATES = (2, 3)
 # Some CAN-FD SCC implementations need a higher lower-jerk limit to follow sustained
 # deceleration requests. Keep the historical MPC-jerk limit as the default and blend
 # toward this stock-like feedforward only after measured under-deceleration.
@@ -227,6 +240,15 @@ class CarController(CarControllerBase):
     self.camera_scc_params = Params().get_int("HyundaiCameraSCC")
     self.is_ldws_car = Params().get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
+
+    self.stock_scc_stop_start_frame = None
+    self.stock_scc_info_display_active_prev = False
+    self.stock_scc_info_display_inactive_frames = 0
+    self.stock_scc_stopped_lead_frames = 0
+    self.stock_scc_keepalive_pending = False
+    self.stock_scc_keepalive_pending_frame = None
+    self.stock_scc_keepalive_sent = False
+    self.stock_scc_last_keepalive_frame = None
 
     self.steerDeltaUpOrg = self.steerDeltaUp = self.steerDeltaUpLC = self.params.STEER_DELTA_UP
     self.steerDeltaDownOrg = self.steerDeltaDown = self.steerDeltaDownLC = self.params.STEER_DELTA_DOWN
@@ -506,7 +528,10 @@ class CarController(CarControllerBase):
 
       # LFA and HDA icons
       if self.frame % 5 == 0 and (not hda2 or hda2_long or camera_scc):
-        can_sends.extend(hyundaicanfd.create_lfahda_cluster(self.packer, CS, self.CAN, CC.longActive, CC.latActive))
+        can_sends.extend(hyundaicanfd.create_lfahda_cluster(
+          self.packer, CS, self.CAN, CC.longActive, CC.latActive,
+          openpilot_longitudinal=self.CP.openpilotLongitudinalControl,
+        ))
         if not camera_scc:
           can_sends.extend(hyundaicanfd.create_lfa_icon_non_camera_scc(self.packer, CS, self.CAN, CC))
 
@@ -541,6 +566,7 @@ class CarController(CarControllerBase):
                                                              self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS))
             self.accel_last = accel
       else:
+        self._update_ka4_stock_scc_keepalive(CC, CS)
         # button presses
         if self.camera_scc_params == 3: # camera scc but stock long
           send_button = self.make_spam_button(CC, CS)
@@ -638,8 +664,11 @@ class CarController(CarControllerBase):
       # carrot.. 왜 alt_cruise_button는 값이 리스트일까?, 그리고 왜? 빈데이터가 들어오는것일까?
       if CS.cruise_buttons_msg is not None and self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
         try:
-          cruise_buttons_msg_values = {key: value[0] for key, value in CS.cruise_buttons_msg.items()}
-        except: # IndexError:
+          cruise_buttons_msg_values = {
+            key: value[0] if isinstance(value, (list, tuple, deque)) else value
+            for key, value in CS.cruise_buttons_msg.items()
+          }
+        except IndexError:
           #print("IndexError....")
           cruise_buttons_msg_values = None
           self.cruise_buttons_msg_cnt += 1
@@ -676,9 +705,11 @@ class CarController(CarControllerBase):
       if self.last_button_frame != self.frame:
         dat = self.canfd_speed_control_pcm(CC, CS, self.cruise_buttons_msg_values)
         if dat is not None:
-          for _ in range(self.button_spam3):
+          repeat_count = 1 if self.stock_scc_keepalive_sent else self.button_spam3
+          for _ in range(repeat_count):
             can_sends.append(dat)
           self.cruise_buttons_msg_cnt += 1
+        self.stock_scc_keepalive_sent = False
 
     return can_sends
 
@@ -714,8 +745,11 @@ class CarController(CarControllerBase):
 
 
   def make_spam_button(self, CC, CS):
+    self.stock_scc_keepalive_sent = False
     if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
       self.activateCruise = 0
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
       return 0
 
     hud_control = CC.hudControl
@@ -733,7 +767,7 @@ class CarController(CarControllerBase):
           send_button = Buttons.RES_ACCEL
           self.activateCruise = 1
           activate_cruise = True
-      elif CC.cruiseControl.resume:
+      elif CC.cruiseControl.resume or self.stock_scc_keepalive_pending:
         send_button = Buttons.RES_ACCEL
       elif target < current and current>= 31 and self.speed_from_pcm != 1:
         send_button = Buttons.SET_DECEL
@@ -769,12 +803,133 @@ class CarController(CarControllerBase):
     #CC.debugTextCC = "{} speed_diff={:.1f},{:.0f}/{:.0f}, button={}, button_wait={}, count={}".format(
     #  send_button_allowed, speed_diff, target, current, send_button, self.button_wait, self.button_spamming_count)
 
-    if send_button_allowed or activate_cruise or (CC.cruiseControl.resume and self.frame % 2 == 0):
+    keepalive_pending = self.stock_scc_keepalive_pending
+    if send_button_allowed or activate_cruise or keepalive_pending or (CC.cruiseControl.resume and self.frame % 2 == 0):
       self.button_spamming_count = self.button_spamming_count + 1 if send_button == Buttons.RES_ACCEL else self.button_spamming_count - 1
+      if keepalive_pending:
+        self.stock_scc_keepalive_pending = False
+        self.stock_scc_keepalive_pending_frame = None
+        self.stock_scc_keepalive_sent = True
+        self.stock_scc_last_keepalive_frame = self.frame
+        self.last_button_frame = self.frame
+        self.button_wait = max(self.button_wait, round(KA4_STOCK_SCC_POST_KEEPALIVE_BUTTON_QUIET / DT_CTRL))
       return send_button
     else:
       self.button_spamming_count = 0
     return 0
+
+  def _update_ka4_stock_scc_keepalive(self, CC, CS):
+    """Request one RES pulse per OEM standstill-warning transition, up to 30 s.
+
+    This is deliberately limited to the radar-SCC KA4 and never bypasses the
+    existing brake, Auto Hold, or parking-brake interlocks. If the vehicle does
+    not accept a RES pulse while the lead remains stopped, InfoDisplay stays
+    active and no additional pulses are requested.
+    """
+    supported = (
+      self.CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN and
+      self.CP.pcmCruise and
+      not self.CP.openpilotLongitudinalControl and
+      bool(self.CP.flags & HyundaiFlags.CANFD) and
+      bool(self.CP.flags & HyundaiFlags.RADAR_SCC) and
+      not bool(self.CP.flags & HyundaiFlags.CAMERA_SCC)
+    )
+    if not supported:
+      self.stock_scc_stop_start_frame = None
+      self.stock_scc_info_display_active_prev = False
+      self.stock_scc_info_display_inactive_frames = 0
+      self.stock_scc_stopped_lead_frames = 0
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_sent = False
+      self.stock_scc_last_keepalive_frame = None
+      return
+
+    # Wheel-speed standstill is already debounced by CarState. Any detected
+    # movement starts a new physical stop, including a very slow crawl.
+    if not CS.out.standstill:
+      self.stock_scc_stop_start_frame = None
+      self.stock_scc_info_display_active_prev = False
+      self.stock_scc_info_display_inactive_frames = 0
+      self.stock_scc_stopped_lead_frames = 0
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_sent = False
+      self.stock_scc_last_keepalive_frame = None
+      return
+
+    scc_control = CS.scc_control or {}
+    info_display = scc_control.get("InfoDisplay", 0)
+    info_display_active = info_display == 4
+    cruise_session_active = CC.enabled and CS.out.cruiseState.enabled
+    raw_lead_stopped = (
+      scc_control.get("ACCMode", 0) in (1, 2) and
+      scc_control.get("SysFailState", 0) == 0 and
+      scc_control.get("TakeOverReq", 0) == 0 and
+      scc_control.get("HUD_LEAD_INFO", 0) in KA4_STOCK_SCC_VALID_LEAD_STATES and
+      0.0 < scc_control.get("ACC_ObjDist", 0.0) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE and
+      abs(scc_control.get("ACC_ObjRelSpd", 0.0)) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_SPEED
+    )
+
+    # Do not consume the 30-second window while the car is parked or stopped
+    # before SCC engagement. Once started, a transient disabled frame does not
+    # restart the window; only physical movement does.
+    if self.stock_scc_stop_start_frame is None:
+      if not cruise_session_active:
+        self.stock_scc_keepalive_pending = False
+        self.stock_scc_keepalive_pending_frame = None
+        self.stock_scc_info_display_active_prev = info_display_active
+        self.stock_scc_info_display_inactive_frames = (
+          self.stock_scc_info_display_inactive_frames + 1 if info_display == 0 else 0
+        )
+        return
+
+      self.stock_scc_stop_start_frame = self.frame
+      self.stock_scc_info_display_active_prev = info_display_active
+      self.stock_scc_info_display_inactive_frames = 1 if info_display == 0 else 0
+      self.stock_scc_stopped_lead_frames = 1 if raw_lead_stopped else 0
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_last_keepalive_frame = None
+      return
+
+    stopped_time = (self.frame - self.stock_scc_stop_start_frame) * DT_CTRL
+    info_display_was_inactive_stable = self.stock_scc_info_display_inactive_frames >= round(
+      KA4_STOCK_SCC_INFO_DISPLAY_INACTIVE_DWELL / DT_CTRL,
+    )
+    self.stock_scc_stopped_lead_frames = self.stock_scc_stopped_lead_frames + 1 if raw_lead_stopped and cruise_session_active else 0
+    lead_stopped_stable = self.stock_scc_stopped_lead_frames >= round(KA4_STOCK_SCC_LEAD_STABLE_DWELL / DT_CTRL)
+    driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
+    interlock_active = (
+      CS.out.brakePressed or CS.out.gasPressed or CS.out.brakeHoldActive or CS.out.parkingBrake or
+      driver_button_pressed
+    )
+    warning_rising = info_display_active and not self.stock_scc_info_display_active_prev and info_display_was_inactive_stable
+    rearm_interval_elapsed = (
+      self.stock_scc_last_keepalive_frame is None or
+      (self.frame - self.stock_scc_last_keepalive_frame) * DT_CTRL >= KA4_STOCK_SCC_MIN_REARM_INTERVAL
+    )
+
+    if (warning_rising and stopped_time <= KA4_STOCK_SCC_REARM_CUTOFF and rearm_interval_elapsed and
+        lead_stopped_stable and cruise_session_active and not interlock_active):
+      self.stock_scc_keepalive_pending = True
+      self.stock_scc_keepalive_pending_frame = self.frame
+    elif (stopped_time > KA4_STOCK_SCC_REARM_CUTOFF or not raw_lead_stopped or
+          not cruise_session_active or interlock_active):
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+
+    if (self.stock_scc_keepalive_pending and self.stock_scc_keepalive_pending_frame is not None and
+        (self.frame - self.stock_scc_keepalive_pending_frame) * DT_CTRL > KA4_STOCK_SCC_KEEPALIVE_REQUEST_TIMEOUT):
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+
+    self.stock_scc_info_display_active_prev = info_display_active
+    # Only the documented no-message state qualifies as a clean re-arm gap.
+    # Front-departure (5), reserved, and invalid states must not arm a RES edge.
+    self.stock_scc_info_display_inactive_frames = (
+      self.stock_scc_info_display_inactive_frames + 1 if info_display == 0 else 0
+    )
 
 class HyundaiJerk:
   def __init__(self):
@@ -859,4 +1014,3 @@ class HyundaiJerk:
         self.jerk_l = min(max(1.0, -self.jerk * 4.0), jerk_max_l)
         self.cb_upper = np.clip(0.9 + accel * 0.2, 0, 1.2)
         self.cb_lower = np.clip(0.8 + accel * 0.2, 0, 1.2)
-
