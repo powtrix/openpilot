@@ -100,11 +100,10 @@ def enter_standstill_warning(controller, CC, CS, warning_frame=300):
   controller._update_ka4_stock_scc_keepalive(CC, CS)
 
 
-@pytest.mark.parametrize("hud_lead_info", [2, 3])
-def test_ka4_stock_scc_warning_requests_one_resume_pulse(hud_lead_info):
+def test_ka4_stock_scc_warning_requests_one_resume_pulse():
   controller = build_controller()
   CC = build_control()
-  CS = build_state(hud_lead_info=hud_lead_info)
+  CS = build_state()
 
   enter_standstill_warning(controller, CC, CS)
 
@@ -142,6 +141,7 @@ def test_ka4_stock_scc_rearm_stops_before_thirty_seconds(warning_frame, expected
   {"acc_obj_rel_spd": 0.3},
   {"hud_lead_info": 0},
   {"hud_lead_info": 1},
+  {"hud_lead_info": 3},
   {"sys_fail_state": 1},
   {"take_over_req": 1},
 ])
@@ -166,7 +166,7 @@ def test_ka4_stock_scc_rearm_cancels_on_driver_button():
   assert not controller.stock_scc_keepalive_pending
 
 
-@pytest.mark.parametrize("hud_lead_info", [0, 1])
+@pytest.mark.parametrize("hud_lead_info", [0, 1, 3])
 def test_ka4_stock_scc_rearm_cancels_if_lead_control_state_changes(hud_lead_info):
   controller = build_controller()
   CC = build_control()
