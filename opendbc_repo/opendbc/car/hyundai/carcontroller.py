@@ -54,7 +54,7 @@ KA4_STOCK_SCC_KEEPALIVE_REQUEST_TIMEOUT = 0.5
 KA4_STOCK_SCC_POST_KEEPALIVE_BUTTON_QUIET = 0.25
 KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE = 20.0
 KA4_STOCK_SCC_MAX_STOPPED_LEAD_SPEED = 0.2
-KA4_STOCK_SCC_VALID_LEAD_STATES = (2, 3)
+KA4_STOCK_SCC_VALID_LEAD_STATE = 2
 # Some CAN-FD SCC implementations need a higher lower-jerk limit to follow sustained
 # deceleration requests. Keep the historical MPC-jerk limit as the default and blend
 # toward this stock-like feedforward only after measured under-deceleration.
@@ -866,7 +866,7 @@ class CarController(CarControllerBase):
       scc_control.get("ACCMode", 0) in (1, 2) and
       scc_control.get("SysFailState", 0) == 0 and
       scc_control.get("TakeOverReq", 0) == 0 and
-      scc_control.get("HUD_LEAD_INFO", 0) in KA4_STOCK_SCC_VALID_LEAD_STATES and
+      scc_control.get("HUD_LEAD_INFO", 0) == KA4_STOCK_SCC_VALID_LEAD_STATE and
       0.0 < scc_control.get("ACC_ObjDist", 0.0) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE and
       abs(scc_control.get("ACC_ObjRelSpd", 0.0)) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_SPEED
     )
