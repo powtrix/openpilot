@@ -134,6 +134,27 @@ def test_cluster_rejection_preserves_raw_dbc_value_and_global_bus() -> None:
   assert rejected_stream["valueCounts"] == {"5": 1}
 
 
+def test_invalid_raw_cluster_checksum_cannot_produce_pass() -> None:
+  from opendbc.can import CANPacker
+
+  analyzer = run_demo("pass")
+  message = CANPacker("hyundai_canfd_generated").make_can_msg("ADRV_0x161", 2, {
+    "COUNTER": 9,
+    "ALERTS_5": 0,
+  })
+  invalid = bytearray(message[1])
+  invalid[0] ^= 0x01
+  analyzer.feed_can("can", 1_010.0, 2, message[0], bytes(invalid))
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "FAIL"
+  episode = report["stopEpisodes"][0]
+  assert episode["clusterEvidence"]["integrity"]["invalidSampleCount"] == 1
+  assert not episode["prerequisites"]["rawAdrv0x161CrcValidAllSamples"]
+  assert "failed the Hyundai CAN-FD CRC" in episode["reasons"][0]
+
+
 def test_demo_rejected_tx_and_early_warning_fails() -> None:
   report = run_demo("fail").report()
 

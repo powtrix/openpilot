@@ -1180,6 +1180,13 @@ class ProbeAnalyzer:
     returned_hda = sorted((sample for sample in samples
                            if sample.origin == "tx_returned" and sample.address == LFAHDA_CLUSTER_ADDRESS),
                           key=lambda sample: sample.t)
+    raw_cluster_samples = [*raw_adrv, *raw_hda]
+    replacement_cluster_samples = [*adrv_requests, *hda_requests, *returned_adrv, *returned_hda]
+    cluster_request_samples = [*adrv_requests, *hda_requests]
+    invalid_cluster_samples = [sample for sample in (*raw_cluster_samples, *replacement_cluster_samples)
+                               if sample.checksum_valid is False]
+    rejected_cluster_requests = [request for request in cluster_request_samples
+                                 if tx_status_by_id.get(id(request)) == "rejected"]
 
     raw_warning_periods = self._cluster_signal_periods(
       [sample for sample in raw_adrv if start <= sample.t <= end], start, "alert_5",
@@ -1263,6 +1270,17 @@ class ProbeAnalyzer:
       "rawAdrvSamples": len(raw_adrv),
       "rawLfaHdaSamples": len(raw_hda),
       "rawAdrvContinuousThrough30_25s": self._continuous_cluster_coverage(raw_adrv, start, coverage_through),
+      "integrity": {
+        "rawAdrvAllCrcValid": bool(raw_adrv) and all(sample.checksum_valid is True for sample in raw_adrv),
+        "rawLfaHdaAllCrcValid": bool(raw_hda) and all(sample.checksum_valid is True for sample in raw_hda),
+        "hostReplacementAllCrcValid": (
+          not replacement_cluster_samples if canfd_hda2 else
+          bool(replacement_cluster_samples)
+          and all(sample.checksum_valid is True for sample in replacement_cluster_samples)
+        ),
+        "invalidSampleCount": len(invalid_cluster_samples),
+        "rejectedRequestCount": len(rejected_cluster_requests),
+      },
       "rawAccelerateWarningPeriods": raw_warning_periods,
       "firstRawAccelerateWarningAfterStop": first_raw_warning,
       "warningPathObservation": warning_path,
@@ -1425,7 +1443,9 @@ class ProbeAnalyzer:
       any(sample.checksum_valid is False for sample in scc)
       or any(sample.checksum_valid is False for sample in raw_alt_stock_bus)
       or any(not group["allRequestChecksumsValid"] for group in episode_groups)
+      or cluster_evidence["integrity"]["invalidSampleCount"] > 0
     )
+    any_cluster_rejected = cluster_evidence["integrity"]["rejectedRequestCount"] > 0
     direct_source_policy_failure = bool(episode_groups) and any(
       group["sourceAvailableAllFrames"]
       and (not group["sourcePlusOneAllFrames"] or not group["latestStockNonButtonFieldsPreserved"])
@@ -1454,22 +1474,25 @@ class ProbeAnalyzer:
       "exact11GroupRearmSchedule": returned_schedule_ok,
       "allObservedRearmRequestsReturned": all_tx_returned,
       "rawAdrv0x161ContinuousThrough30_25s": cluster_evidence["rawAdrvContinuousThrough30_25s"],
+      "rawAdrv0x161CrcValidAllSamples": cluster_evidence["integrity"]["rawAdrvAllCrcValid"],
       "rawLfaHda0x1e0Observed": cluster_evidence["rawLfaHdaSamples"] > 0,
+      "rawLfaHda0x1e0CrcValidAllSamples": cluster_evidence["integrity"]["rawLfaHdaAllCrcValid"],
+      "hostClusterReplacementCrcValidAllSamples": cluster_evidence["integrity"]["hostReplacementAllCrcValid"],
       "hdaPathConsistentWithCurrentStockLongTopology": cluster_evidence[
         "hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"],
     }
 
     verdict = "INCONCLUSIVE"
     reasons = []
-    if any_rejected:
+    if any_rejected or any_cluster_rejected:
       verdict = "FAIL"
-      reasons.append("Panda safety rejected one or more 0x1AA RES requests")
+      reasons.append("Panda safety rejected one or more 0x1AA RES or cluster replacement requests")
     elif direct_schedule_violation:
       verdict = "FAIL"
       reasons.append("0x1AA RES traffic exceeded the exact 11x3 schedule or continued after 27.00s")
     elif direct_crc_failure:
       verdict = "FAIL"
-      reasons.append("an SCC_CONTROL or CRUISE_BUTTONS_ALT frame failed the Hyundai CAN-FD CRC")
+      reasons.append("an SCC, button, ADRV, or LFAHDA frame failed the Hyundai CAN-FD CRC")
     elif direct_source_policy_failure:
       verdict = "FAIL"
       reasons.append("a RES frame violated source+1 counter or changed a non-button field from the latest stock 0x1AA")
