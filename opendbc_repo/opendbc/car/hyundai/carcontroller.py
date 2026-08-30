@@ -47,13 +47,15 @@ KA4_STOCK_SCC_OEM_REARM_INTERVAL = 3.0
 # The stock SCC normally raises InfoDisplay after roughly three seconds. Stop
 # re-arming early enough that the final OEM interval expires at about 30 s.
 KA4_STOCK_SCC_REARM_CUTOFF = KA4_STOCK_SCC_MAX_STANDSTILL_GRACE - KA4_STOCK_SCC_OEM_REARM_INTERVAL
+KA4_STOCK_SCC_FIRST_REARM_DELAY = 2.5
 KA4_STOCK_SCC_MIN_REARM_INTERVAL = 2.5
-KA4_STOCK_SCC_INFO_DISPLAY_INACTIVE_DWELL = 0.2
+KA4_STOCK_SCC_WARNING_RETRY_INTERVAL = 0.5
 KA4_STOCK_SCC_LEAD_STABLE_DWELL = 0.3
 KA4_STOCK_SCC_KEEPALIVE_REQUEST_TIMEOUT = 0.5
 KA4_STOCK_SCC_POST_KEEPALIVE_BUTTON_QUIET = 0.25
+KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES = 3
 KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE = 20.0
-KA4_STOCK_SCC_MAX_STOPPED_LEAD_SPEED = 0.2
+KA4_STOCK_SCC_MAX_DEPARTURE_SPEED = 0.5
 KA4_STOCK_SCC_VALID_LEAD_STATE = 2
 # Some CAN-FD SCC implementations need a higher lower-jerk limit to follow sustained
 # deceleration requests. Keep the historical MPC-jerk limit as the default and blend
@@ -242,11 +244,12 @@ class CarController(CarControllerBase):
     self.enable_corner_radar = 0
 
     self.stock_scc_stop_start_frame = None
-    self.stock_scc_info_display_active_prev = False
-    self.stock_scc_info_display_inactive_frames = 0
     self.stock_scc_stopped_lead_frames = 0
     self.stock_scc_keepalive_pending = False
     self.stock_scc_keepalive_pending_frame = None
+    self.stock_scc_keepalive_press_frames = 0
+    self.stock_scc_keepalive_warning_recovery = False
+    self.stock_scc_warning_recovery_sent = False
     self.stock_scc_keepalive_sent = False
     self.stock_scc_last_keepalive_frame = None
 
@@ -750,6 +753,8 @@ class CarController(CarControllerBase):
       self.activateCruise = 0
       self.stock_scc_keepalive_pending = False
       self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_press_frames = 0
+      self.stock_scc_keepalive_warning_recovery = False
       return 0
 
     hud_control = CC.hudControl
@@ -807,8 +812,13 @@ class CarController(CarControllerBase):
     if send_button_allowed or activate_cruise or keepalive_pending or (CC.cruiseControl.resume and self.frame % 2 == 0):
       self.button_spamming_count = self.button_spamming_count + 1 if send_button == Buttons.RES_ACCEL else self.button_spamming_count - 1
       if keepalive_pending:
-        self.stock_scc_keepalive_pending = False
-        self.stock_scc_keepalive_pending_frame = None
+        if self.stock_scc_keepalive_warning_recovery:
+          self.stock_scc_warning_recovery_sent = True
+          self.stock_scc_keepalive_warning_recovery = False
+        self.stock_scc_keepalive_press_frames = max(0, self.stock_scc_keepalive_press_frames - 1)
+        if self.stock_scc_keepalive_press_frames == 0:
+          self.stock_scc_keepalive_pending = False
+          self.stock_scc_keepalive_pending_frame = None
         self.stock_scc_keepalive_sent = True
         self.stock_scc_last_keepalive_frame = self.frame
         self.last_button_frame = self.frame
@@ -818,13 +828,30 @@ class CarController(CarControllerBase):
       self.button_spamming_count = 0
     return 0
 
-  def _update_ka4_stock_scc_keepalive(self, CC, CS):
-    """Request one RES pulse per OEM standstill-warning transition, up to 30 s.
+  def _reset_ka4_stock_scc_keepalive(self):
+    self.stock_scc_stop_start_frame = None
+    self.stock_scc_stopped_lead_frames = 0
+    self.stock_scc_keepalive_pending = False
+    self.stock_scc_keepalive_pending_frame = None
+    self.stock_scc_keepalive_press_frames = 0
+    self.stock_scc_keepalive_warning_recovery = False
+    self.stock_scc_warning_recovery_sent = False
+    self.stock_scc_keepalive_sent = False
+    self.stock_scc_last_keepalive_frame = None
 
-    This is deliberately limited to the radar-SCC KA4 and never bypasses the
-    existing brake, Auto Hold, or parking-brake interlocks. If the vehicle does
-    not accept a RES pulse while the lead remains stopped, InfoDisplay stays
-    active and no additional pulses are requested.
+  def _update_ka4_stock_scc_keepalive(self, CC, CS):
+    """Keep KA4 radar-SCC auto-resume ready for at most 30 seconds.
+
+    KA4 stock SCC normally changes InfoDisplay to the driver-action warning
+    after about three seconds. A short RES press just before that deadline
+    re-arms the OEM timer. Periodic presses stop with a final short press that
+    ends at 27 seconds, so the OEM's own three-second interval expires at about
+    30 seconds. An already-active warning is level-triggered and retried
+    at a bounded rate instead of depending on a 0-to-4 edge.
+
+    This is deliberately limited to radar-SCC KA4 and never bypasses brake,
+    accelerator, Auto Hold, parking-brake, driver-button, SCC failure, or
+    takeover interlocks.
     """
     supported = (
       self.CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN and
@@ -835,40 +862,40 @@ class CarController(CarControllerBase):
       not bool(self.CP.flags & HyundaiFlags.CAMERA_SCC)
     )
     if not supported:
-      self.stock_scc_stop_start_frame = None
-      self.stock_scc_info_display_active_prev = False
-      self.stock_scc_info_display_inactive_frames = 0
-      self.stock_scc_stopped_lead_frames = 0
-      self.stock_scc_keepalive_pending = False
-      self.stock_scc_keepalive_pending_frame = None
-      self.stock_scc_keepalive_sent = False
-      self.stock_scc_last_keepalive_frame = None
+      self._reset_ka4_stock_scc_keepalive()
       return
 
     # Wheel-speed standstill is already debounced by CarState. Any detected
     # movement starts a new physical stop, including a very slow crawl.
     if not CS.out.standstill:
-      self.stock_scc_stop_start_frame = None
-      self.stock_scc_info_display_active_prev = False
-      self.stock_scc_info_display_inactive_frames = 0
-      self.stock_scc_stopped_lead_frames = 0
-      self.stock_scc_keepalive_pending = False
-      self.stock_scc_keepalive_pending_frame = None
-      self.stock_scc_keepalive_sent = False
-      self.stock_scc_last_keepalive_frame = None
+      self._reset_ka4_stock_scc_keepalive()
       return
 
     scc_control = CS.scc_control or {}
     info_display = scc_control.get("InfoDisplay", 0)
     info_display_active = info_display == 4
     cruise_session_active = CC.enabled and CS.out.cruiseState.enabled
-    raw_lead_stopped = (
+    driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
+    interlock_active = (
+      CS.out.brakePressed or CS.out.gasPressed or CS.out.brakeHoldActive or CS.out.parkingBrake or
+      driver_button_pressed or CC.cruiseControl.cancel
+    )
+    if not info_display_active:
+      self.stock_scc_warning_recovery_sent = False
+      if self.stock_scc_keepalive_warning_recovery:
+        self.stock_scc_keepalive_pending = False
+        self.stock_scc_keepalive_pending_frame = None
+        self.stock_scc_keepalive_press_frames = 0
+        self.stock_scc_keepalive_warning_recovery = False
+
+    raw_lead_safe = (
+      info_display in (0, 4) and
       scc_control.get("ACCMode", 0) in (1, 2) and
       scc_control.get("SysFailState", 0) == 0 and
       scc_control.get("TakeOverReq", 0) == 0 and
       scc_control.get("HUD_LEAD_INFO", 0) == KA4_STOCK_SCC_VALID_LEAD_STATE and
       0.0 < scc_control.get("ACC_ObjDist", 0.0) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE and
-      abs(scc_control.get("ACC_ObjRelSpd", 0.0)) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_SPEED
+      scc_control.get("ACC_ObjRelSpd", 0.0) <= KA4_STOCK_SCC_MAX_DEPARTURE_SPEED
     )
 
     # Do not consume the 30-second window while the car is parked or stopped
@@ -878,58 +905,82 @@ class CarController(CarControllerBase):
       if not cruise_session_active:
         self.stock_scc_keepalive_pending = False
         self.stock_scc_keepalive_pending_frame = None
-        self.stock_scc_info_display_active_prev = info_display_active
-        self.stock_scc_info_display_inactive_frames = (
-          self.stock_scc_info_display_inactive_frames + 1 if info_display == 0 else 0
-        )
+        self.stock_scc_keepalive_press_frames = 0
+        self.stock_scc_keepalive_warning_recovery = False
         return
 
       self.stock_scc_stop_start_frame = self.frame
-      self.stock_scc_info_display_active_prev = info_display_active
-      self.stock_scc_info_display_inactive_frames = 1 if info_display == 0 else 0
-      self.stock_scc_stopped_lead_frames = 1 if raw_lead_stopped else 0
+      self.stock_scc_stopped_lead_frames = 1 if raw_lead_safe and not interlock_active else 0
       self.stock_scc_keepalive_pending = False
       self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_press_frames = 0
+      self.stock_scc_keepalive_warning_recovery = False
       self.stock_scc_last_keepalive_frame = None
       return
 
-    stopped_time = (self.frame - self.stock_scc_stop_start_frame) * DT_CTRL
-    info_display_was_inactive_stable = self.stock_scc_info_display_inactive_frames >= round(
-      KA4_STOCK_SCC_INFO_DISPLAY_INACTIVE_DWELL / DT_CTRL,
+    stopped_frames = self.frame - self.stock_scc_stop_start_frame
+    stopped_time = stopped_frames * DT_CTRL
+    self.stock_scc_stopped_lead_frames = (
+      self.stock_scc_stopped_lead_frames + 1
+      if raw_lead_safe and cruise_session_active and not interlock_active else 0
     )
-    self.stock_scc_stopped_lead_frames = self.stock_scc_stopped_lead_frames + 1 if raw_lead_stopped and cruise_session_active else 0
-    lead_stopped_stable = self.stock_scc_stopped_lead_frames >= round(KA4_STOCK_SCC_LEAD_STABLE_DWELL / DT_CTRL)
-    driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
-    interlock_active = (
-      CS.out.brakePressed or CS.out.gasPressed or CS.out.brakeHoldActive or CS.out.parkingBrake or
-      driver_button_pressed
-    )
-    warning_rising = info_display_active and not self.stock_scc_info_display_active_prev and info_display_was_inactive_stable
-    rearm_interval_elapsed = (
-      self.stock_scc_last_keepalive_frame is None or
-      (self.frame - self.stock_scc_last_keepalive_frame) * DT_CTRL >= KA4_STOCK_SCC_MIN_REARM_INTERVAL
-    )
+    # Requiring one more sample than the number of 10 ms intervals makes the
+    # elapsed dwell at least 0.30 s instead of accepting at frame 29.
+    lead_stopped_stable = self.stock_scc_stopped_lead_frames > round(KA4_STOCK_SCC_LEAD_STABLE_DWELL / DT_CTRL)
 
-    if (warning_rising and stopped_time <= KA4_STOCK_SCC_REARM_CUTOFF and rearm_interval_elapsed and
-        lead_stopped_stable and cruise_session_active and not interlock_active):
-      self.stock_scc_keepalive_pending = True
-      self.stock_scc_keepalive_pending_frame = self.frame
-    elif (stopped_time > KA4_STOCK_SCC_REARM_CUTOFF or not raw_lead_stopped or
-          not cruise_session_active or interlock_active):
+    if not raw_lead_safe or not cruise_session_active or interlock_active:
       self.stock_scc_keepalive_pending = False
       self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_press_frames = 0
+      self.stock_scc_keepalive_warning_recovery = False
+      return
 
     if (self.stock_scc_keepalive_pending and self.stock_scc_keepalive_pending_frame is not None and
         (self.frame - self.stock_scc_keepalive_pending_frame) * DT_CTRL > KA4_STOCK_SCC_KEEPALIVE_REQUEST_TIMEOUT):
       self.stock_scc_keepalive_pending = False
       self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_press_frames = 0
+      self.stock_scc_keepalive_warning_recovery = False
 
-    self.stock_scc_info_display_active_prev = info_display_active
-    # Only the documented no-message state qualifies as a clean re-arm gap.
-    # Front-departure (5), reserved, and invalid states must not arm a RES edge.
-    self.stock_scc_info_display_inactive_frames = (
-      self.stock_scc_info_display_inactive_frames + 1 if info_display == 0 else 0
+    cutoff_frames = round(KA4_STOCK_SCC_REARM_CUTOFF / DT_CTRL)
+    final_press_start_frame = cutoff_frames - (KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES - 1)
+    normal_press_start_cutoff = final_press_start_frame - KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES - 1
+    if (self.stock_scc_keepalive_pending and stopped_frames > normal_press_start_cutoff and
+        self.stock_scc_keepalive_press_frames == KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES):
+      # An unsent normal/warning request must not occupy the reserved final
+      # press window. A burst that already started is allowed to finish.
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_press_frames = 0
+      self.stock_scc_keepalive_warning_recovery = False
+
+    if self.stock_scc_keepalive_pending or not lead_stopped_stable:
+      return
+
+    last_keepalive_elapsed = None
+    last_keepalive_stopped_frames = None
+    if self.stock_scc_last_keepalive_frame is not None:
+      last_keepalive_elapsed = (self.frame - self.stock_scc_last_keepalive_frame) * DT_CTRL
+      last_keepalive_stopped_frames = self.stock_scc_last_keepalive_frame - self.stock_scc_stop_start_frame
+
+    normal_rearm_due = (
+      stopped_time >= KA4_STOCK_SCC_FIRST_REARM_DELAY if last_keepalive_elapsed is None else
+      last_keepalive_elapsed >= KA4_STOCK_SCC_MIN_REARM_INTERVAL
     )
+    warning_retry_due = info_display_active and not self.stock_scc_warning_recovery_sent and (
+      last_keepalive_elapsed is None or last_keepalive_elapsed >= KA4_STOCK_SCC_WARNING_RETRY_INTERVAL
+    )
+    final_rearm_due = (
+      stopped_frames >= final_press_start_frame and
+      (last_keepalive_stopped_frames is None or last_keepalive_stopped_frames < final_press_start_frame)
+    )
+
+    normal_or_warning_due = stopped_frames <= normal_press_start_cutoff and (normal_rearm_due or warning_retry_due)
+    if normal_or_warning_due or (stopped_frames == final_press_start_frame and final_rearm_due):
+      self.stock_scc_keepalive_pending = True
+      self.stock_scc_keepalive_pending_frame = self.frame
+      self.stock_scc_keepalive_press_frames = KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES
+      self.stock_scc_keepalive_warning_recovery = bool(warning_retry_due)
 
 class HyundaiJerk:
   def __init__(self):

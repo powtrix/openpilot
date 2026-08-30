@@ -25,11 +25,12 @@ def build_controller():
   )
   controller.frame = 0
   controller.stock_scc_stop_start_frame = None
-  controller.stock_scc_info_display_active_prev = False
-  controller.stock_scc_info_display_inactive_frames = 0
   controller.stock_scc_stopped_lead_frames = 0
   controller.stock_scc_keepalive_pending = False
   controller.stock_scc_keepalive_pending_frame = None
+  controller.stock_scc_keepalive_press_frames = 0
+  controller.stock_scc_keepalive_warning_recovery = False
+  controller.stock_scc_warning_recovery_sent = False
   controller.stock_scc_keepalive_sent = False
   controller.stock_scc_last_keepalive_frame = None
   controller.activateCruise = 0
@@ -71,6 +72,7 @@ def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd
       gasPressed=gas_pressed,
       brakeHoldActive=brake_hold_active,
       parkingBrake=parking_brake,
+      activateCruise=False,
       vEgo=0.0,
       cruiseState=SimpleNamespace(enabled=True, speed=80 / 3.6),
     ),
@@ -80,7 +82,7 @@ def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd
 def build_control(*, lead_visible=True, lead_radar=1, lead_distance=5.0, lead_rel_speed=0.0):
   return SimpleNamespace(
     enabled=True,
-    cruiseControl=SimpleNamespace(resume=False),
+    cruiseControl=SimpleNamespace(resume=False, cancel=False),
     hudControl=SimpleNamespace(
       setSpeed=80 / 3.6,
       leadVisible=lead_visible,
@@ -100,7 +102,21 @@ def enter_standstill_warning(controller, CC, CS, warning_frame=300):
   controller._update_ka4_stock_scc_keepalive(CC, CS)
 
 
-def test_ka4_stock_scc_warning_requests_one_resume_pulse():
+def step_controller(controller, CC, CS, frame):
+  controller.frame = frame
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  return controller.create_button_messages(CC, CS, use_clu11=False)
+
+
+def resume_message_sent(messages):
+  return any(message[2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL for message in messages)
+
+
+def pulse_group_starts(pulse_frames):
+  return [frame for index, frame in enumerate(pulse_frames) if index == 0 or frame != pulse_frames[index - 1] + 1]
+
+
+def test_ka4_stock_scc_warning_requests_short_resume_press():
   controller = build_controller()
   CC = build_control()
   CS = build_state()
@@ -108,18 +124,18 @@ def test_ka4_stock_scc_warning_requests_one_resume_pulse():
   enter_standstill_warning(controller, CC, CS)
 
   assert controller.stock_scc_keepalive_pending
-  assert controller.make_spam_button(CC, CS) == Buttons.RES_ACCEL
-  assert not controller.stock_scc_keepalive_pending
-  assert controller.stock_scc_keepalive_sent
-  assert controller.last_button_frame == controller.frame
+  for _ in range(3):
+    assert controller.make_spam_button(CC, CS) == Buttons.RES_ACCEL
+    assert controller.stock_scc_keepalive_sent
+    assert controller.last_button_frame == controller.frame
+    controller.frame += 1
+    controller._update_ka4_stock_scc_keepalive(CC, CS)
 
-  controller.frame += 1
-  controller._update_ka4_stock_scc_keepalive(CC, CS)
   assert not controller.stock_scc_keepalive_pending
   assert controller.make_spam_button(CC, CS) == Buttons.NONE
 
 
-@pytest.mark.parametrize("warning_frame, expected", [(2700, True), (2701, False), (3000, False)])
+@pytest.mark.parametrize("warning_frame, expected", [(2698, True), (2699, False), (2700, False), (3000, False)])
 def test_ka4_stock_scc_rearm_stops_before_thirty_seconds(warning_frame, expected):
   controller = build_controller()
   CC = build_control()
@@ -138,7 +154,7 @@ def test_ka4_stock_scc_rearm_stops_before_thirty_seconds(warning_frame, expected
   {"acc_mode": 0},
   {"acc_obj_dist": 0.0},
   {"acc_obj_dist": 25.0},
-  {"acc_obj_rel_spd": 0.3},
+  {"acc_obj_rel_spd": 0.6},
   {"hud_lead_info": 0},
   {"hud_lead_info": 1},
   {"hud_lead_info": 3},
@@ -153,6 +169,17 @@ def test_ka4_stock_scc_rearm_requires_safe_stationary_lead(state_kwargs):
   enter_standstill_warning(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
+
+
+@pytest.mark.parametrize("relative_speed", [-2.0, 0.3, 0.5])
+def test_ka4_stock_scc_rearm_allows_non_departing_relative_speed(relative_speed):
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(acc_obj_rel_spd=relative_speed)
+
+  enter_standstill_warning(controller, CC, CS)
+
+  assert controller.stock_scc_keepalive_pending
 
 
 def test_ka4_stock_scc_rearm_cancels_on_driver_button():
@@ -179,6 +206,58 @@ def test_ka4_stock_scc_rearm_cancels_if_lead_control_state_changes(hud_lead_info
   controller._update_ka4_stock_scc_keepalive(CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
+
+
+@pytest.mark.parametrize("abort_case", [
+  "brake", "gas", "auto_hold", "parking_brake", "driver_button", "cruise_disabled",
+  "control_cancel", "movement", "scc_failure", "takeover", "lead_state", "lead_distance",
+  "lead_departure", "info_display",
+])
+def test_ka4_stock_scc_short_press_aborts_on_every_safety_interlock(abort_case):
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state()
+  enter_standstill_warning(controller, CC, CS)
+
+  assert resume_message_sent(controller.create_button_messages(CC, CS, use_clu11=False))
+  assert controller.stock_scc_keepalive_pending
+
+  if abort_case == "brake":
+    CS.out.brakePressed = True
+  elif abort_case == "gas":
+    CS.out.gasPressed = True
+  elif abort_case == "auto_hold":
+    CS.out.brakeHoldActive = True
+  elif abort_case == "parking_brake":
+    CS.out.parkingBrake = True
+  elif abort_case == "driver_button":
+    CS.cruise_buttons[-1] = Buttons.SET_DECEL
+  elif abort_case == "cruise_disabled":
+    CC.enabled = False
+    CS.out.cruiseState.enabled = False
+  elif abort_case == "control_cancel":
+    CC.cruiseControl.cancel = True
+  elif abort_case == "movement":
+    CS.out.standstill = False
+    CS.out.vEgo = 0.2
+  elif abort_case == "scc_failure":
+    CS.scc_control["SysFailState"] = 1
+  elif abort_case == "takeover":
+    CS.scc_control["TakeOverReq"] = 1
+  elif abort_case == "lead_state":
+    CS.scc_control["HUD_LEAD_INFO"] = 1
+  elif abort_case == "lead_distance":
+    CS.scc_control["ACC_ObjDist"] = 25.0
+  elif abort_case == "lead_departure":
+    CS.scc_control["ACC_ObjRelSpd"] = 0.6
+  elif abort_case == "info_display":
+    CS.scc_control["InfoDisplay"] = 5
+
+  messages = step_controller(controller, CC, CS, controller.frame + 1)
+
+  assert not resume_message_sent(messages)
+  assert not controller.stock_scc_keepalive_pending
+  assert controller.stock_scc_keepalive_press_frames == 0
 
 
 def test_ka4_stock_scc_ignores_front_vehicle_departure_notice():
@@ -212,33 +291,32 @@ def test_ka4_stock_scc_front_departure_notice_does_not_arm_warning_edge():
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_stock_scc_requires_a_real_inactive_to_warning_edge():
+def test_ka4_stock_scc_recovers_when_warning_is_already_active_at_stop_start():
   controller = build_controller()
   CC = build_control()
   CS = build_state(info_display=4)
+  pulse_frames = []
 
-  for frame in range(300):
-    controller.frame = frame
-    controller._update_ka4_stock_scc_keepalive(CC, CS)
+  for frame in range(100):
+    if resume_message_sent(step_controller(controller, CC, CS, frame)):
+      pulse_frames.append(frame)
 
-  assert not controller.stock_scc_keepalive_pending
+  assert pulse_frames == [30, 31, 32]
 
 
-def test_ka4_stock_scc_rejects_bouncing_warning_edges():
+def test_ka4_stock_scc_active_warning_gets_one_fast_recovery_then_normal_cadence():
   controller = build_controller()
   CC = build_control()
-  CS = build_state()
-  enter_standstill_warning(controller, CC, CS)
-  assert controller.make_spam_button(CC, CS) == Buttons.RES_ACCEL
+  CS = build_state(info_display=4)
+  pulse_frames = []
 
-  CS.scc_control["InfoDisplay"] = 0
-  controller.frame += 1
-  controller._update_ka4_stock_scc_keepalive(CC, CS)
-  CS.scc_control["InfoDisplay"] = 4
-  controller.frame += 1
-  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  for frame in range(600):
+    if resume_message_sent(step_controller(controller, CC, CS, frame)):
+      pulse_frames.append(frame)
 
-  assert not controller.stock_scc_keepalive_pending
+  starts = pulse_group_starts(pulse_frames)
+  assert starts == [30, 282, 534]
+  assert all(next_start - start >= 250 for start, next_start in zip(starts, starts[1:], strict=False))
 
 
 def test_ka4_stock_scc_enabled_transient_does_not_reset_thirty_second_epoch():
@@ -344,13 +422,16 @@ def test_ka4_alt_button_keepalive_accepts_cached_scalar_or_list_values(list_valu
   CS.cruise_buttons_msg = {key: [value] for key, value in button_values.items()} if list_values else button_values
   enter_standstill_warning(controller, CC, CS)
 
-  messages = controller.create_button_messages(CC, CS, use_clu11=False)
+  for _ in range(3):
+    messages = controller.create_button_messages(CC, CS, use_clu11=False)
+    assert len(messages) == 1
+    assert messages[0][0] == "CRUISE_BUTTONS_ALT"
+    assert messages[0][1] == controller.CAN.CAM
+    assert messages[0][2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
+    assert messages[0][2]["COUNTER"] == 18
+    controller.frame += 1
+    controller._update_ka4_stock_scc_keepalive(CC, CS)
 
-  assert len(messages) == 1
-  assert messages[0][0] == "CRUISE_BUTTONS_ALT"
-  assert messages[0][1] == controller.CAN.CAM
-  assert messages[0][2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
-  assert messages[0][2]["COUNTER"] == 18
   assert not controller.stock_scc_keepalive_pending
 
 
@@ -367,12 +448,32 @@ def test_ka4_alt_button_keepalive_waits_for_source_message():
 
   controller.frame += 1
   CS.cruise_buttons_msg = {"COUNTER": 17, "CRUISE_BUTTONS": Buttons.NONE, "LFA_BTN": 0}
-  messages = controller.create_button_messages(CC, CS, use_clu11=False)
+  for _ in range(3):
+    messages = controller.create_button_messages(CC, CS, use_clu11=False)
+    assert len(messages) == 1
+    assert messages[0][0] == "CRUISE_BUTTONS_ALT"
+    assert messages[0][2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
+    controller.frame += 1
+    controller._update_ka4_stock_scc_keepalive(CC, CS)
 
-  assert len(messages) == 1
-  assert messages[0][0] == "CRUISE_BUTTONS_ALT"
-  assert messages[0][2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
   assert not controller.stock_scc_keepalive_pending
+
+
+def test_ka4_alt_button_warning_recovery_is_retried_if_source_arrives_late():
+  controller = build_controller()
+  controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
+  CC = build_control()
+  CS = build_state(info_display=4)
+
+  for frame in range(81):
+    assert not resume_message_sent(step_controller(controller, CC, CS, frame))
+
+  assert not controller.stock_scc_warning_recovery_sent
+  CS.cruise_buttons_msg = {"COUNTER": 17, "CRUISE_BUTTONS": Buttons.NONE, "LFA_BTN": 0}
+  messages = step_controller(controller, CC, CS, 81)
+
+  assert resume_message_sent(messages)
+  assert controller.stock_scc_warning_recovery_sent
 
 
 def test_ka4_stock_scc_rearm_resets_after_vehicle_moves():
@@ -392,30 +493,50 @@ def test_ka4_stock_scc_rearm_resets_after_vehicle_moves():
   assert controller.stock_scc_last_keepalive_frame is None
 
 
-def test_ka4_stock_scc_rearms_every_oem_interval_only_until_thirty_seconds():
+def test_ka4_stock_scc_keeps_oem_timer_quiet_until_thirty_seconds():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state()
+  oem_warning_deadline = 300
+  warning_frames = []
+  pulse_frames = []
+
+  for frame in range(3050):
+    warning_active = frame >= oem_warning_deadline
+    CS.scc_control["InfoDisplay"] = 4 if warning_active else 0
+    if warning_active:
+      warning_frames.append(frame)
+
+    if resume_message_sent(step_controller(controller, CC, CS, frame)):
+      pulse_frames.append(frame)
+      # Model the stock SCC contract: an accepted short RES press restarts its
+      # own three-second driver-action timer.
+      oem_warning_deadline = frame + 300
+
+  starts = pulse_group_starts(pulse_frames)
+  assert starts[0] == 250
+  assert starts[-1] == 2698
+  assert all(len([frame for frame in pulse_frames if start <= frame < start + 3]) == 3 for start in starts)
+  assert warning_frames[0] == 3000
+  assert all(frame >= 3000 for frame in warning_frames)
+  assert not any(frame > 2700 for frame in pulse_frames)
+
+
+@pytest.mark.parametrize("warning_frame", [2695, 2697])
+def test_ka4_stock_scc_reserves_a_distinct_final_press_window(warning_frame):
   controller = build_controller()
   CC = build_control()
   CS = build_state()
   pulse_frames = []
 
-  for frame in range(300):
-    controller.frame = frame
-    controller._update_ka4_stock_scc_keepalive(CC, CS)
+  for frame in range(2701):
+    CS.scc_control["InfoDisplay"] = 4 if frame >= warning_frame else 0
+    if resume_message_sent(step_controller(controller, CC, CS, frame)):
+      pulse_frames.append(frame)
 
-  for warning_frame in range(300, 3001, 300):
-    controller.frame = warning_frame
-    CS.scc_control["InfoDisplay"] = 4
-    controller._update_ka4_stock_scc_keepalive(CC, CS)
-    if controller.stock_scc_keepalive_pending:
-      assert controller.make_spam_button(CC, CS) == Buttons.RES_ACCEL
-      pulse_frames.append(warning_frame)
-
-    CS.scc_control["InfoDisplay"] = 0
-    for frame in range(warning_frame + 1, min(warning_frame + 300, 3001)):
-      controller.frame = frame
-      controller._update_ka4_stock_scc_keepalive(CC, CS)
-
-  assert pulse_frames == list(range(300, 2701, 300))
+  assert pulse_group_starts(pulse_frames)[-1] == 2698
+  assert pulse_frames[-3:] == [2698, 2699, 2700]
+  assert 2697 not in pulse_frames
 
 
 @pytest.mark.parametrize("oem_hda_state", [0, 1, 2])
