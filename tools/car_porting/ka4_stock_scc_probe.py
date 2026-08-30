@@ -80,7 +80,9 @@ BUTTON_NAMES = {
   5: "LFA_BUTTON",
 }
 
-TARGET_FINGERPRINT = "KIA CARNIVAL 4TH GEN"
+TARGET_FINGERPRINT = "KIA_CARNIVAL_4TH_GEN"
+# Older cereal logs serialized the human-readable platform value.
+TARGET_FINGERPRINT_ALIASES = (TARGET_FINGERPRINT, "KIA CARNIVAL 4TH GEN")
 MIN_EXACT_PROOF_DURATION = 30.25
 EARLIEST_EXPECTED_FINAL_WARNING = 29.5
 LATEST_EXPECTED_FINAL_WARNING = 31.5
@@ -340,7 +342,7 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
       and bool(safety_param & int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS))
     )
   gate = {
-    "fingerprintIsKa4": fingerprint == TARGET_FINGERPRINT,
+    "fingerprintIsKa4": fingerprint in TARGET_FINGERPRINT_ALIASES,
     "pcmCruise": pcm_cruise,
     "stockLongitudinal": not openpilot_long,
     "canFd": bool(flags & int(HyundaiFlags.CANFD)),

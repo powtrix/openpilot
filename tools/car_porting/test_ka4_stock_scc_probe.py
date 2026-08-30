@@ -16,6 +16,7 @@ from tools.car_porting.ka4_stock_scc_probe import (  # noqa: TID251
   SCHEDULE_MODE_REGULAR,
   classify_can_source,
   run_demo,
+  summarize_car_params,
 )
 
 
@@ -26,6 +27,12 @@ def test_classify_panda_tx_echo_sources() -> None:
   assert classify_can_source("can", 0x86) == ("tx_returned", 6)
   assert classify_can_source("can", 0xC6) == ("tx_rejected", 6)
   assert classify_can_source("sendcan", 0x02) == ("send_request", 2)
+
+
+@pytest.mark.parametrize("fingerprint", ("KIA_CARNIVAL_4TH_GEN", "KIA CARNIVAL 4TH GEN"))
+def test_probe_accepts_current_and_legacy_ka4_fingerprint_values(fingerprint: str) -> None:
+  report = summarize_car_params(SimpleNamespace(carFingerprint=fingerprint))
+  assert report["ka4StockSccGate"]["fingerprintIsKa4"]
 
 
 @pytest.mark.parametrize(
