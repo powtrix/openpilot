@@ -7,6 +7,7 @@ from openpilot.cereal import car, log
 from openpilot.selfdrive.controls.controlsd import Controls
 from openpilot.selfdrive.controls.lib.drive_helpers import CAR_ROTATION_RADIUS, CONTROL_N, get_lag_adjusted_curvature
 from openpilot.selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc, N as LAT_MPC_N
+from openpilot.selfdrive.controls.lib.lateral_planner import apply_static_path_offset, publish_offset_evidence
 
 
 V_EGO = 20.0
@@ -175,3 +176,20 @@ def test_straight_path_offset_mpc_plan_reaches_controlsd():
   assert controls.desired_curvature == pytest.approx(expected_plan_curvature)
   assert CC.actuators.curvature == pytest.approx(expected_plan_curvature)
   assert np.sign(controls.desired_curvature) != np.sign(raw_model_curvature)
+
+
+def test_static_and_dynamic_offsets_are_logged_as_numeric_evidence():
+  path_xyz = np.zeros((LAT_MPC_N + 1, 3))
+  path_xyz[:, 1] = np.linspace(-0.02, 0.02, LAT_MPC_N + 1)
+  expected_before = path_xyz[:, 1].copy()
+
+  before = apply_static_path_offset(path_xyz, PATH_OFFSET_M)
+
+  assert before == pytest.approx(expected_before)
+  assert path_xyz[:, 1] - before == pytest.approx(PATH_OFFSET_M)
+
+  plan = log.LateralPlan.new_message()
+  publish_offset_evidence(plan, PATH_OFFSET_M, -0.03, before)
+  assert plan.staticPathOffset == pytest.approx(PATH_OFFSET_M)
+  assert plan.dynamicLaneOffset == pytest.approx(-0.03)
+  assert list(plan.pathBeforeStaticOffset) == pytest.approx(expected_before)

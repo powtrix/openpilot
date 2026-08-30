@@ -29,6 +29,19 @@ LATERAL_JERK_COST = 0.04
 STEERING_RATE_COST = 700.0
 
 
+def apply_static_path_offset(path_xyz, path_offset):
+  """Apply and return directly loggable evidence of the static path offset."""
+  path_before_static_offset = path_xyz[:, 1].copy()
+  path_xyz[:, 1] += path_offset
+  return path_before_static_offset
+
+
+def publish_offset_evidence(lateral_plan, static_path_offset, dynamic_lane_offset, path_before_static_offset):
+  lateral_plan.staticPathOffset = float(static_path_offset)
+  lateral_plan.dynamicLaneOffset = float(dynamic_lane_offset)
+  lateral_plan.pathBeforeStaticOffset = path_before_static_offset.tolist()
+
+
 class LateralPlanner:
   def __init__(self, CP, debug=False):
     #self.DH = DesireHelper()
@@ -67,6 +80,7 @@ class LateralPlanner:
     self.t_idxs = np.arange(TRAJECTORY_SIZE)
     self.y_pts = np.zeros((TRAJECTORY_SIZE,))
     self.d_path_w_lines_xyz = np.zeros((TRAJECTORY_SIZE, 3))
+    self.path_before_static_offset = np.zeros((TRAJECTORY_SIZE,))
 
     self.lat_mpc = LateralMpc()
     self.reset_mpc(np.zeros(4))
@@ -160,7 +174,7 @@ class LateralPlanner:
     self.latDebugText = self.LP.debugText
     #self.lanelines_active = True if self.LP.d_prob > 0.3 and self.LP.lanefull_mode else False
 
-    self.path_xyz[:, 1] += self.pathOffset
+    self.path_before_static_offset = apply_static_path_offset(self.path_xyz, self.pathOffset)
 
     self.lat_mpc.set_weights(self.lateralPathCost, self.lateralMotionCost,
                              LATERAL_ACCEL_COST, LATERAL_JERK_COST,
@@ -218,6 +232,12 @@ class LateralPlanner:
     lateralPlan = plan_send.lateralPlan
     lateralPlan.modelMonoTime = sm.logMonoTime['modelV2']
     lateralPlan.dPathPoints = self.y_pts.tolist()
+    publish_offset_evidence(
+      lateralPlan,
+      self.pathOffset,
+      self.LP.offset_total,
+      self.path_before_static_offset[:LAT_MPC_N + 1],
+    )
     lateralPlan.psis = self.lat_mpc.x_sol[0:CONTROL_N, 2].tolist()
     lateralPlan.distances = self.lat_mpc.x_sol[0:CONTROL_N, 0].tolist()
 
