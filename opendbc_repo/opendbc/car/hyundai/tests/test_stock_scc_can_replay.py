@@ -91,21 +91,33 @@ class Ka4StockSccReplay:
     self.CS = build_state()
     self.scc_parser = CANParser(DBC_NAME, [("SCC_CONTROL", SCC_CONTROL_FREQUENCY)], self.controller.CAN.ECAN)
     self.modeled_state_deadline = round(3.0 / DT_CTRL)
+    self.info_display_override: int | None = None
+    self.acc_mode = 1
     self.modeled_state_frames: list[int] = []
     self.scc_packets: list[tuple[int, bytes, int]] = []
+    self.oem_button_packets: list[tuple[int, bytes, int]] = []
+    # ``injected`` records host requests. A request is not proof that Panda
+    # accepted it, so keep the safety result in a separate list.
     self.injected: list[InjectedButton] = []
+    self.safety_accepted: list[InjectedButton] = []
+    self.last_safety_tx_results: list[bool | None] = []
 
   def _update_stock_inputs(self, frame: int) -> None:
     scc_period_frames = round(1.0 / (SCC_CONTROL_FREQUENCY * DT_CTRL))
     if frame % scc_period_frames == 0:
       stock_counter = (frame // scc_period_frames) & 0xFF
-      info_display = 4 if frame >= self.modeled_state_deadline else 0
+      info_display = (
+        self.info_display_override
+        if self.info_display_override is not None
+        else 4 if frame >= self.modeled_state_deadline else 0
+      )
       if info_display == 4:
         self.modeled_state_frames.append(frame)
 
       scc_packet = self.scc_packer.make_can_msg("SCC_CONTROL", self.controller.CAN.ECAN, {
         "COUNTER": stock_counter,
-        "ACCMode": 1,
+        "ACCMode": self.acc_mode,
+        "MainMode_ACC": 1,
         "ACC_ObjDist": 5.0,
         "ACC_ObjRelSpd": 0.0,
         "HUD_LEAD_INFO": 2,
@@ -117,6 +129,10 @@ class Ka4StockSccReplay:
       self.scc_parser.update([round(frame * DT_CTRL * 1e9), [scc_packet]])
       assert self.scc_parser.can_valid
       self.CS.scc_control = dict(self.scc_parser.vl["SCC_CONTROL"])
+      # Mirror the production CarState stock-SCC engagement contract. The
+      # parser above supplies the real DBC value; ACCMode 1/2 are the only
+      # enabled states accepted by CarState and Panda stock-long safety.
+      self.CS.out.cruiseState.enabled = self.acc_mode in (1, 2)
 
     # CarState reads this value from the stock 0x1CF/0x1AA received at 50 Hz.
     # Build and decode that packet rather than assigning an invented
@@ -133,23 +149,45 @@ class Ka4StockSccReplay:
       "CRUISE_BUTTONS": Buttons.NONE,
     })
     oem_button = self.oem_button_packer.make_can_msg(self.button_message_name, self.controller.CAN.ECAN, oem_values)
+    self.oem_button_packets.append(oem_button)
     decoded_button = decode_message(self.dbc, self.button_message_name, oem_button[1])
     self.CS.buttons_counter = decoded_button["COUNTER"]
     self.CS.cruise_buttons_msg = decoded_button if self.alt_buttons else None
 
-  def step(self, frame: int) -> list[tuple[int, bytes, int]]:
+  def step(self, frame: int, *, safety=None) -> list[tuple[int, bytes, int]]:
+    previous_scc_count = len(self.scc_packets)
+    previous_button_count = len(self.oem_button_packets)
     self._update_stock_inputs(frame)
+    if safety is not None:
+      safety.set_timer(round(frame * DT_CTRL * 1e6))
+      for address, data, bus in (
+        self.scc_packets[previous_scc_count:] + self.oem_button_packets[previous_button_count:]
+      ):
+        local_bus = bus - self.panda_bus_offset
+        assert 0 <= local_bus <= 2
+        assert safety.safety_rx_hook(libsafety_py.make_CANPacket(address, local_bus, data))
     self.controller.frame = frame
     self.controller._update_ka4_stock_scc_keepalive(self.CC, self.CS)
     messages = self.controller.create_button_messages(self.CC, self.CS, use_clu11=False)
+    self.last_safety_tx_results = []
     for address, data, bus in messages:
       decoded = decode_message(self.dbc, self.button_message_name, data)
+      accepted = None
+      if safety is not None:
+        local_bus = bus - self.panda_bus_offset
+        assert 0 <= local_bus <= 2
+        accepted = bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(address, local_bus, data)))
+      self.last_safety_tx_results.append(accepted)
       if decoded["CRUISE_BUTTONS"] == Buttons.RES_ACCEL:
-        self.injected.append(InjectedButton(frame, address, bus, data, self.CS.buttons_counter))
-        # Advance the synthetic InfoDisplay schedule assumed by this replay.
-        # Public KA4 routes do not establish that SCC accepts these injected
-        # frames, changes any OEM timing, or displays a corresponding warning.
-        self.modeled_state_deadline = frame + round(3.0 / DT_CTRL)
+        request = InjectedButton(frame, address, bus, data, self.CS.buttons_counter)
+        self.injected.append(request)
+        if accepted:
+          self.safety_accepted.append(request)
+          # Advance the synthetic InfoDisplay schedule only after Panda
+          # accepts the frame. This still does not prove arbitration or SCC
+          # ECU acceptance, but a rejected host request must not advance even
+          # the replay's synthetic model.
+          self.modeled_state_deadline = frame + round(3.0 / DT_CTRL)
     return messages
 
 
@@ -249,14 +287,12 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_synthetic_state_mode
     safety_param |= HyundaiSafetyFlags.CANFD_ALT_BUTTONS
   assert safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(safety_param)) == 0
   safety.init_tests()
-  safety.set_controls_allowed(True)
+  assert not safety.get_controls_allowed()
 
   for frame in range(3051):
-    messages = replay.step(frame)
-    for address, data, bus in messages:
-      # card publishes global bus numbers. pandad routes the frame to the
-      # selected Panda and that Panda's safety hook sees its local 0..2 bus.
-      assert safety.safety_tx_hook(libsafety_py.make_CANPacket(address, bus - panda_bus_offset, data))
+    messages = replay.step(frame, safety=safety)
+    assert len(replay.last_safety_tx_results) == len(messages)
+    assert all(replay.last_safety_tx_results)
 
   frames = [message.frame for message in replay.injected]
   groups = pulse_groups(frames)
@@ -341,6 +377,51 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_synthetic_state_mode
   else:
     button_checksum = button_message.sigs["_CHECKSUM"]
     assert button_checksum.calc_checksum is None
+
+
+@pytest.mark.parametrize("closing_acc_mode", [0, 4], ids=["off", "cancelled"])
+def test_ka4_real_scc_rx_aborts_keepalive_and_panda_rejects_generic_reactivation(closing_acc_mode):
+  replay = Ka4StockSccReplay(alt_buttons=True)
+  safety = libsafety_py.libsafety
+  assert safety.set_safety_hooks(
+    CarParams.SafetyModel.hyundaiCanfd, int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
+  ) == 0
+  safety.init_tests()
+
+  # Qualify the physical stop with ACCMode=1. At the 0.30 s boundary, the
+  # observed InfoDisplay=4 state starts a recovery burst and Panda permits its
+  # first frame because the received SCC state is still engaged.
+  for frame in range(30):
+    assert replay.step(frame, safety=safety) == []
+  replay.info_display_override = 4
+  first = replay.step(30, safety=safety)
+  assert len(first) == 1
+  assert decode_message(replay.dbc, replay.button_message_name, first[0][1])["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
+  assert replay.last_safety_tx_results == [True]
+  assert [request.frame for request in replay.safety_accepted] == [30]
+  assert safety.get_controls_allowed()
+
+  # The next 50 Hz SCC frame closes ACC before the second fresh button source.
+  # Feed that real RX transition to Panda before running the controller. The
+  # dedicated keepalive aborts. The existing generic cruise-reactivation path
+  # still creates one host RES request while CC.enabled is stale, but Panda has
+  # already closed controls_allowed and must reject that request.
+  assert replay.step(31, safety=safety) == []
+  replay.acc_mode = closing_acc_mode
+  after_transition = replay.step(32, safety=safety)
+  assert len(after_transition) == 1
+  assert decode_message(
+    replay.dbc, replay.button_message_name, after_transition[0][1],
+  )["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
+  assert not replay.CS.out.cruiseState.enabled
+  assert not replay.controller.stock_scc_keepalive_pending
+  assert replay.controller.stock_scc_keepalive_press_frames == 0
+  assert not replay.controller.stock_scc_keepalive_sent
+  assert not safety.get_controls_allowed()
+  assert replay.last_safety_tx_results == [False]
+  assert [request.frame for request in replay.injected] == [30, 32]
+  assert [request.frame for request in replay.safety_accepted] == [30]
+  assert replay.modeled_state_deadline == 30 + round(3.0 / DT_CTRL)
 
 
 INTERLOCKS = (

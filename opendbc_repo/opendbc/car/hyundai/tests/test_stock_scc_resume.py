@@ -401,7 +401,7 @@ def test_ka4_stock_scc_front_departure_notice_does_not_arm_stale_resume_state_ed
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_stock_scc_responds_when_resume_state_is_already_active_at_stop_start():
+def test_ka4_stock_scc_info_display_4_at_stop_start_waits_for_dwell_then_sends_exact_burst():
   controller = build_controller()
   CC = build_control()
   CS = build_state(info_display=4)
@@ -412,6 +412,77 @@ def test_ka4_stock_scc_responds_when_resume_state_is_already_active_at_stop_star
       pulse_frames.append(frame)
 
   assert pulse_frames == [30, 32, 34]
+  assert not any(frame < 30 for frame in pulse_frames)
+
+
+def test_ka4_stock_scc_early_info_display_recovery_is_blocked_when_acc_mode_closes_before_dwell():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state()
+  pulse_frames = []
+
+  for frame in range(300):
+    if frame == 10:
+      CS.scc_control["InfoDisplay"] = 4
+    if frame == 20:
+      # Keep the higher-level cruiseState fixture enabled so this assertion
+      # specifically proves that raw SCC ACCMode closes the controller gate.
+      CS.scc_control["ACCMode"] = 4
+    if resume_message_sent(step_controller(controller, CC, CS, frame)):
+      pulse_frames.append(frame)
+
+  assert pulse_frames == []
+  assert controller.stock_scc_stop_start_frame is None
+  assert controller.stock_scc_near_zero_frames == 0
+  assert not controller.stock_scc_keepalive_pending
+
+
+def test_ka4_stock_scc_alerts_5_candidate_alone_does_not_trigger_early_recovery():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(info_display=0)
+  # ALERTS_5=5 is only a candidate for the visible cluster prompt. The current
+  # controller contract intentionally reads SCC_CONTROL, not ADRV_0x161, until
+  # synchronized vehicle evidence establishes that association.
+  CS.adrv_0x161 = {"ALERTS_5": 5}
+
+  pulse_frames = [frame for frame in range(250)
+                  if resume_message_sent(step_controller(controller, CC, CS, frame))]
+
+  assert pulse_frames == []
+  assert not controller.stock_scc_warning_recovery_sent
+  assert resume_message_sent(step_controller(controller, CC, CS, 250))
+
+
+def test_ka4_stock_scc_info_display_4_at_096_seconds_triggers_immediate_recovery():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(info_display=0, acc_mode=1)
+  pulse_frames = []
+
+  for frame in range(105):
+    if frame == 96:
+      CS.scc_control["InfoDisplay"] = 4
+    if resume_message_sent(step_controller(controller, CC, CS, frame)):
+      pulse_frames.append(frame)
+
+  assert pulse_frames == [96, 98, 100]
+  assert controller.stock_scc_warning_recovery_sent
+
+
+@pytest.mark.parametrize("info_display", [5, 6, 7])
+def test_ka4_stock_scc_info_display_5_through_7_block_raw_lead_gate(info_display):
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(info_display=info_display)
+
+  pulse_frames = [frame for frame in range(300)
+                  if resume_message_sent(step_controller(controller, CC, CS, frame))]
+
+  assert pulse_frames == []
+  assert controller.stock_scc_stop_start_frame is None
+  assert controller.stock_scc_near_zero_frames == 0
+  assert not controller.stock_scc_keepalive_pending
 
 
 def test_ka4_stock_scc_active_resume_state_gets_one_fast_response_then_normal_cadence():

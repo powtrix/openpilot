@@ -66,6 +66,7 @@ if str(OPENPILOT_ROOT) not in sys.path:
 
 DBC_NAME = "hyundai_canfd_generated"
 SCC_CONTROL_ADDRESS = 0x1A0
+TCS_ADDRESS = 0x175
 ADRV_0X161_ADDRESS = 0x161
 LFAHDA_CLUSTER_ADDRESS = 0x1E0
 CRUISE_BUTTONS_ALT_ADDRESS = 0x1AA
@@ -95,7 +96,7 @@ BUTTON_NAMES = {
   5: "LFA_BUTTON",
 }
 
-REPORT_SCHEMA_VERSION = 5
+REPORT_SCHEMA_VERSION = 6
 TARGET_FINGERPRINT = "KIA_CARNIVAL_4TH_GEN"
 # Older cereal logs serialized the human-readable platform value.
 TARGET_FINGERPRINT_ALIASES = (TARGET_FINGERPRINT, "KIA CARNIVAL 4TH GEN")
@@ -135,6 +136,9 @@ USE_SWITCH_OR_PEDAL_TO_ACCELERATE = 5
 CLUSTER_STREAM_MAX_GAP = 0.250
 PROOF_STREAM_MAX_GAP = 0.100
 PROOF_STREAM_EDGE_TOLERANCE = 0.100
+PANDA_STATES_PERIOD = 0.100
+PANDA_STATES_CADENCE_TOLERANCE = 0.050
+UINT32_MODULUS = 1 << 32
 
 LIVE_PARAM_KEYS = (
   "CarName",
@@ -250,6 +254,7 @@ class SccSample:
   counter: int
   info_display: int
   acc_mode: int
+  main_mode_acc: int
   lead_info: int
   lead_distance: float
   lead_relative_speed: float
@@ -285,6 +290,33 @@ class ButtonSample:
   normal_main: int
   lfa_button: int
   non_button_values: tuple[tuple[str, float | int], ...]
+
+
+@dataclass(frozen=True)
+class TcsSample:
+  t: float
+  src: int
+  bus: int
+  data_hex: str
+  checksum_valid: bool | None
+  counter: int
+  acc_enable: int
+  acc_request: int
+  esc_standstill: int
+  driver_braking: int
+
+
+@dataclass(frozen=True)
+class PandaSample:
+  t: float
+  index: int
+  uptime: int
+  controls_allowed: bool
+  safety_tx_blocked: int
+  safety_rx_invalid: int
+  safety_rx_checks_invalid: bool
+  safety_model: str
+  safety_param: int
 
 
 @dataclass(frozen=True)
@@ -516,7 +548,9 @@ class ProbeAnalyzer:
     self.controls: list[ControlSample] = []
     self.alerts: list[AlertSample] = []
     self.scc: list[SccSample] = []
+    self.tcs: list[TcsSample] = []
     self.buttons: list[ButtonSample] = []
+    self.panda_states: list[PandaSample] = []
     self.cluster_can: list[ClusterCanSample] = []
     self.decode_errors: Counter[str] = Counter()
     self.decode_error_samples: list[CanDecodeErrorSample] = []
@@ -538,6 +572,8 @@ class ProbeAnalyzer:
     message_name = None
     if address == SCC_CONTROL_ADDRESS:
       message_name = "SCC_CONTROL"
+    elif address == TCS_ADDRESS:
+      message_name = "TCS"
     elif address == ADRV_0X161_ADDRESS:
       message_name = "ADRV_0x161"
     elif address == LFAHDA_CLUSTER_ADDRESS:
@@ -607,11 +643,28 @@ class ProbeAnalyzer:
           counter=int(values.get("COUNTER", 0)),
           info_display=int(values.get("InfoDisplay", 0)),
           acc_mode=int(values.get("ACCMode", 0)),
+          main_mode_acc=int(values.get("MainMode_ACC", 0)),
           lead_info=int(values.get("HUD_LEAD_INFO", 0)),
           lead_distance=_finite_float(values.get("ACC_ObjDist")),
           lead_relative_speed=_finite_float(values.get("ACC_ObjRelSpd")),
           sys_fail_state=int(values.get("SysFailState", 0)),
           takeover_request=int(values.get("TakeOverReq", 0)),
+        ))
+      return
+
+    if address == TCS_ADDRESS:
+      if service == "can" and origin == "vehicle_rx":
+        self.tcs.append(TcsSample(
+          t=t,
+          src=src,
+          bus=bus,
+          data_hex=data.hex(),
+          checksum_valid=checksum_valid,
+          counter=int(values.get("COUNTER", 0)),
+          acc_enable=int(values.get("ACCEnable", 0)),
+          acc_request=int(values.get("ACC_REQ", 0)),
+          esc_standstill=int(values.get("ESC_StdStillVal", 0)),
+          driver_braking=int(values.get("DriverBraking", 0)),
         ))
       return
 
@@ -677,6 +730,21 @@ class ProbeAnalyzer:
       alert_text_2=str(_safe_get(state, "alertText2", "")),
     ))
 
+  def feed_panda_states(self, t: float, states: Iterable[Any]) -> None:
+    self._touch(t)
+    for index, state in enumerate(states):
+      self.panda_states.append(PandaSample(
+        t=t,
+        index=index,
+        uptime=int(_safe_get(state, "uptime", 0)),
+        controls_allowed=bool(_safe_get(state, "controlsAllowed", False)),
+        safety_tx_blocked=int(_safe_get(state, "safetyTxBlocked", 0)),
+        safety_rx_invalid=int(_safe_get(state, "safetyRxInvalid", 0)),
+        safety_rx_checks_invalid=bool(_safe_get(state, "safetyRxChecksInvalid", False)),
+        safety_model=str(_safe_get(state, "safetyModel", "")),
+        safety_param=int(_safe_get(state, "safetyParam", 0)),
+      ))
+
   def feed_cereal_event(self, event: Any) -> None:
     t = int(_safe_get(event, "logMonoTime", 0)) * 1e-9
     try:
@@ -692,6 +760,8 @@ class ProbeAnalyzer:
       self.feed_control(t, event.carControl)
     elif which == "selfdriveState":
       self.feed_selfdrive(t, event.selfdriveState)
+    elif which == "pandaStates":
+      self.feed_panda_states(t, event.pandaStates)
     elif which == "carParams":
       self.set_car_params(event.carParams, "rlog:carParams")
 
@@ -718,6 +788,7 @@ class ProbeAnalyzer:
     return result
 
   def _stock_rx_bus(self) -> int | None:
+    """Return the observed stock-source bus for descriptive layout reports."""
     button_counts = Counter(
       sample.bus for sample in self.buttons
       if sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
@@ -727,11 +798,214 @@ class ProbeAnalyzer:
     scc_counts = Counter(sample.bus for sample in self.scc)
     return max(scc_counts, key=lambda bus: (scc_counts[bus], -bus)) if scc_counts else None
 
+  def _expected_stock_rx_bus(self) -> int | None:
+    """Return the CarParams-derived ECAN bus used for causal evidence."""
+    panda_bus_offset = self._configured_panda_bus_offset()
+    if panda_bus_offset is None or not self.car_params:
+      return None
+    return panda_bus_offset + (1 if self.car_params.get("canFdHda2") else 0)
+
+  def _camera_rx_bus(self) -> int | None:
+    panda_bus_offset = self._configured_panda_bus_offset()
+    return None if panda_bus_offset is None else panda_bus_offset + 2
+
   def _configured_panda_bus_offset(self) -> int | None:
     if not self.car_params:
       return None
     value = self.car_params.get("pandaBusOffset")
     return int(value) if isinstance(value, int) and value >= 0 else None
+
+  def _active_safety_config(self) -> dict[str, Any] | None:
+    panda_bus_offset = self._configured_panda_bus_offset()
+    if panda_bus_offset is None or not self.car_params:
+      return None
+    index = panda_bus_offset // 4
+    configs = self.car_params.get("safetyConfigs")
+    if not isinstance(configs, list) or not (0 <= index < len(configs)):
+      return None
+    config = configs[index]
+    if not isinstance(config, dict):
+      return None
+    return {
+      "index": index,
+      "model": str(config.get("model", "")),
+      "param": int(config.get("param", 0)),
+    }
+
+  @staticmethod
+  def _counter_evidence(samples: list[PandaSample], field: str) -> dict[str, Any]:
+    """Summarize a cumulative UInt32 counter without hiding resets.
+
+    Panda exposes cumulative counters. A decrease is only treated as a wrap
+    when uptime/config stay continuous and the values straddle the UInt32
+    boundary. Reboot/config changes and ambiguous decreases make the total
+    delta unknown instead of silently reporting zero.
+    """
+    ordered = sorted(samples, key=lambda sample: sample.t)
+    if not ordered:
+      return {
+        "first": None,
+        "last": None,
+        "delta": None,
+        "deltaExact": False,
+        "wrapCount": 0,
+        "resetCount": 0,
+        "ambiguousDecreaseCount": 0,
+      }
+
+    total = 0
+    wraps = 0
+    resets = 0
+    ambiguous = 0
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+      previous_value = int(getattr(previous, field))
+      current_value = int(getattr(current, field))
+      same_config = (
+        previous.safety_model == current.safety_model
+        and previous.safety_param == current.safety_param
+      )
+      uptime_continuous = current.uptime >= previous.uptime
+      if not same_config or not uptime_continuous:
+        resets += 1
+      elif current_value >= previous_value:
+        total += current_value - previous_value
+      elif previous_value >= UINT32_MODULUS * 0.90 and current_value <= UINT32_MODULUS * 0.10:
+        total += UINT32_MODULUS - previous_value + current_value
+        wraps += 1
+      else:
+        ambiguous += 1
+
+    exact = resets == 0 and ambiguous == 0
+    return {
+      "first": int(getattr(ordered[0], field)),
+      "last": int(getattr(ordered[-1], field)),
+      "delta": total if exact else None,
+      "deltaExact": exact,
+      "wrapCount": wraps,
+      "resetCount": resets,
+      "ambiguousDecreaseCount": ambiguous,
+    }
+
+  def _matching_active_panda_samples(self) -> tuple[dict[str, Any] | None, list[PandaSample]]:
+    expected = self._active_safety_config()
+    if expected is None:
+      return None, []
+    return expected, [
+      sample for sample in self.panda_states
+      if sample.index == expected["index"]
+      and sample.safety_model == expected["model"]
+      and sample.safety_param == expected["param"]
+    ]
+
+  def _active_panda_index_samples(self) -> tuple[dict[str, Any] | None, list[PandaSample]]:
+    expected = self._active_safety_config()
+    if expected is None:
+      return None, []
+    return expected, [sample for sample in self.panda_states if sample.index == expected["index"]]
+
+  def _panda_report(self) -> dict[str, Any]:
+    grouped: dict[int, list[PandaSample]] = defaultdict(list)
+    for sample in self.panda_states:
+      grouped[sample.index].append(sample)
+
+    panda_bus_offset = self._configured_panda_bus_offset()
+    expected_config, active_index_samples = self._active_panda_index_samples()
+    _, matching_active_samples = self._matching_active_panda_samples()
+    active_index = None if expected_config is None else expected_config["index"]
+    pandas = []
+    for index, samples in sorted(grouped.items()):
+      samples.sort(key=lambda sample: sample.t)
+      transitions = []
+      previous: tuple[Any, ...] | None = None
+      previous_tx_blocked: int | None = None
+      for sample in samples:
+        state = (
+          sample.controls_allowed,
+          sample.safety_rx_invalid,
+          sample.safety_rx_checks_invalid,
+          sample.safety_model,
+          sample.safety_param,
+        )
+        if state != previous or (
+          previous_tx_blocked is not None and sample.safety_tx_blocked != previous_tx_blocked
+        ):
+          transitions.append({
+            "t": self._rel(sample.t),
+            "uptime": sample.uptime,
+            "controlsAllowed": sample.controls_allowed,
+            "safetyTxBlocked": sample.safety_tx_blocked,
+            "safetyRxInvalid": sample.safety_rx_invalid,
+            "safetyRxChecksInvalid": sample.safety_rx_checks_invalid,
+            "safetyModel": sample.safety_model,
+            "safetyParam": sample.safety_param,
+            "matchesExpectedSafetyConfig": bool(
+              expected_config is not None
+              and index == expected_config["index"]
+              and sample.safety_model == expected_config["model"]
+              and sample.safety_param == expected_config["param"]
+            ),
+          })
+        previous = state
+        previous_tx_blocked = sample.safety_tx_blocked
+      config_matching_samples = [
+        sample for sample in samples
+        if expected_config is not None
+        and index == expected_config["index"]
+        and sample.safety_model == expected_config["model"]
+        and sample.safety_param == expected_config["param"]
+      ]
+      pandas.append({
+        "index": index,
+        "activeSafetyPanda": index == active_index,
+        "sampleCount": len(samples),
+        "expectedSafetyConfigMatchSamples": len(config_matching_samples),
+        "expectedSafetyConfigMismatchSamples": len(samples) - len(config_matching_samples),
+        "first": self._rel(samples[0].t),
+        "last": self._rel(samples[-1].t),
+        "uptimeFirst": samples[0].uptime,
+        "uptimeLast": samples[-1].uptime,
+        "controlsAllowedTrueSamples": sum(sample.controls_allowed for sample in samples),
+        "safetyTxBlocked": self._counter_evidence(samples, "safety_tx_blocked"),
+        "safetyRxInvalid": self._counter_evidence(samples, "safety_rx_invalid"),
+        "safetyRxChecksInvalidSamples": sum(
+          sample.safety_rx_checks_invalid for sample in config_matching_samples
+        ),
+        "transitions": transitions[:100],
+      })
+    return {
+      "configuredPandaBusOffset": panda_bus_offset,
+      "expectedSafetyConfig": expected_config,
+      "activeSafetyPandaIndex": active_index,
+      "activeSafetyPandaIndexObserved": active_index is not None and active_index in grouped,
+      "activeSafetyConfigObserved": bool(matching_active_samples),
+      "activeSafetyConfigContinuous": bool(active_index_samples) and (
+        len(matching_active_samples) == len(active_index_samples)
+      ),
+      "pandas": pandas,
+      "counterNote": (
+        "Counters cover all Panda TX/RX safety events, not a specific RES frame. " +
+        "A rejected RES requires the matched tx-rejected echo; a counter decrease without a proven wrap makes delta null."
+      ),
+    }
+
+  def _tcs_report(self) -> dict[str, Any]:
+    grouped: dict[int, list[TcsSample]] = defaultdict(list)
+    for sample in self.tcs:
+      grouped[sample.bus].append(sample)
+    buses = []
+    for bus, samples in sorted(grouped.items()):
+      samples.sort(key=lambda sample: sample.t)
+      buses.append({
+        "bus": bus,
+        "sampleCount": len(samples),
+        "first": self._rel(samples[0].t),
+        "last": self._rel(samples[-1].t),
+        "accEnableCounts": dict(sorted(Counter(sample.acc_enable for sample in samples).items())),
+        "accRequestCounts": dict(sorted(Counter(sample.acc_request for sample in samples).items())),
+        "escStandstillCounts": dict(sorted(Counter(sample.esc_standstill for sample in samples).items())),
+        "driverBrakingCounts": dict(sorted(Counter(sample.driver_braking for sample in samples).items())),
+      })
+    return {"buses": buses}
 
   def _scc_report(self) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -747,11 +1021,21 @@ class ProbeAnalyzer:
       deltas = [(curr.counter - prev.counter) & 0xFF for prev, curr in zip(samples, samples[1:], strict=False)]
       duration = samples[-1].t - samples[0].t if len(samples) > 1 else 0.0
       transitions = []
-      previous = None
+      previous_info = None
+      acc_mode_transitions = []
+      previous_acc_mode = None
+      main_mode_transitions = []
+      previous_main_mode = None
       for sample in samples:
-        if sample.info_display != previous:
+        if sample.info_display != previous_info:
           transitions.append({"t": self._rel(sample.t), "value": sample.info_display})
-          previous = sample.info_display
+          previous_info = sample.info_display
+        if sample.acc_mode != previous_acc_mode:
+          acc_mode_transitions.append({"t": self._rel(sample.t), "value": sample.acc_mode})
+          previous_acc_mode = sample.acc_mode
+        if sample.main_mode_acc != previous_main_mode:
+          main_mode_transitions.append({"t": self._rel(sample.t), "value": sample.main_mode_acc})
+          previous_main_mode = sample.main_mode_acc
       result["buses"].append({
         "bus": bus,
         "count": len(samples),
@@ -763,6 +1047,10 @@ class ProbeAnalyzer:
         "infoDisplayTransitions": transitions[:100],
         "accModeCounts": {str(value): count for value, count in sorted(Counter(
           sample.acc_mode for sample in samples).items())},
+        "accModeTransitions": acc_mode_transitions[:100],
+        "mainModeAccCounts": {str(value): count for value, count in sorted(Counter(
+          sample.main_mode_acc for sample in samples).items())},
+        "mainModeAccTransitions": main_mode_transitions[:100],
         "rawLeadSafeSamples": sum(sample.raw_lead_safe for sample in samples),
         "counter": {
           "first": samples[0].counter,
@@ -774,6 +1062,7 @@ class ProbeAnalyzer:
         "firstDecoded": {
           "InfoDisplay": samples[0].info_display,
           "ACCMode": samples[0].acc_mode,
+          "MainMode_ACC": samples[0].main_mode_acc,
           "HUD_LEAD_INFO": samples[0].lead_info,
           "ACC_ObjDist": samples[0].lead_distance,
           "ACC_ObjRelSpd": samples[0].lead_relative_speed,
@@ -784,6 +1073,7 @@ class ProbeAnalyzer:
         "lastDecoded": {
           "InfoDisplay": samples[-1].info_display,
           "ACCMode": samples[-1].acc_mode,
+          "MainMode_ACC": samples[-1].main_mode_acc,
           "HUD_LEAD_INFO": samples[-1].lead_info,
           "ACC_ObjDist": samples[-1].lead_distance,
           "ACC_ObjRelSpd": samples[-1].lead_relative_speed,
@@ -1010,7 +1300,7 @@ class ProbeAnalyzer:
       groups[-1].append(request)
 
     result = []
-    stock_bus = self._stock_rx_bus()
+    stock_bus = self._expected_stock_rx_bus()
     stock = sorted(
       (sample for sample in self.buttons
        if sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
@@ -1220,6 +1510,45 @@ class ProbeAnalyzer:
       episodes.append((current_start, current_last, start_observed))
     return episodes
 
+  def _physical_stop_episodes(self) -> list[tuple[float, float, bool]]:
+    """Find physical near-zero stops even if SCC/control disengages at entry."""
+    states = sorted(self.states, key=lambda sample: sample.t)
+    episodes: list[tuple[float, float, bool]] = []
+    current_start: float | None = None
+    current_last: float | None = None
+    start_observed = False
+    previous: StateSample | None = None
+
+    def physical_near_zero(sample: StateSample) -> bool:
+      return sample.kinematics_finite and sample.standstill and abs(sample.v_ego_raw) <= 0.03
+
+    for sample in states:
+      if current_start is not None and current_last is not None and sample.t - current_last > STOP_STREAM_GAP:
+        episodes.append((current_start, current_last, start_observed))
+        current_start = current_last = None
+        start_observed = False
+      if physical_near_zero(sample):
+        if current_start is None:
+          current_start = sample.t
+          start_observed = (
+            previous is not None
+            and previous.kinematics_finite
+            and previous.can_valid
+            and not physical_near_zero(previous)
+            and (abs(previous.v_ego) > 0.05 or abs(previous.v_ego_raw) > 0.03)
+            and sample.can_valid
+            and sample.t - previous.t <= CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE
+          )
+        current_last = sample.t
+      elif current_start is not None and current_last is not None:
+        episodes.append((current_start, current_last, start_observed))
+        current_start = current_last = None
+        start_observed = False
+      previous = sample
+    if current_start is not None and current_last is not None:
+      episodes.append((current_start, current_last, start_observed))
+    return episodes
+
   def _state_report(self) -> dict[str, Any]:
     states = sorted(self.states, key=lambda sample: sample.t)
 
@@ -1312,6 +1641,7 @@ class ProbeAnalyzer:
       scc_by_bus[sample.bus].append(sample)
     for bus, samples in sorted(scc_by_bus.items()):
       previous_info: int | None = None
+      previous_engagement: tuple[int, int] | None = None
       for sample in sorted(samples, key=lambda item: item.t):
         if sample.info_display != previous_info:
           events.append((sample.t, "sccInfoDisplay", {
@@ -1321,6 +1651,105 @@ class ProbeAnalyzer:
             "dataHex": sample.data_hex,
           }))
           previous_info = sample.info_display
+        engagement = (sample.acc_mode, sample.main_mode_acc)
+        if engagement != previous_engagement:
+          events.append((sample.t, "sccEngagementTransition", {
+            "bus": bus,
+            "ACCMode": sample.acc_mode,
+            "MainMode_ACC": sample.main_mode_acc,
+            "InfoDisplay": sample.info_display,
+            "counter": sample.counter,
+            "dataHex": sample.data_hex,
+          }))
+          previous_engagement = engagement
+
+    tcs_by_bus: dict[int, list[TcsSample]] = defaultdict(list)
+    for sample in self.tcs:
+      tcs_by_bus[sample.bus].append(sample)
+    for bus, samples in sorted(tcs_by_bus.items()):
+      previous_tcs: tuple[int, ...] | None = None
+      for sample in sorted(samples, key=lambda item: item.t):
+        state = (
+          sample.acc_enable,
+          sample.acc_request,
+          sample.esc_standstill,
+          sample.driver_braking,
+        )
+        if state != previous_tcs:
+          events.append((sample.t, "tcsStateTransition", {
+            "bus": bus,
+            "ACCEnable": sample.acc_enable,
+            "ACC_REQ": sample.acc_request,
+            "ESC_StdStillVal": sample.esc_standstill,
+            "DriverBraking": sample.driver_braking,
+            "counter": sample.counter,
+            "dataHex": sample.data_hex,
+          }))
+          previous_tcs = state
+
+    previous_car_state: tuple[bool, bool, bool] | None = None
+    for sample in sorted(self.states, key=lambda item: item.t):
+      state = (sample.cruise_enabled, sample.cruise_standstill, sample.can_valid)
+      if state != previous_car_state:
+        events.append((sample.t, "carStateCruiseTransition", {
+          "cruiseEnabled": sample.cruise_enabled,
+          "cruiseStandstill": sample.cruise_standstill,
+          "canValid": sample.can_valid,
+          "standstill": sample.standstill,
+          "vEgoRaw": sample.v_ego_raw,
+        }))
+        previous_car_state = state
+
+    previous_control: tuple[bool, bool] | None = None
+    for sample in sorted(self.controls, key=lambda item: item.t):
+      state = (sample.enabled, sample.cancel)
+      if state != previous_control:
+        events.append((sample.t, "carControlTransition", {
+          "enabled": sample.enabled,
+          "cancel": sample.cancel,
+        }))
+        previous_control = state
+
+    panda_groups: dict[int, list[PandaSample]] = defaultdict(list)
+    for sample in self.panda_states:
+      panda_groups[sample.index].append(sample)
+    expected_panda_config = self._active_safety_config()
+    for index, samples in sorted(panda_groups.items()):
+      previous_panda: tuple[Any, ...] | None = None
+      previous_tx_blocked: int | None = None
+      for sample in sorted(samples, key=lambda item: item.t):
+        state = (
+          sample.controls_allowed,
+          sample.safety_rx_invalid,
+          sample.safety_rx_checks_invalid,
+          sample.safety_model,
+          sample.safety_param,
+        )
+        if state != previous_panda or (
+          previous_tx_blocked is not None and sample.safety_tx_blocked != previous_tx_blocked
+        ):
+          events.append((sample.t, "pandaSafetyTransition", {
+            "pandaIndex": index,
+            "uptime": sample.uptime,
+            "controlsAllowed": sample.controls_allowed,
+            "safetyTxBlocked": sample.safety_tx_blocked,
+            "safetyTxBlockedDelta": (
+              None if previous_tx_blocked is None or sample.safety_tx_blocked < previous_tx_blocked
+              else sample.safety_tx_blocked - previous_tx_blocked
+            ),
+            "safetyRxInvalid": sample.safety_rx_invalid,
+            "safetyRxChecksInvalid": sample.safety_rx_checks_invalid,
+            "safetyModel": sample.safety_model,
+            "safetyParam": sample.safety_param,
+            "matchesExpectedSafetyConfig": bool(
+              expected_panda_config is not None
+              and index == expected_panda_config["index"]
+              and sample.safety_model == expected_panda_config["model"]
+              and sample.safety_param == expected_panda_config["param"]
+            ),
+          }))
+        previous_panda = state
+        previous_tx_blocked = sample.safety_tx_blocked
 
     for sample in sorted(self.buttons, key=lambda item: item.t):
       if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL:
@@ -1372,7 +1801,15 @@ class ProbeAnalyzer:
           }))
 
     previous_alert: tuple[str, str, str] | None = None
+    previous_selfdrive: tuple[bool, bool] | None = None
     for sample in sorted(self.alerts, key=lambda item: item.t):
+      selfdrive_state = (sample.enabled, sample.active)
+      if selfdrive_state != previous_selfdrive:
+        events.append((sample.t, "selfdriveStateTransition", {
+          "enabled": sample.enabled,
+          "active": sample.active,
+        }))
+        previous_selfdrive = selfdrive_state
       value = (sample.alert_type, sample.alert_text_1, sample.alert_text_2)
       if value != previous_alert and any(value):
         events.append((sample.t, "selfdriveAlert", {
@@ -1384,6 +1821,628 @@ class ProbeAnalyzer:
 
     return [{"t": self._rel(t), "event": kind, **detail}
             for t, kind, detail in sorted(events, key=lambda item: (item[0], item[1]))]
+
+  @staticmethod
+  def _gate_state_evidence(
+    samples: Iterable[Any],
+    start: float,
+    end: float,
+    predicate: Callable[[Any], bool],
+    max_gap: float,
+    first_res: float | None,
+  ) -> dict[str, Any]:
+    """Describe gate history and the freshest state used at the first RES."""
+    ordered = sorted(samples, key=lambda item: item.t)
+    analysis_end = min(end, first_res) if first_res is not None else end
+    before = [sample for sample in ordered if sample.t <= start]
+    boundary_sample = before[-1] if before and start - before[-1].t <= max_gap else None
+    window = [sample for sample in ordered if start <= sample.t <= analysis_end]
+
+    coverage_gaps = 0
+    first_in_window = window[0] if window else None
+    if boundary_sample is None and (
+      first_in_window is None or first_in_window.t - start > max_gap
+    ):
+      coverage_gaps += 1
+    adjacency = []
+    if boundary_sample is not None:
+      adjacency.append(boundary_sample)
+    adjacency.extend(sample for sample in window if boundary_sample is None or sample is not boundary_sample)
+    for prior, current in zip(adjacency, adjacency[1:], strict=False):
+      if current.t - prior.t > max_gap:
+        coverage_gaps += 1
+    last_observed = window[-1] if window else boundary_sample
+    if last_observed is None or analysis_end - last_observed.t > max_gap:
+      coverage_gaps += 1
+
+    first_closed_observation: float | None = None
+    first_falling_edge: float | None = None
+    first_reopening_edge: float | None = None
+    transitions = []
+    previous = boundary_sample
+    if boundary_sample is not None and not predicate(boundary_sample):
+      first_closed_observation = start
+
+    for sample in window:
+      current_open = predicate(sample)
+      if not current_open and first_closed_observation is None:
+        first_closed_observation = sample.t
+      if previous is not None and sample is not previous:
+        previous_open = predicate(previous)
+        gap = sample.t - previous.t
+        if previous_open != current_open and gap <= max_gap:
+          transitions.append({
+            "t": round(sample.t - start, 3),
+            "from": "OPEN" if previous_open else "CLOSED",
+            "to": "OPEN" if current_open else "CLOSED",
+            "adjacentGap": round(gap, 6),
+          })
+          if previous_open and not current_open and first_falling_edge is None:
+            first_falling_edge = sample.t
+          if not previous_open and current_open and first_reopening_edge is None:
+            first_reopening_edge = sample.t
+      previous = sample
+
+    if coverage_gaps:
+      status = "UNKNOWN_GAP"
+    elif len(transitions) > 1:
+      status = "MULTIPLE_TRANSITIONS"
+    elif transitions:
+      status = "FALLING_EDGE" if transitions[0]["to"] == "CLOSED" else "REOPENING_EDGE"
+    elif last_observed is None:
+      status = "NO_WINDOW_SAMPLES"
+    elif predicate(last_observed):
+      status = "OPEN_THROUGH_REQUEST_WINDOW"
+    else:
+      status = "CLOSED_THROUGH_REQUEST_WINDOW"
+
+    state_at_res = "NO_HOST_RES"
+    freshest_age = None
+    last_transition = None
+    if first_res is not None:
+      preceding = [sample for sample in ordered if sample.t <= first_res]
+      freshest = preceding[-1] if preceding else None
+      if freshest is None or first_res - freshest.t > max_gap:
+        state_at_res = "UNKNOWN"
+      else:
+        freshest_age = first_res - freshest.t
+        previous_candidates = [sample for sample in preceding if sample is not freshest]
+        prior = previous_candidates[-1] if previous_candidates else None
+        transition_at_request = (
+          prior is not None
+          and freshest.t - prior.t <= max_gap
+          and predicate(prior) != predicate(freshest)
+          and first_res - freshest.t <= MIN_DISTINCT_CAN_FRAME_GAP
+        )
+        if transition_at_request:
+          state_at_res = "AMBIGUOUS_TRANSITION"
+        else:
+          state_at_res = "OPEN" if predicate(freshest) else "CLOSED"
+        transition_candidates = [item for item in transitions if start + item["t"] <= first_res + 1e-9]
+        last_transition = transition_candidates[-1] if transition_candidates else None
+
+    return {
+      "status": status,
+      "sampleCountInStop": len(window),
+      "evidenceEndAfterStop": round(analysis_end - start, 3),
+      "maxAdjacentGapForEdge": max_gap,
+      "coverageGapCount": coverage_gaps,
+      "firstClosedObservationAfterStop": (
+        None if first_closed_observation is None else round(first_closed_observation - start, 3)
+      ),
+      "firstFallingEdgeAfterStop": (
+        None if first_falling_edge is None else round(first_falling_edge - start, 3)
+      ),
+      "firstReopeningEdgeAfterStop": (
+        None if first_reopening_edge is None else round(first_reopening_edge - start, 3)
+      ),
+      "transitions": transitions[:100],
+      "stateAtFirstHostRes": state_at_res,
+      "freshestSampleAgeAtFirstHostRes": (
+        None if freshest_age is None else round(freshest_age, 6)
+      ),
+      "lastTransitionBeforeFirstHostRes": last_transition,
+    }
+
+  def _controller_gate_eligibility(
+    self,
+    start: float,
+    end: float,
+    stock_scc: list[SccSample],
+    raw_buttons: list[ButtonSample],
+  ) -> tuple[dict[str, Any], float | None]:
+    """Reconstruct the controller's pre-epoch gate at carState cadence.
+
+    This intentionally excludes the feature toggle: baseline and enabled A/B
+    captures need the same physical eligibility reference. Every CAN/control
+    input must be a preceding, fresh sample; future interpolation is not used.
+    """
+    states = sorted((sample for sample in self.states if start <= sample.t <= end), key=lambda sample: sample.t)
+    controls = sorted(self.controls, key=lambda sample: sample.t)
+    scc = sorted(stock_scc, key=lambda sample: sample.t)
+    buttons = sorted(raw_buttons, key=lambda sample: sample.t)
+    topology_supported = bool(self.car_params and self.car_params.get("ka4StockSccGatePassed"))
+
+    latest_control = latest_scc = latest_button = None
+    control_index = scc_index = button_index = 0
+    qualified_start: float | None = None
+    qualified_last: float | None = None
+    first_eligible: float | None = None
+    max_qualified_duration = 0.0
+    correlated_samples = 0
+    unknown_samples = 0
+
+    for state in states:
+      while control_index < len(controls) and controls[control_index].t <= state.t:
+        latest_control = controls[control_index]
+        control_index += 1
+      while scc_index < len(scc) and scc[scc_index].t <= state.t:
+        latest_scc = scc[scc_index]
+        scc_index += 1
+      while button_index < len(buttons) and buttons[button_index].t <= state.t:
+        latest_button = buttons[button_index]
+        button_index += 1
+
+      control_fresh = (
+        latest_control is not None
+        and state.t - latest_control.t <= CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE
+      )
+      scc_fresh = latest_scc is not None and state.t - latest_scc.t <= STOCK_SOURCE_PERIOD + 0.010
+      button_fresh = (
+        latest_button is not None
+        and state.t - latest_button.t <= STOCK_SOURCE_PERIOD + BUTTON_SOURCE_CADENCE_TOLERANCE
+      )
+      known = topology_supported and control_fresh and scc_fresh and button_fresh
+      if not known:
+        unknown_samples += 1
+        qualified_start = qualified_last = None
+        continue
+
+      correlated_samples += 1
+      raw_buttons_clear = (
+        latest_button.button == BUTTON_NONE
+        and latest_button.adaptive_main == 0
+        and latest_button.normal_main == 0
+        and latest_button.lfa_button == 0
+      )
+      qualified = (
+        state.kinematics_finite
+        and state.standstill
+        and abs(state.v_ego_raw) <= 0.03
+        and state.cruise_enabled
+        and state.can_valid
+        and not state.interlock_active
+        and latest_control.enabled
+        and not latest_control.cancel
+        and latest_scc.raw_lead_safe
+        and raw_buttons_clear
+      )
+      cadence_continuous = (
+        qualified_last is None
+        or state.t - qualified_last <= CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE
+      )
+      if qualified:
+        if qualified_start is None or not cadence_continuous:
+          qualified_start = state.t
+        qualified_last = state.t
+        duration = state.t - qualified_start
+        max_qualified_duration = max(max_qualified_duration, duration)
+        if first_eligible is None and duration + 1e-9 >= INITIAL_RECOVERY_REQUIRED_DURATION:
+          first_eligible = state.t
+      else:
+        qualified_start = qualified_last = None
+
+    if not topology_supported:
+      status = "UNSUPPORTED_OR_UNRESOLVED_TOPOLOGY"
+    elif first_eligible is not None:
+      status = "ELIGIBLE"
+    elif unknown_samples:
+      status = "UNRESOLVED_INPUT_GAPS"
+    else:
+      status = "NOT_ELIGIBLE"
+    return ({
+      "status": status,
+      "ignoresFeatureToggleForABComparability": True,
+      "stateSamples": len(states),
+      "fullyCorrelatedSamples": correlated_samples,
+      "unknownInputSamples": unknown_samples,
+      "requiredContinuousQualificationSeconds": INITIAL_RECOVERY_REQUIRED_DURATION,
+      "maxObservedContinuousQualificationSeconds": round(max_qualified_duration, 3),
+      "firstEligibleAfterPhysicalStop": (
+        None if first_eligible is None else round(first_eligible - start, 3)
+      ),
+    }, first_eligible)
+
+  def _stop_transition_evidence(
+    self,
+    stop_boundaries: list[tuple[float, float, bool]],
+    button_tx_status_by_id: dict[int, str],
+  ) -> list[dict[str, Any]]:
+    """Summarize physical-stop ordering without elevating DBC labels to HUD proof."""
+
+    def first_sample(
+      samples: Iterable[Any], start: float, end: float, predicate: Callable[[Any], bool],
+    ) -> Any | None:
+      candidates = [sample for sample in samples if start <= sample.t <= end and predicate(sample)]
+      return min(candidates, key=lambda sample: sample.t) if candidates else None
+
+    stock_bus = self._expected_stock_rx_bus()
+    camera_bus = self._camera_rx_bus()
+    canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
+    expected_send_bus = stock_bus if canfd_hda2 else camera_bus
+    stock_scc_all = [] if stock_bus is None else [sample for sample in self.scc if sample.bus == stock_bus]
+    stock_tcs_all = [] if stock_bus is None else [sample for sample in self.tcs if sample.bus == stock_bus]
+    raw_buttons_all = [] if stock_bus is None else [
+      sample for sample in self.buttons
+      if sample.origin == "vehicle_rx"
+      and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+      and sample.bus == stock_bus
+    ]
+    raw_alert5_all = [] if camera_bus is None else [
+      sample for sample in self.cluster_can
+      if sample.origin == "vehicle_rx"
+      and sample.address == ADRV_0X161_ADDRESS
+      and sample.bus == camera_bus
+    ]
+    stock_scc = [sample for sample in stock_scc_all if sample.checksum_valid is True]
+    stock_tcs = [sample for sample in stock_tcs_all if sample.checksum_valid is True]
+    raw_buttons = [sample for sample in raw_buttons_all if sample.checksum_valid is True]
+    raw_alert5 = [sample for sample in raw_alert5_all if sample.checksum_valid is True]
+    all_host_res = [
+      sample for sample in self.buttons
+      if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL
+    ]
+    host_res = [
+      sample for sample in all_host_res
+      if sample.address == CRUISE_BUTTONS_ALT_ADDRESS and sample.bus == expected_send_bus
+    ]
+    expected_config, active_panda = self._active_panda_index_samples()
+    if expected_config is None:
+      active_panda = []
+
+    def active_panda_config_matches(sample: PandaSample) -> bool:
+      return bool(
+        expected_config is not None
+        and sample.safety_model == expected_config["model"]
+        and sample.safety_param == expected_config["param"]
+      )
+
+    def active_panda_gate_open(sample: PandaSample) -> bool:
+      return active_panda_config_matches(sample) and sample.controls_allowed
+
+    result = []
+    for start, end, start_observed in stop_boundaries:
+      # CAN requests and prompt candidates are attributed only while the same
+      # physical stop is active. No end+grace window can absorb the next stop.
+      stock_scc_window_all = [sample for sample in stock_scc_all if start <= sample.t <= end]
+      stock_tcs_window_all = [sample for sample in stock_tcs_all if start <= sample.t <= end]
+      raw_button_window_all = [sample for sample in raw_buttons_all if start <= sample.t <= end]
+      raw_alert_window_all = [sample for sample in raw_alert5_all if start <= sample.t <= end]
+      causal_integrity = {
+        "sccInvalidOrUnavailableChecksumSamples": sum(
+          sample.checksum_valid is not True for sample in stock_scc_window_all
+        ),
+        "tcsInvalidOrUnavailableChecksumSamples": sum(
+          sample.checksum_valid is not True for sample in stock_tcs_window_all
+        ),
+        "rawButtonInvalidOrUnavailableChecksumSamples": sum(
+          sample.checksum_valid is not True for sample in raw_button_window_all
+        ),
+        "adrvInvalidOrUnavailableChecksumSamples": sum(
+          sample.checksum_valid is not True for sample in raw_alert_window_all
+        ),
+      }
+      controller_decode_errors = [
+        sample for sample in self.decode_error_samples
+        if start <= sample.t <= end
+        and sample.origin == "vehicle_rx"
+        and sample.address in (SCC_CONTROL_ADDRESS, TCS_ADDRESS, CRUISE_BUTTONS_ALT_ADDRESS)
+        and sample.bus == stock_bus
+      ]
+      adrv_decode_errors = [
+        sample for sample in self.decode_error_samples
+        if start <= sample.t <= end
+        and sample.origin == "vehicle_rx"
+        and sample.address == ADRV_0X161_ADDRESS
+        and sample.bus == camera_bus
+      ]
+      causal_integrity["controllerDecodeErrorSamples"] = len(controller_decode_errors)
+      causal_integrity["adrvDecodeErrorSamples"] = len(adrv_decode_errors)
+      controller_integrity_clean = not any(
+        causal_integrity[field]
+        for field in (
+          "sccInvalidOrUnavailableChecksumSamples",
+          "tcsInvalidOrUnavailableChecksumSamples",
+          "rawButtonInvalidOrUnavailableChecksumSamples",
+          "controllerDecodeErrorSamples",
+        )
+      )
+      causal_integrity_clean = not any(causal_integrity.values())
+
+      first_info4_sample = first_sample(stock_scc, start, end, lambda sample: sample.info_display == 4)
+      first_alert5_sample = first_sample(
+        raw_alert5, start, end,
+        lambda sample: sample.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE,
+      )
+      first_res_sample = first_sample(host_res, start, end, lambda _sample: True)
+      first_info4 = None if first_info4_sample is None else first_info4_sample.t
+      first_alert5 = None if first_alert5_sample is None else first_alert5_sample.t
+      first_res = None if first_res_sample is None else first_res_sample.t
+      unexpected_host_res = [
+        sample for sample in all_host_res
+        if start <= sample.t <= end
+        and (
+          sample.address != CRUISE_BUTTONS_ALT_ADDRESS
+          or sample.bus != expected_send_bus
+        )
+      ]
+
+      qualification, first_eligible = self._controller_gate_eligibility(
+        start, end, stock_scc, raw_buttons,
+      )
+
+      blocking_inputs = {
+        "rawSccLeadSafe": (stock_scc, lambda sample: sample.raw_lead_safe, STOCK_SOURCE_PERIOD + 0.015),
+        "sccAccMode": (stock_scc, lambda sample: sample.acc_mode in (1, 2), STOCK_SOURCE_PERIOD + 0.015),
+        "tcsAccEnableNoFault": (stock_tcs, lambda sample: sample.acc_enable == 0, STOCK_SOURCE_PERIOD + 0.015),
+        "carStateCruiseEnabled": (
+          self.states, lambda sample: sample.cruise_enabled,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+        "carStateCanValid": (
+          self.states, lambda sample: sample.can_valid,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+        "carStateInterlocksClear": (
+          self.states, lambda sample: not sample.interlock_active,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+        "carControlEnabled": (
+          self.controls, lambda sample: sample.enabled,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+        "carControlCancelClear": (
+          self.controls, lambda sample: not sample.cancel,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+        "rawDriverButtonsClear": (
+          raw_buttons,
+          lambda sample: (
+            sample.button == BUTTON_NONE
+            and sample.adaptive_main == 0
+            and sample.normal_main == 0
+            and sample.lfa_button == 0
+          ),
+          STOCK_SOURCE_PERIOD + BUTTON_SOURCE_CADENCE_TOLERANCE,
+        ),
+        "pandaControlsAllowed": (
+          active_panda, active_panda_gate_open,
+          PANDA_STATES_PERIOD + PANDA_STATES_CADENCE_TOLERANCE,
+        ),
+      }
+      observed_inputs = {
+        "sccMainModeAcc": (stock_scc, lambda sample: sample.main_mode_acc == 1, STOCK_SOURCE_PERIOD + 0.015),
+        "tcsAccRequest": (stock_tcs, lambda sample: sample.acc_request == 1, STOCK_SOURCE_PERIOD + 0.015),
+        "selfdriveEnabled": (
+          self.alerts, lambda sample: sample.enabled,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+        "selfdriveActive": (
+          self.alerts, lambda sample: sample.active,
+          CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        ),
+      }
+      blocking_evidence = {
+        name: self._gate_state_evidence(samples, start, end, predicate, max_gap, first_res)
+        for name, (samples, predicate, max_gap) in blocking_inputs.items()
+      }
+      observed_evidence = {
+        name: self._gate_state_evidence(samples, start, end, predicate, max_gap, first_res)
+        for name, (samples, predicate, max_gap) in observed_inputs.items()
+      }
+      blockers_closed = [
+        name for name, evidence in blocking_evidence.items()
+        if evidence["stateAtFirstHostRes"] == "CLOSED"
+      ]
+      blockers_ambiguous = [
+        name for name, evidence in blocking_evidence.items()
+        if evidence["stateAtFirstHostRes"] in ("AMBIGUOUS_TRANSITION", "UNKNOWN")
+      ]
+      if first_res is None:
+        blocking_at_res: bool | None = None
+      elif blockers_closed:
+        blocking_at_res = True
+      elif blockers_ambiguous:
+        blocking_at_res = None
+      else:
+        blocking_at_res = False
+
+      prompt_candidates = [value for value in (first_info4, first_alert5) if value is not None]
+      first_prompt_candidate = min(prompt_candidates) if prompt_candidates else None
+      if first_prompt_candidate is None:
+        prompt_order = "NO_PROMPT_CANDIDATE"
+        prompt_before_safe_rearm: bool | None = None
+      elif first_eligible is None:
+        prompt_order = "SAFE_REARM_NOT_OBSERVED"
+        prompt_before_safe_rearm = None
+      elif abs(first_prompt_candidate - first_eligible) <= STOCK_SOURCE_PERIOD + 0.015:
+        prompt_order = "AMBIGUOUS"
+        prompt_before_safe_rearm = None
+      elif first_prompt_candidate < first_eligible:
+        prompt_order = "BEFORE"
+        prompt_before_safe_rearm = True
+      else:
+        prompt_order = "AFTER"
+        prompt_before_safe_rearm = False
+
+      panda_window = [sample for sample in active_panda if start <= sample.t <= end]
+      panda_matching_window = [sample for sample in panda_window if active_panda_config_matches(sample)]
+      panda_config_mismatch_samples = len(panda_window) - len(panda_matching_window)
+      panda_tx_counter = self._counter_evidence(panda_window, "safety_tx_blocked")
+      panda_rx_counter = self._counter_evidence(panda_window, "safety_rx_invalid")
+      host_res_before_eligibility = (
+        first_res is not None
+        and first_eligible is not None
+        and first_res + MIN_DISTINCT_CAN_FRAME_GAP < first_eligible
+      )
+
+      observed_scc_buses = sorted({sample.bus for sample in self.scc if start <= sample.t <= end})
+      observed_tcs_buses = sorted({sample.bus for sample in self.tcs if start <= sample.t <= end})
+      observed_alert5_buses = sorted({
+        sample.bus for sample in self.cluster_can
+        if start <= sample.t <= end
+        and sample.origin == "vehicle_rx"
+        and sample.address == ADRV_0X161_ADDRESS
+      })
+      unexpected_stock_bus_sources = sorted(
+        (set(observed_scc_buses) | set(observed_tcs_buses)) - ({stock_bus} if stock_bus is not None else set())
+      )
+      observed_button_buses = sorted({
+        sample.bus for sample in self.buttons
+        if start <= sample.t <= end
+        and sample.origin == "vehicle_rx"
+        and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+      })
+      unexpected_button_buses = sorted(
+        set(observed_button_buses) - ({stock_bus} if stock_bus is not None else set())
+      )
+      unexpected_camera_buses = sorted(
+        set(observed_alert5_buses) - ({camera_bus} if camera_bus is not None else set())
+      )
+      qualification_coverage_complete = (
+        qualification["stateSamples"] > 0 and qualification["unknownInputSamples"] == 0
+      )
+      tcs_gate_coverage_complete = (
+        blocking_evidence["tcsAccEnableNoFault"]["coverageGapCount"] == 0
+      )
+      adrv_prompt_coverage_through = first_alert5 if first_alert5 is not None else end
+      adrv_prompt_stream_coverage = self._continuous_coverage(
+        raw_alert5,
+        start,
+        adrv_prompt_coverage_through,
+        max_gap=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+        edge_tolerance=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      )
+      adrv_prompt_transport_observed = bool(raw_alert_window_all or adrv_decode_errors)
+      bus_resolved = (
+        stock_bus is not None
+        and bool(stock_scc_window_all)
+        and bool(stock_tcs_window_all)
+        and bool(raw_button_window_all)
+        and not unexpected_stock_bus_sources
+        and not unexpected_button_buses
+        and controller_integrity_clean
+        and qualification_coverage_complete
+        and tcs_gate_coverage_complete
+      )
+      adrv_prompt_bus_resolved = (
+        camera_bus is not None
+        and bool(raw_alert_window_all)
+        and not unexpected_camera_buses
+        and causal_integrity["adrvInvalidOrUnavailableChecksumSamples"] == 0
+        and causal_integrity["adrvDecodeErrorSamples"] == 0
+        and adrv_prompt_stream_coverage["continuous"]
+      )
+
+      classifications = ["DESTINATION_UNPROVEN"]
+      if not bus_resolved:
+        classifications.append("BUS_UNRESOLVED")
+      if unexpected_camera_buses:
+        classifications.append("PROMPT_CANDIDATE_BUS_UNRESOLVED")
+      if adrv_prompt_transport_observed and not adrv_prompt_stream_coverage["continuous"]:
+        classifications.append("PROMPT_CANDIDATE_STREAM_UNRESOLVED")
+      if not causal_integrity_clean:
+        classifications.append("CAUSAL_CAN_INTEGRITY_UNRESOLVED")
+      if unexpected_host_res:
+        classifications.append("UNEXPECTED_HOST_RES_REQUEST")
+      if first_prompt_candidate is not None and first_prompt_candidate - start < 0.30:
+        classifications.append("PROMPT_CANDIDATE_WITHIN_300MS_OF_PHYSICAL_STOP")
+      if prompt_before_safe_rearm:
+        classifications.append("PROMPT_CANDIDATE_BEFORE_OBSERVED_SAFE_REARM")
+      if first_res is None:
+        classifications.append("NO_HOST_RES_REQUEST")
+      else:
+        if first_eligible is None:
+          classifications.append("HOST_RES_WITHOUT_OBSERVED_SAFE_REARM_ELIGIBILITY")
+        elif host_res_before_eligibility:
+          classifications.append("HOST_RES_BEFORE_OBSERVED_SAFE_REARM_ELIGIBILITY")
+
+        # Eligibility reconstruction and the gate state at the actual request
+        # are independent evidence.  Report both when, for example, a request
+        # occurs without an observed eligibility epoch while ACCMode is closed.
+        if blocking_at_res:
+          classifications.append("BLOCKING_GATE_CLOSED_AT_FIRST_HOST_RES")
+        elif blocking_at_res is None:
+          classifications.append("BLOCKING_GATE_STATE_AT_FIRST_HOST_RES_UNRESOLVED")
+      if expected_config is None or not panda_matching_window:
+        classifications.append("ACTIVE_PANDA_CONFIG_UNOBSERVED")
+      if panda_config_mismatch_samples:
+        classifications.append("ACTIVE_PANDA_CONFIG_DISCONTINUITY")
+      if not panda_tx_counter["deltaExact"] or not panda_rx_counter["deltaExact"]:
+        classifications.append("PANDA_COUNTER_DISCONTINUITY")
+
+      result.append({
+        "boundaryKind": "physicalNearZeroStop",
+        "start": self._rel(start),
+        "end": self._rel(end),
+        "startTransitionObserved": start_observed,
+        "firstInfoDisplay4AfterStop": None if first_info4 is None else round(first_info4 - start, 3),
+        "firstRawAlert5Value5AfterStop": None if first_alert5 is None else round(first_alert5 - start, 3),
+        "promptCandidateWithin300msOfPhysicalStop": (
+          first_prompt_candidate is not None and first_prompt_candidate - start < 0.30
+        ),
+        "promptCandidateOrderingVsSafeRearm": prompt_order,
+        "promptCandidateBeforeObservedSafeRearm": prompt_before_safe_rearm,
+        "controllerGateEligibility": qualification,
+        "firstHostResRequestAfterStop": None if first_res is None else round(first_res - start, 3),
+        "firstHostResTxStatus": (
+          None if first_res_sample is None else button_tx_status_by_id.get(id(first_res_sample), "unobserved")
+        ),
+        "expectedHostRes": {
+          "addressHex": f"0x{CRUISE_BUTTONS_ALT_ADDRESS:X}",
+          "bus": expected_send_bus,
+        },
+        "unexpectedHostResRequests": [{
+          "t": round(sample.t - start, 3),
+          "addressHex": f"0x{sample.address:X}",
+          "bus": sample.bus,
+          "txStatus": button_tx_status_by_id.get(id(sample), "unobserved"),
+        } for sample in unexpected_host_res[:100]],
+        "hostResBeforeObservedSafeRearmEligibility": host_res_before_eligibility,
+        "blockingGateEvidence": blocking_evidence,
+        "observedNonBlockingTransitions": observed_evidence,
+        "blockingGatesClosedAtFirstHostRes": blockers_closed,
+        "blockingGatesStateAmbiguousAtFirstHostRes": blockers_ambiguous,
+        "blockingGateClosedAtFirstHostRes": blocking_at_res,
+        "busEvidence": {
+          "expectedStockBus": stock_bus,
+          "expectedCameraBus": camera_bus,
+          "observedSccBuses": observed_scc_buses,
+          "observedTcsBuses": observed_tcs_buses,
+          "observedRawButtonBuses": observed_button_buses,
+          "observedAdrv0x161Buses": observed_alert5_buses,
+          "unexpectedStockSignalBuses": unexpected_stock_bus_sources,
+          "unexpectedRawButtonBuses": unexpected_button_buses,
+          "unexpectedCameraSignalBuses": unexpected_camera_buses,
+          "causalCanIntegrity": causal_integrity,
+          "qualificationInputCoverageComplete": qualification_coverage_complete,
+          "tcsGateCoverageComplete": tcs_gate_coverage_complete,
+          "adrvPromptStreamObserved": adrv_prompt_transport_observed,
+          "adrvPromptStreamCoverage": adrv_prompt_stream_coverage,
+          "resolvedForControllerEvidence": bus_resolved,
+          "resolvedForAdrvPromptCandidate": adrv_prompt_bus_resolved,
+        },
+        "activeSafetyConfig": expected_config,
+        "activePandaIndexStateObserved": bool(panda_window),
+        "activePandaStateObserved": bool(panda_matching_window),
+        "activePandaConfigMismatchSamples": panda_config_mismatch_samples,
+        "activePandaSafetyTxBlocked": panda_tx_counter,
+        "activePandaSafetyRxInvalid": panda_rx_counter,
+        "pandaCounterScope": "all safety traffic; matched TX echo is authoritative for this RES request",
+        "destinationEcuAcceptanceProven": False,
+        "classifications": classifications,
+      })
+    return result
 
   @staticmethod
   def _nearest_bool(samples: list[Any], t: float, name: str, tolerance: float = 0.150) -> bool | None:
@@ -2847,8 +3906,10 @@ class ProbeAnalyzer:
     tx_matches, status_by_id = self._match_button_tx()
     cluster_tx_matches, cluster_status_by_id = self._cluster_tx_matches()
     res_groups = self._res_groups(status_by_id)
+    stop_boundaries = self._stop_episodes()
+    physical_stop_boundaries = self._physical_stop_episodes()
     episodes = [self._episode_report(start, end, observed, res_groups, status_by_id, cluster_status_by_id)
-                for start, end, observed in self._stop_episodes()]
+                for start, end, observed in stop_boundaries]
 
     overall = "FAIL" if any(episode["verdict"] == "FAIL" for episode in episodes) else "INCONCLUSIVE"
     episode_can_verdicts = [episode["canEvidenceVerdict"] for episode in episodes]
@@ -2887,11 +3948,14 @@ class ProbeAnalyzer:
       "decodeErrors": dict(self.decode_errors),
       "rawButtonCounters": self._raw_button_counter_report(),
       "sccEvidence": self._scc_report(),
+      "tcsEvidence": self._tcs_report(),
+      "pandaEvidence": self._panda_report(),
       "buttonEvidence": self._button_report(),
       "clusterCanEvidence": self._cluster_report(cluster_tx_matches),
       "txMatches": tx_matches,
       "resGroups": res_groups,
       "correlatedTimeline": self._correlated_timeline(status_by_id, cluster_status_by_id),
+      "stopTransitionEvidence": self._stop_transition_evidence(physical_stop_boundaries, status_by_id),
       "stopEpisodes": episodes,
       "canEvidenceVerdict": can_evidence_verdict,
       "overallVerdict": overall,
@@ -2929,6 +3993,10 @@ class ProbeAnalyzer:
           "camera-bus capture can prove release timing and counter continuity seen by the receiving ECU."
         ),
         "Neither +0x80 TX-return nor stock 0x1A0 InfoDisplay acknowledges SCC acceptance or a timer reset.",
+        (
+          "pandaStates is sampled more slowly than CAN; controlsAllowed and safety counter transitions constrain ordering " +
+          "but do not identify an exact 10 ms control frame by themselves."
+        ),
         "SCC_CONTROL InfoDisplay=4 selects the regular/recovery state schedule only; it is not visible-prompt evidence.",
         (
           "ADRV_0x161 ALERTS_5=5 is only a raw CAN-field observation on variants where 0x161 exists; " +
@@ -2962,7 +4030,7 @@ def run_live(duration: float, messaging_address: str) -> ProbeAnalyzer:
 
   sockets = {
     service: messaging.sub_sock(service, addr=messaging_address, conflate=False)
-    for service in ("can", "sendcan", "carState", "carControl", "selfdriveState", "carParams")
+    for service in ("can", "sendcan", "carState", "carControl", "selfdriveState", "pandaStates", "carParams")
   }
   start = time.monotonic()
   last_status = start
@@ -3055,6 +4123,7 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
       scc = packer.make_can_msg("SCC_CONTROL", 0, {
         "COUNTER": (frame // 2) & 0xFF,
         "ACCMode": 1,
+        "MainMode_ACC": 1,
         "ACC_ObjDist": 5.0,
         "ACC_ObjRelSpd": 0.0,
         "HUD_LEAD_INFO": 2,
@@ -3063,6 +4132,15 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
         "TakeOverReq": 0,
       })
       analyzer.feed_can("can", t, stock_bus, scc[0], scc[1])
+
+      tcs = packer.make_can_msg("TCS", 0, {
+        "COUNTER": (frame // 2) & 0xFF,
+        "ACCEnable": 0,
+        "ACC_REQ": 1,
+        "ESC_StdStillVal": 1,
+        "DriverBraking": 0,
+      })
+      analyzer.feed_can("can", t, stock_bus, tcs[0], tcs[1])
 
     if frame >= button_source_phase_frames and (frame - button_source_phase_frames) % 2 == 0:
       stock_button = packer.make_can_msg("CRUISE_BUTTONS_ALT", 0, {
@@ -3080,6 +4158,28 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
     )
     analyzer.feed_state(t, stopped_state)
     analyzer.feed_control(t, SimpleNamespace(enabled=True))
+    if frame % round(PANDA_STATES_PERIOD / CONTROL_SERVICE_PERIOD) == 0:
+      panda_states = []
+      if bus_offset:
+        panda_states.append(SimpleNamespace(
+          uptime=frame // round(1.0 / CONTROL_SERVICE_PERIOD),
+          controlsAllowed=False,
+          safetyTxBlocked=0,
+          safetyRxInvalid=0,
+          safetyRxChecksInvalid=False,
+          safetyModel="noOutput",
+          safetyParam=0,
+        ))
+      panda_states.append(SimpleNamespace(
+        uptime=frame // round(1.0 / CONTROL_SERVICE_PERIOD),
+        controlsAllowed=True,
+        safetyTxBlocked=0,
+        safetyRxInvalid=0,
+        safetyRxChecksInvalid=False,
+        safetyModel="hyundaiCanfd",
+        safetyParam=int(analyzer.car_params["safetyConfigs"][-1]["param"]),
+      ))
+      analyzer.feed_panda_states(t, panda_states)
 
   # Real-DBC camera source and host replacement evidence. HDA1 stock-long
   # replaces both messages on ECAN while preserving the synthetic source
@@ -3195,6 +4295,12 @@ def print_human(report: dict[str, Any]) -> None:
     )
     if bus["infoDisplayTransitions"]:
       print(f"    InfoDisplay transitions: {bus['infoDisplayTransitions']}")
+    if bus["accModeTransitions"]:
+      print(f"    ACCMode transitions: {bus['accModeTransitions']}")
+    if bus["mainModeAccTransitions"]:
+      print(f"    MainMode_ACC transitions: {bus['mainModeAccTransitions']}")
+  print(f"Raw TCS state: {report['tcsEvidence']}")
+  print(f"Panda safety state: {report['pandaEvidence']}")
   for buttons in report["buttonEvidence"]:
     print(
       f"  buttons {buttons['service']}/{buttons['origin']} bus={buttons['bus']} {buttons['addressHex']} ",
@@ -3229,6 +4335,8 @@ def print_human(report: dict[str, Any]) -> None:
   )
   if state["gateTransitions"]:
     print(f"  carState gate transitions: {state['gateTransitions']}")
+
+  print(f"Ordered stop-transition evidence: {report['stopTransitionEvidence']}")
 
   print("Stop episodes:")
   if not report["stopEpisodes"]:

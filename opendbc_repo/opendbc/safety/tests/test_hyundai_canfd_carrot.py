@@ -401,6 +401,48 @@ def test_pedal_held_blocks_alt_res_set_after_scc_rx_reenables_controls(
   assert safety.safety_tx_hook(cancel)
 
 
+@pytest.mark.parametrize("closing_acc_mode", [0, 4], ids=["off", "cancelled"])
+def test_hda1_alt_resume_is_blocked_immediately_after_stock_scc_disengages(closing_acc_mode):
+  """Exercise the real SCC RX -> controls_allowed -> button TX ordering.
+
+  The KA4 recovery controller cannot rely on a RES request made after the OEM
+  has already changed ACCMode away from 1/2: Panda closes controls_allowed on
+  that received SCC frame and rejects the camera-bus synthetic button.
+  """
+  safety = libsafety_py.libsafety
+  assert safety.set_safety_hooks(
+    CarParams.SafetyModel.hyundaiCanfd, HyundaiSafetyFlags.CANFD_ALT_BUTTONS,
+  ) == 0
+  safety.init_tests()
+  packer = CANPacker("hyundai_canfd_generated")
+
+  engaged = make_rx_packet(packer, "SCC_CONTROL", 0, {
+    "COUNTER": 1,
+    "ACCMode": 1,
+  })
+  assert safety.safety_rx_hook(engaged)
+  assert safety.get_controls_allowed()
+  assert safety.get_cruise_engaged_prev()
+
+  before_transition = make_button_packet(
+    packer, alt_buttons=True, bus=2, counter=2, button=Buttons.RES_ACCEL,
+  )
+  assert safety.safety_tx_hook(before_transition)
+
+  disengaged = make_rx_packet(packer, "SCC_CONTROL", 0, {
+    "COUNTER": 2,
+    "ACCMode": closing_acc_mode,
+  })
+  assert safety.safety_rx_hook(disengaged)
+  assert not safety.get_controls_allowed()
+  assert not safety.get_cruise_engaged_prev()
+
+  after_transition = make_button_packet(
+    packer, alt_buttons=True, bus=2, counter=3, button=Buttons.RES_ACCEL,
+  )
+  assert not safety.safety_tx_hook(after_transition)
+
+
 def test_camera_scc_physical_alt_button_uses_buffered_forward_queue():
   safety = libsafety_py.libsafety
   safety_param = HyundaiSafetyFlags.CANFD_ALT_BUTTONS | HyundaiSafetyFlags.CAMERA_SCC

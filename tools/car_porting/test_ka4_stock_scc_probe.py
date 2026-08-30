@@ -58,7 +58,7 @@ def test_demo_models_exact_supported_schedule_without_claiming_vehicle_acceptanc
     button_source_phase_frames=button_source_phase_frames,
   ).report()
 
-  assert report["schemaVersion"] == 5
+  assert report["schemaVersion"] == 6
   assert report["overallVerdict"] == "INCONCLUSIVE"
   assert report["canEvidenceVerdict"] == "OBSERVED_SCHEDULE_AND_ALERT5_TIMING"
   assert report["vehicleAcceptanceVerdict"] == "REQUIRES_ON_CAR_A_B"
@@ -105,6 +105,384 @@ def test_demo_models_exact_supported_schedule_without_claiming_vehicle_acceptanc
   assert sum(match["status"] == "rejected" for match in report["txMatches"]) == 0
 
 
+def test_probe_reports_tcs_active_panda_and_ordered_transition_evidence() -> None:
+  report = run_demo("pass").report()
+
+  assert report["tcsEvidence"]["buses"][0]["accRequestCounts"] == {1: 1751}
+  panda = report["pandaEvidence"]
+  assert panda["activeSafetyPandaIndex"] == 0
+  assert panda["activeSafetyPandaIndexObserved"]
+  assert panda["activeSafetyConfigObserved"]
+  assert panda["pandas"][0]["safetyTxBlocked"]["delta"] == 0
+  assert panda["pandas"][0]["safetyTxBlocked"]["deltaExact"]
+
+  transition = report["stopTransitionEvidence"][0]
+  assert transition["firstInfoDisplay4AfterStop"] == 30.0
+  assert transition["firstRawAlert5Value5AfterStop"] == 30.0
+  assert transition["controllerGateEligibility"]["status"] == "ELIGIBLE"
+  assert transition["controllerGateEligibility"]["firstEligibleAfterPhysicalStop"] == 0.3
+  assert transition["firstHostResRequestAfterStop"] == 2.5
+  assert transition["firstHostResTxStatus"] == "returned"
+  assert transition["promptCandidateOrderingVsSafeRearm"] == "AFTER"
+  assert transition["promptCandidateBeforeObservedSafeRearm"] is False
+  assert transition["blockingGateClosedAtFirstHostRes"] is False
+  assert not transition["destinationEcuAcceptanceProven"]
+  assert transition["classifications"] == ["DESTINATION_UNPROVEN"]
+
+  timeline_events = {item["event"] for item in report["correlatedTimeline"]}
+  assert {
+    "sccEngagementTransition",
+    "tcsStateTransition",
+    "carStateCruiseTransition",
+    "carControlTransition",
+    "pandaSafetyTransition",
+  } <= timeline_events
+
+
+def test_probe_flags_early_prompt_candidate_and_gate_close_before_first_res() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  close_t = stop_start + 0.20
+  analyzer.scc = [
+    replace(sample, acc_mode=4) if sample.t >= close_t else sample
+    for sample in analyzer.scc
+  ]
+  analyzer.panda_states = [
+    replace(sample, controls_allowed=False, safety_tx_blocked=1)
+    if sample.t >= close_t else sample
+    for sample in analyzer.panda_states
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["firstInfoDisplay4AfterStop"] == 0.0
+  assert transition["promptCandidateWithin300msOfPhysicalStop"]
+  assert transition["promptCandidateOrderingVsSafeRearm"] == "SAFE_REARM_NOT_OBSERVED"
+  assert transition["promptCandidateBeforeObservedSafeRearm"] is None
+  assert transition["blockingGateEvidence"]["sccAccMode"]["firstFallingEdgeAfterStop"] == 0.2
+  assert transition["blockingGateEvidence"]["sccAccMode"]["stateAtFirstHostRes"] == "CLOSED"
+  assert transition["blockingGateEvidence"]["pandaControlsAllowed"]["firstFallingEdgeAfterStop"] == 0.2
+  assert transition["blockingGateEvidence"]["pandaControlsAllowed"]["stateAtFirstHostRes"] == "CLOSED"
+  assert transition["activePandaSafetyTxBlocked"]["delta"] == 1
+  assert transition["blockingGateClosedAtFirstHostRes"] is True
+  assert "PROMPT_CANDIDATE_WITHIN_300MS_OF_PHYSICAL_STOP" in transition["classifications"]
+  assert "BLOCKING_GATE_CLOSED_AT_FIRST_HOST_RES" in transition["classifications"]
+
+
+def test_nonblocking_main_mode_and_tcs_request_transitions_do_not_create_gate_blocker() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  close_t = stop_start + 0.20
+  analyzer.scc = [
+    replace(sample, main_mode_acc=0) if sample.t >= close_t else sample
+    for sample in analyzer.scc
+  ]
+  analyzer.tcs = [
+    replace(sample, acc_request=0) if sample.t >= close_t else sample
+    for sample in analyzer.tcs
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["observedNonBlockingTransitions"]["sccMainModeAcc"]["firstFallingEdgeAfterStop"] == 0.2
+  assert transition["observedNonBlockingTransitions"]["tcsAccRequest"]["firstFallingEdgeAfterStop"] == 0.2
+  assert transition["blockingGateClosedAtFirstHostRes"] is False
+  assert "BLOCKING_GATE_CLOSED_AT_FIRST_HOST_RES" not in transition["classifications"]
+
+
+def test_gate_already_closed_at_physical_stop_boundary_is_not_missed() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  analyzer.scc = [replace(sample, acc_mode=4) for sample in analyzer.scc]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  acc_mode = transition["blockingGateEvidence"]["sccAccMode"]
+  assert acc_mode["status"] == "CLOSED_THROUGH_REQUEST_WINDOW"
+  assert acc_mode["firstClosedObservationAfterStop"] == 0.0
+  assert acc_mode["stateAtFirstHostRes"] == "CLOSED"
+  assert transition["blockingGateClosedAtFirstHostRes"] is True
+
+
+def test_gate_change_across_unobserved_can_gap_is_not_claimed_as_ordered_edge() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.scc = [
+    replace(sample, acc_mode=4) if sample.t >= stop_start + 0.20 else sample
+    for sample in analyzer.scc
+    if not stop_start + 0.01 <= sample.t < stop_start + 0.20
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  acc_mode = transition["blockingGateEvidence"]["sccAccMode"]
+  assert acc_mode["status"] == "UNKNOWN_GAP"
+  assert acc_mode["firstFallingEdgeAfterStop"] is None
+  assert acc_mode["stateAtFirstHostRes"] == "CLOSED"
+  assert transition["blockingGateClosedAtFirstHostRes"] is True
+
+
+def test_gate_change_at_same_time_as_first_res_is_ordering_ambiguous() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  first_res = stop_start + 0.30
+  analyzer.scc = [
+    replace(sample, acc_mode=4) if sample.t >= first_res else sample
+    for sample in analyzer.scc
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["blockingGateEvidence"]["sccAccMode"]["stateAtFirstHostRes"] == "AMBIGUOUS_TRANSITION"
+  assert transition["blockingGateClosedAtFirstHostRes"] is None
+
+
+def test_gate_closed_early_then_reopened_before_res_is_not_a_request_blocker() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_REGULAR)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.scc = [
+    replace(sample, lead_info=1) if sample.t < stop_start + 0.20 else sample
+    for sample in analyzer.scc
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  raw_gate = transition["blockingGateEvidence"]["rawSccLeadSafe"]
+  assert raw_gate["firstClosedObservationAfterStop"] == 0.0
+  assert raw_gate["firstReopeningEdgeAfterStop"] == 0.2
+  assert raw_gate["stateAtFirstHostRes"] == "OPEN"
+  assert transition["controllerGateEligibility"]["firstEligibleAfterPhysicalStop"] == 0.5
+  assert transition["blockingGateClosedAtFirstHostRes"] is False
+  assert not transition["hostResBeforeObservedSafeRearmEligibility"]
+
+
+def test_res_after_physical_stop_end_is_not_attributed_by_grace_window() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.states = [
+    replace(sample, standstill=False, v_ego=0.2, v_ego_raw=0.2)
+    if sample.t >= stop_start + 0.25 else sample
+    for sample in analyzer.states
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["end"] - transition["start"] < 0.30
+  assert transition["firstHostResRequestAfterStop"] is None
+  assert "NO_HOST_RES_REQUEST" in transition["classifications"]
+
+
+@pytest.mark.parametrize("post_reset_counter", [0, 9], ids=["decrease", "increase"])
+def test_panda_counter_reset_is_unknown_regardless_of_counter_direction(post_reset_counter: int) -> None:
+  analyzer = run_demo("pass")
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.panda_states = [
+    replace(sample, uptime=100, safety_tx_blocked=5)
+    if sample.t < stop_start + 0.50 else
+    replace(sample, uptime=1, safety_tx_blocked=post_reset_counter)
+    for sample in analyzer.panda_states
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  counter = transition["activePandaSafetyTxBlocked"]
+  assert counter["delta"] is None
+  assert not counter["deltaExact"]
+  assert counter["resetCount"] == 1
+  assert "PANDA_COUNTER_DISCONTINUITY" in transition["classifications"]
+
+
+def test_panda_counter_wrap_and_ambiguous_decrease_are_distinguished() -> None:
+  analyzer = run_demo("pass")
+  first, second = analyzer.panda_states[:2]
+  wrap = analyzer._counter_evidence([
+    replace(first, uptime=100, safety_tx_blocked=(1 << 32) - 2),
+    replace(second, uptime=101, safety_tx_blocked=3),
+  ], "safety_tx_blocked")
+  assert wrap["delta"] == 5
+  assert wrap["deltaExact"]
+  assert wrap["wrapCount"] == 1
+
+  ambiguous = analyzer._counter_evidence([
+    replace(first, uptime=100, safety_tx_blocked=100),
+    replace(second, uptime=101, safety_tx_blocked=3),
+  ], "safety_tx_blocked")
+  assert ambiguous["delta"] is None
+  assert not ambiguous["deltaExact"]
+  assert ambiguous["ambiguousDecreaseCount"] == 1
+
+
+def test_duplicate_stock_signal_bus_makes_controller_bus_evidence_unresolved() -> None:
+  analyzer = run_demo("pass")
+  analyzer.scc.append(replace(analyzer.scc[1], bus=1))
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["busEvidence"]["unexpectedStockSignalBuses"] == [1]
+  assert not transition["busEvidence"]["resolvedForControllerEvidence"]
+  assert "BUS_UNRESOLVED" in transition["classifications"]
+
+
+def test_stock_signal_on_other_bus_outside_stop_does_not_contaminate_stop_bus_evidence() -> None:
+  analyzer = run_demo("pass")
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.scc.append(replace(analyzer.scc[0], t=stop_start - 0.01, bus=1))
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["busEvidence"]["unexpectedStockSignalBuses"] == []
+  assert transition["busEvidence"]["resolvedForControllerEvidence"]
+
+
+def test_sparse_tcs_stream_cannot_claim_controller_bus_evidence_resolved() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.tcs = [min(
+    (sample for sample in analyzer.tcs if sample.t >= stop_start),
+    key=lambda sample: sample.t,
+  )]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  tcs_gate = transition["blockingGateEvidence"]["tcsAccEnableNoFault"]
+  assert tcs_gate["status"] == "UNKNOWN_GAP"
+  assert tcs_gate["coverageGapCount"] > 0
+  assert not transition["busEvidence"]["tcsGateCoverageComplete"]
+  assert not transition["busEvidence"]["resolvedForControllerEvidence"]
+  assert "BUS_UNRESOLVED" in transition["classifications"]
+
+
+def test_wrong_active_panda_safety_config_is_not_used_as_controls_allowed_gate() -> None:
+  analyzer = run_demo("pass")
+  analyzer.panda_states = [
+    replace(sample, safety_param=sample.safety_param + 1)
+    for sample in analyzer.panda_states
+  ]
+
+  report = analyzer.report()
+  assert not report["pandaEvidence"]["activeSafetyConfigObserved"]
+  transition = report["stopTransitionEvidence"][0]
+  assert not transition["activePandaStateObserved"]
+  assert transition["activePandaIndexStateObserved"]
+  assert transition["blockingGateEvidence"]["pandaControlsAllowed"]["status"] == "CLOSED_THROUGH_REQUEST_WINDOW"
+  assert transition["blockingGateEvidence"]["pandaControlsAllowed"]["stateAtFirstHostRes"] == "CLOSED"
+  assert "ACTIVE_PANDA_CONFIG_UNOBSERVED" in transition["classifications"]
+
+
+def test_temporary_panda_config_change_is_preserved_as_discontinuity_segment() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.panda_states = [
+    replace(sample, safety_model="noOutput", safety_param=0)
+    if stop_start + 0.10 <= sample.t < stop_start + 0.20 else sample
+    for sample in analyzer.panda_states
+  ]
+
+  report = analyzer.report()
+  assert not report["pandaEvidence"]["activeSafetyConfigContinuous"]
+  transition = report["stopTransitionEvidence"][0]
+  panda_gate = transition["blockingGateEvidence"]["pandaControlsAllowed"]
+  assert panda_gate["firstFallingEdgeAfterStop"] == 0.1
+  assert panda_gate["firstReopeningEdgeAfterStop"] == 0.2
+  assert panda_gate["stateAtFirstHostRes"] == "OPEN"
+  assert transition["activePandaConfigMismatchSamples"] > 0
+  assert transition["activePandaSafetyTxBlocked"]["delta"] is None
+  assert "ACTIVE_PANDA_CONFIG_DISCONTINUITY" in transition["classifications"]
+
+
+def test_crc_invalid_causal_can_sample_is_excluded_and_marks_integrity_unresolved() -> None:
+  analyzer = run_demo("pass")
+  analyzer.scc[1] = replace(analyzer.scc[1], checksum_valid=False)
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  integrity = transition["busEvidence"]["causalCanIntegrity"]
+  assert integrity["sccInvalidOrUnavailableChecksumSamples"] == 1
+  assert not transition["busEvidence"]["resolvedForControllerEvidence"]
+  assert "CAUSAL_CAN_INTEGRITY_UNRESOLVED" in transition["classifications"]
+
+
+@pytest.mark.parametrize(
+  "wrong_address,wrong_bus,expected_address_hex",
+  [
+    pytest.param(CRUISE_BUTTONS_ADDRESS, 2, "0x1CF", id="wrong-address"),
+    pytest.param(CRUISE_BUTTONS_ALT_ADDRESS, 0, "0x1AA", id="wrong-bus"),
+  ],
+)
+def test_wrong_address_or_bus_res_does_not_become_causal_first_host_request(
+    wrong_address: int, wrong_bus: int, expected_address_hex: str,
+) -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  expected = next(
+    sample for sample in analyzer.buttons
+    if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL
+  )
+  analyzer.buttons.append(replace(
+    expected,
+    t=stop_start + 0.10,
+    address=wrong_address,
+    bus=wrong_bus,
+  ))
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  assert transition["firstHostResRequestAfterStop"] == 0.3
+  assert transition["unexpectedHostResRequests"] == [{
+    "t": 0.1,
+    "addressHex": expected_address_hex,
+    "bus": wrong_bus,
+    "txStatus": "unobserved",
+  }]
+  assert "UNEXPECTED_HOST_RES_REQUEST" in transition["classifications"]
+
+
+@pytest.mark.parametrize("bus_offset,expected_bus", [(0, 1), (4, 5)])
+def test_hda2_causal_host_res_uses_car_params_derived_ecan_bus(
+    bus_offset: int, expected_bus: int,
+) -> None:
+  transition = run_demo(
+    "pass",
+    bus_offset=bus_offset,
+    hda2=True,
+    schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY,
+  ).report()["stopTransitionEvidence"][0]
+
+  assert transition["expectedHostRes"] == {
+    "addressHex": "0x1AA",
+    "bus": expected_bus,
+  }
+  assert transition["firstHostResRequestAfterStop"] == 0.3
+  assert transition["unexpectedHostResRequests"] == []
+
+
+def test_sparse_adrv_stream_marks_prompt_candidate_timing_unresolved() -> None:
+  analyzer = run_demo("pass")
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  first_alert_t = min(
+    sample.t for sample in analyzer.cluster_can
+    if sample.origin == "vehicle_rx"
+    and sample.address == ADRV_0X161_ADDRESS
+    and sample.alert_5 == 5
+  )
+  analyzer.cluster_can = [
+    sample for sample in analyzer.cluster_can
+    if not (
+      sample.origin == "vehicle_rx"
+      and sample.address == ADRV_0X161_ADDRESS
+      and sample.t not in (stop_start, first_alert_t)
+    )
+  ]
+
+  transition = analyzer.report()["stopTransitionEvidence"][0]
+  bus_evidence = transition["busEvidence"]
+  assert transition["firstRawAlert5Value5AfterStop"] == 30.0
+  assert bus_evidence["adrvPromptStreamObserved"]
+  assert not bus_evidence["adrvPromptStreamCoverage"]["continuous"]
+  assert bus_evidence["adrvPromptStreamCoverage"]["gapsOverLimit"] == 1
+  assert not bus_evidence["resolvedForAdrvPromptCandidate"]
+  assert "PROMPT_CANDIDATE_STREAM_UNRESOLVED" in transition["classifications"]
+
+
+def test_safe_rearm_eligibility_tracks_delayed_raw_lead_qualification_not_fixed_stop_plus_300ms() -> None:
+  analyzer = run_demo("pass", schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY)
+  stop_start = min(sample.t for sample in analyzer.states if sample.stop_active)
+  analyzer.scc = [
+    replace(sample, lead_info=1) if sample.t < stop_start + 0.20 else sample
+    for sample in analyzer.scc
+  ]
+
+  qualification = analyzer.report()["stopTransitionEvidence"][0]["controllerGateEligibility"]
+  assert qualification["status"] == "ELIGIBLE"
+  assert qualification["firstEligibleAfterPhysicalStop"] == 0.5
+
+
 @pytest.mark.parametrize(
   "schedule_mode,button_source_phase_frames,expected_schedules",
   [
@@ -119,14 +497,24 @@ def test_probe_schedule_constants_track_real_controller_replay(
     button_source_phase_frames: int,
     expected_schedules: tuple[tuple[float, ...], ...],
 ) -> None:
+  from opendbc.car.structs import CarParams
+  from opendbc.car.hyundai.values import HyundaiSafetyFlags
+  from opendbc.safety.tests.libsafety import libsafety_py
   from opendbc.car.hyundai.tests.test_stock_scc_can_replay import Ka4StockSccReplay, pulse_groups
 
   replay = Ka4StockSccReplay(alt_buttons=True, button_phase_frames=button_source_phase_frames)
   if schedule_mode == SCHEDULE_MODE_INITIAL_RECOVERY:
     replay.modeled_state_deadline = 0
 
+  safety = libsafety_py.libsafety
+  assert safety.set_safety_hooks(
+    CarParams.SafetyModel.hyundaiCanfd, int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
+  ) == 0
+  safety.init_tests()
+
   for frame in range(2701):
-    replay.step(frame)
+    replay.step(frame, safety=safety)
+    assert all(replay.last_safety_tx_results)
 
   groups = pulse_groups([message.frame for message in replay.injected])
   assert tuple(group[0] / 100.0 for group in groups) == expected_schedules[button_source_phase_frames]
@@ -835,7 +1223,7 @@ def test_late_alert5_value_is_observation_not_failure() -> None:
 
 def test_empty_analyzer_is_inconclusive() -> None:
   report = ProbeAnalyzer("test", "empty").report()
-  assert report["schemaVersion"] == 5
+  assert report["schemaVersion"] == 6
   assert report["overallVerdict"] == "INCONCLUSIVE"
   assert report["stopEpisodes"] == []
   assert report["stateEvidence"]["sampleCount"] == 0
