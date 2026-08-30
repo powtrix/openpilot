@@ -94,6 +94,9 @@ def test_preopen_orientation_is_carried_by_h264_setup_without_setting_transactio
 
 
 def test_h264_egpu_coexistence_caps_chunks_and_yields_after_send(monkeypatch):
+  assert USBGPU_H264_MAX_CHUNK_SIZE == 32 * 1024
+  assert USBGPU_H264_CHUNK_GAP_S == 0.002
+
   display = TuringUsbDisplay(fast_write=True)
   display.dev = object()
   display._send_optional_command = lambda *_args, **_kwargs: None
@@ -115,6 +118,16 @@ def test_h264_egpu_coexistence_caps_chunks_and_yields_after_send(monkeypatch):
 
   assert sent == [(b"frame", False, False)]
   assert sleeps == [USBGPU_H264_CHUNK_GAP_S]
+
+
+def test_h264_egpu_coexistence_skips_blocking_chunk_negotiation(monkeypatch):
+  display = TuringUsbDisplay()
+  display._send_command = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+    AssertionError("eGPU mode must not wait for a TURZX response"),
+  )
+  monkeypatch.setattr("cluster_usb_display._usbgpu_transfer_active", lambda: True)
+
+  assert display._h264_chunk_size(0) > USBGPU_H264_MAX_CHUNK_SIZE
 
 
 def test_h264_clear_overlay_matches_captured_shape_and_size():
