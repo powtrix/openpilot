@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+import math
 
 import numpy as np
+import pytest
 
 from openpilot.tools.lateral_maneuvers.lane_offset_route_analyzer import (
   FrameEvidence,
@@ -8,6 +10,8 @@ from openpilot.tools.lateral_maneuvers.lane_offset_route_analyzer import (
   _load_lateral_mpc,
   _yaw_from_path,
   analyze_events,
+  analyze_physical_ab_events,
+  fit_ego_right_from_lane_lines,
   parse_debug_offsets,
   replay_mpc_static_counterfactual,
 )
@@ -31,12 +35,13 @@ def init_event(params):
   entries = [namespace(key=key, value=str(value).encode()) for key, value in params.items()]
   return FakeEvent("initData", 1, namespace(
     params=namespace(entries=entries),
+    dongleId="synthetic-dongle",
     gitBranch="carrot-wip",
     gitCommit="",
   ))
 
 
-def model_event(mono_time):
+def model_event(mono_time, *, lane_center_y=0.0, speed_ms=20.0):
   count = 33
   x = np.linspace(0.0, 100.0, count).tolist()
   t = np.linspace(0.0, 10.0, count).tolist()
@@ -44,8 +49,9 @@ def model_event(mono_time):
     return namespace(x=x, y=[y] * count, t=t)
   model = namespace(
     position=namespace(x=x, y=[0.0] * count, z=[0.0] * count, t=t),
-    velocity=namespace(x=[20.0] * count, y=[0.0] * count, z=[0.0] * count),
-    laneLines=[line(-5.2), line(-1.75), line(1.75), line(5.2)],
+    velocity=namespace(x=[speed_ms] * count, y=[0.0] * count, z=[0.0] * count),
+    laneLines=[line(lane_center_y - 5.2), line(lane_center_y - 1.75),
+               line(lane_center_y + 1.75), line(lane_center_y + 5.2)],
     laneLineProbs=[0.1, 0.95, 0.95, 0.1],
     laneLineStds=[0.3, 0.1, 0.1, 0.3],
     action=namespace(desiredCurvature=0.0),
@@ -55,10 +61,12 @@ def model_event(mono_time):
 
 
 def plan_event(event_time, model_time, *, dynamic_cm=2.0, include_dynamic=True, include_numeric=True,
-               observed_static_m=0.10, published_static_m=None):
+               observed_static_m=0.10, published_static_m=None, pre_static_y_m=None):
   dynamic_m = dynamic_cm * 0.01
   if published_static_m is None:
     published_static_m = observed_static_m
+  if pre_static_y_m is None:
+    pre_static_y_m = dynamic_m
   debug = "lanemode | 3.0m | 3.5m | 3.0m"
   if include_dynamic:
     debug += f" | offset={dynamic_cm:.1f}cm turn=0km/h"
@@ -69,18 +77,19 @@ def plan_event(event_time, model_time, *, dynamic_cm=2.0, include_dynamic=True, 
   plan_values = dict(
     modelMonoTime=model_time,
     useLaneLines=True,
-    dPathPoints=[dynamic_m + observed_static_m] * count,
+    dPathPoints=[pre_static_y_m + observed_static_m] * count,
     curvatures=curvatures,
     psis=(0.5 * control_target * distances).tolist(),
     distances=distances.tolist(),
     position=namespace(x=np.linspace(0.0, 100.0, count).tolist(), y=[0.0] * count),
     latDebugText=debug,
+    laneChangeState="off",
   )
   if include_numeric:
     plan_values.update(
       staticPathOffset=published_static_m,
       dynamicLaneOffset=dynamic_m,
-      pathBeforeStaticOffset=[dynamic_m] * count,
+      pathBeforeStaticOffset=[pre_static_y_m] * count,
     )
   plan = namespace(**plan_values)
   return FakeEvent("lateralPlan", event_time, plan)
@@ -88,6 +97,7 @@ def plan_event(event_time, model_time, *, dynamic_cm=2.0, include_dynamic=True, 
 
 def car_params_event():
   return FakeEvent("carParams", 2, namespace(
+    carFingerprint="KIA_CARNIVAL_4TH_GEN",
     steerControlType="torque",
     wheelbase=3.09,
     centerToFront=1.35,
@@ -96,10 +106,11 @@ def car_params_event():
   ))
 
 
-def linked_control_events(base_time, model_time, *, desired_curvature=0.0001, torque=-0.2, can_torque=-100.0):
+def linked_control_events(base_time, model_time, *, desired_curvature=0.0001, torque=-0.2,
+                          can_torque=-100.0, speed_ms=20.0):
   controls_time = base_time + 2_000_000
   return [
-    FakeEvent("carState", controls_time, namespace(vEgo=20.0)),
+    FakeEvent("carState", controls_time, namespace(vEgo=speed_ms, steeringPressed=False)),
     FakeEvent("liveDelay", controls_time, namespace(lateralDelay=0.1)),
     FakeEvent("controlsState", controls_time, namespace(
       lateralPlanMonoTime=model_time,
@@ -139,6 +150,50 @@ def synthetic_route(*, include_dynamic=True, include_numeric=True, observed_stat
       plan_event(plan_time, model_time, include_dynamic=include_dynamic, include_numeric=include_numeric,
                  observed_static_m=observed_static_m, published_static_m=published_static_m),
       *linked_control_events(plan_time, model_time),
+    ))
+  return events
+
+
+def gps_event(mono_time, latitude, longitude, *, speed_ms=20.0, heading_deg=0.0):
+  return FakeEvent("gpsLocationExternal", mono_time, namespace(
+    hasFix=True,
+    latitude=latitude,
+    longitude=longitude,
+    speed=speed_ms,
+    bearingDeg=heading_deg,
+    horizontalAccuracy=1.0,
+    bearingAccuracyDeg=1.0,
+    speedAccuracy=0.2,
+  ))
+
+
+def synthetic_physical_route(*, static_offset_m, ego_right_m, dynamic_offset_m=0.0,
+                             longitude_shift_deg=0.0, camera_bias_y_m=0.03):
+  params = {
+    "PathOffset": round(static_offset_m * 100),
+    "AdjustLaneOffset": 0,
+  }
+  events = [init_event(params), car_params_event()]
+  latitude_start = 37.0
+  longitude = 127.0 + longitude_shift_deg
+  spacing_m = 25.0
+  latitude_step = math.degrees(spacing_m / 6_371_000.0)
+  lane_center_y = camera_bias_y_m - ego_right_m
+  for index in range(12):
+    model_time = 1_000_000_000 + index * 1_000_000_000
+    plan_time = model_time + 1_000_000
+    events.extend((
+      model_event(model_time, lane_center_y=lane_center_y),
+      plan_event(
+        plan_time,
+        model_time,
+        dynamic_cm=dynamic_offset_m * 100.0,
+        observed_static_m=static_offset_m,
+        published_static_m=static_offset_m,
+        pre_static_y_m=lane_center_y + dynamic_offset_m,
+      ),
+      *linked_control_events(plan_time, model_time),
+      gps_event(plan_time, latitude_start + index * latitude_step, longitude),
     ))
   return events
 
@@ -223,6 +278,64 @@ def test_wrong_configured_path_offset_is_reported_as_contradicted():
   )
 
   assert report.stages["configured_path_offset"].status == "contradicted"
+
+
+def test_lane_center_coordinate_sign_is_vehicle_right_positive():
+  event = model_event(1, lane_center_y=-0.10)
+  # A far-field outlier should not move the robust origin fit materially.
+  event.modelV2.laneLines[1].y[15] += 1.5
+  event.modelV2.laneLines[2].y[15] -= 1.0
+
+  lane_fit, error = fit_ego_right_from_lane_lines(event.modelV2)
+
+  assert error == ""
+  assert lane_fit is not None
+  assert lane_fit.lane_center_y_m == pytest.approx(-0.10, abs=0.01)
+  assert lane_fit.ego_right_of_lane_center_m == pytest.approx(0.10, abs=0.01)
+
+
+def test_physical_ab_proves_positive_ten_centimeter_shift_with_fixed_camera_bias():
+  evidence = analyze_physical_ab_events(
+    synthetic_physical_route(static_offset_m=0.0, ego_right_m=0.0),
+    synthetic_physical_route(static_offset_m=0.10, ego_right_m=0.10),
+  )
+
+  assert evidence.status == "proven"
+  assert evidence.sample_count >= 8
+  assert evidence.details["median_rightward_delta_m"] == pytest.approx(0.10, abs=0.005)
+  assert evidence.details["baseline_accepted_samples"] == 12
+  assert evidence.details["variant_accepted_samples"] == 12
+
+
+def test_physical_ab_wrong_sign_is_contradicted():
+  evidence = analyze_physical_ab_events(
+    synthetic_physical_route(static_offset_m=0.0, ego_right_m=0.0),
+    synthetic_physical_route(static_offset_m=0.10, ego_right_m=-0.10),
+  )
+
+  assert evidence.status == "contradicted"
+  assert evidence.details["median_rightward_delta_m"] == pytest.approx(-0.10, abs=0.005)
+
+
+def test_physical_ab_insufficient_spatial_overlap_is_missing():
+  evidence = analyze_physical_ab_events(
+    synthetic_physical_route(static_offset_m=0.0, ego_right_m=0.0),
+    synthetic_physical_route(static_offset_m=0.10, ego_right_m=0.10, longitude_shift_deg=0.01),
+  )
+
+  assert evidence.status == "missing"
+  assert evidence.details["spatial_bin_count"] == 0
+
+
+def test_physical_ab_nonzero_dynamic_offset_is_missing():
+  evidence = analyze_physical_ab_events(
+    synthetic_physical_route(static_offset_m=0.0, ego_right_m=0.0),
+    synthetic_physical_route(static_offset_m=0.10, ego_right_m=0.10, dynamic_offset_m=0.02),
+  )
+
+  assert evidence.status == "missing"
+  assert evidence.details["variant_accepted_samples"] == 0
+  assert evidence.details["variant_rejections"]["dynamic_offset_nonzero"] == 12
 
 
 def test_real_mpc_counterfactual_is_right_positive_and_matches_recorded_solution():

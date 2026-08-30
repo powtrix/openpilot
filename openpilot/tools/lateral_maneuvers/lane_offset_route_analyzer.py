@@ -8,6 +8,12 @@ static offset can be checked directly.  Older routes lack those fields; their
 legacy reconstruction is accepted only when the route code matches the local
 planner and the pre-static path can be recovered unambiguously.
 
+With ``--baseline-log``, the positional log is treated as the +10 cm variant.
+Strict straight-lane samples from the two routes are paired by GPS position,
+travel heading, and speed, then reduced to independent spatial bins before a
+physical vehicle-to-lane displacement is reported. A single log never proves
+physical displacement.
+
 Coordinate/sign conventions used by the current carrot implementation:
 
 * path Y and curvature: positive is right
@@ -16,6 +22,7 @@ Coordinate/sign conventions used by the current carrot implementation:
 Examples:
 
   ./lane_offset_route_analyzer.py /data/media/0/realdata/<route>--0/rlog.zst
+  ./lane_offset_route_analyzer.py variant/rlog.zst --baseline-log baseline/rlog.zst
   ./lane_offset_route_analyzer.py 'dongle|2026-01-02--03-04-05/0' --json
 """
 
@@ -24,7 +31,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from collections.abc import Callable, Iterable, Sequence
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, fields
 import json
 import math
@@ -43,6 +50,16 @@ CONTROL_N = 17
 STATIC_TOLERANCE_M = 0.003
 MPC_REPLAY_RMSE_LIMIT = 5e-5
 RIGHT_CURVATURE_EPS = 1e-7
+EARTH_RADIUS_M = 6_371_000.0
+DIRECT_OFFSET_TOLERANCE_M = 0.003
+ZERO_DYNAMIC_TOLERANCE_M = 0.005
+LANE_PROBABILITY_MIN = 0.8
+LANE_STD_MAX_M = 0.2
+LANE_WIDTH_MIN_M = 2.6
+LANE_WIDTH_MAX_M = 4.2
+LANE_FIT_SPREAD_MAX_M = 0.15
+PHYSICAL_STRAIGHT_CURVATURE_MAX = 0.001
+PHYSICAL_MIN_SPEED_MS = 5.0
 CODE_PATHS = (
   "openpilot/cereal/log.capnp",
   "openpilot/selfdrive/controls/lib/lateral_planner.py",
@@ -106,6 +123,51 @@ class FrameEvidence:
       if not item.name.startswith("_")
     }
     return _json_finite(result)
+
+
+@dataclass(frozen=True)
+class LaneCenterFit:
+  lane_center_y_m: float
+  ego_right_of_lane_center_m: float
+  lane_width_m: float
+  center_curvature: float
+  robust_spread_m: float
+
+
+@dataclass(frozen=True)
+class LocationFix:
+  mono_time: int
+  latitude: float
+  longitude: float
+  heading_deg: float
+  speed_ms: float
+  source: str
+
+
+@dataclass(frozen=True)
+class PhysicalLaneSample:
+  mono_time: int
+  latitude: float
+  longitude: float
+  heading_deg: float
+  speed_ms: float
+  ego_right_m: float
+  lane_center_y_m: float
+  lane_width_m: float
+  fit_spread_m: float
+  static_offset_m: float
+  dynamic_offset_m: float
+  location_source: str
+
+
+@dataclass
+class PhysicalSampleSet:
+  samples: list[PhysicalLaneSample]
+  rejections: Counter[str]
+  location_source: str
+  location_fix_count: int
+  dongle_ids: tuple[str, ...]
+  car_fingerprints: tuple[str, ...]
 
 
 @dataclass
@@ -231,6 +293,27 @@ def _latest_record_before(records: Sequence[tuple[int, Any]], mono_time: int,
   return record
 
 
+def _nearest_record(records: Sequence[tuple[int, Any]], mono_time: int,
+                    max_delta_ns: int) -> tuple[int, Any] | None:
+  if not records:
+    return None
+  times = [record[0] for record in records]
+  insertion = bisect_right(times, mono_time)
+  candidates = []
+  if insertion:
+    candidates.append(records[insertion - 1])
+  if insertion < len(records):
+    candidates.append(records[insertion])
+  if not candidates:
+    return None
+  result = min(candidates, key=lambda record: abs(record[0] - mono_time))
+  return result if abs(result[0] - mono_time) <= max_delta_ns else None
+
+
+def _heading_difference_deg(left: float, right: float) -> float:
+  return abs((left - right + 180.0) % 360.0 - 180.0)
+
+
 def parse_debug_offsets(text: str) -> tuple[float, float]:
   """Return the applied dynamic lane offset [m] and turn speed [km/h]."""
   offset_match = _DYNAMIC_OFFSET_RE.search(text)
@@ -261,6 +344,96 @@ def _model_lane_center_curvature(model: Any) -> float:
   if not len(left_x) or len(left_x) != len(left_y) or len(left_y) != len(right_y):
     return NAN
   return _lane_center_curvature(left_x, (left_y + right_y) * 0.5)
+
+
+def _robust_quadratic_fit(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, float] | None:
+  valid = np.isfinite(x) & np.isfinite(y)
+  x = np.asarray(x[valid], dtype=float)
+  y = np.asarray(y[valid], dtype=float)
+  if len(x) < 8 or np.ptp(x) < 8.0:
+    return None
+  x_scale = max(float(np.max(np.abs(x))), 1.0)
+  normalized_x = x / x_scale
+  design = np.column_stack((np.ones(len(x)), normalized_x, normalized_x**2))
+  weights = np.ones(len(x), dtype=float)
+  coefficients = np.zeros(3, dtype=float)
+  spread = NAN
+  for _ in range(8):
+    weighted_design = design * np.sqrt(weights)[:, None]
+    weighted_y = y * np.sqrt(weights)
+    try:
+      coefficients = np.linalg.lstsq(weighted_design, weighted_y, rcond=None)[0]
+    except np.linalg.LinAlgError:
+      return None
+    residual = y - design @ coefficients
+    residual_center = float(np.median(residual))
+    spread = 1.4826 * float(np.median(np.abs(residual - residual_center)))
+    if spread < 1e-6:
+      break
+    scaled_residual = np.abs(residual - residual_center) / (1.5 * spread)
+    weights = np.ones(len(scaled_residual), dtype=float)
+    outliers = scaled_residual > 1.0
+    weights[outliers] = 1.0 / scaled_residual[outliers]
+  # Convert [1, x/scale, (x/scale)^2] back to ordinary x coefficients.
+  ordinary = np.array((coefficients[0], coefficients[1] / x_scale, coefficients[2] / x_scale**2))
+  return ordinary, spread
+
+
+def fit_ego_right_from_lane_lines(model: Any, *, max_fit_distance_m: float = 45.0) -> tuple[LaneCenterFit | None, str]:
+  """Fit the two inner lane lines and evaluate their center at the camera origin.
+
+  Carrot's model Y coordinate is positive to the vehicle's right. Therefore a
+  vehicle displaced right of the lane center observes that center to its left:
+  ``ego_right_of_lane_center = -lane_center_y``. A fixed camera/extrinsic
+  lateral bias is present in both A/B runs and cancels in their difference.
+  """
+  lane_lines = list(_nested(model, "laneLines", []))
+  if len(lane_lines) < 3:
+    return None, "lane_lines_missing"
+  left_x = _float_sequence(_nested(lane_lines[1], "x", []))
+  left_y = _float_sequence(_nested(lane_lines[1], "y", []))
+  right_x = _float_sequence(_nested(lane_lines[2], "x", []))
+  right_y = _float_sequence(_nested(lane_lines[2], "y", []))
+  if min(len(left_x), len(left_y), len(right_x), len(right_y)) < 8:
+    return None, "lane_trajectory_incomplete"
+
+  def sorted_unique(x_values: np.ndarray, y_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    valid = np.isfinite(x_values) & np.isfinite(y_values)
+    order = np.argsort(x_values[valid])
+    sorted_x = x_values[valid][order]
+    sorted_y = y_values[valid][order]
+    unique_x, indices = np.unique(sorted_x, return_index=True)
+    return unique_x, sorted_y[indices]
+
+  left_x, left_y = sorted_unique(left_x, left_y)
+  right_x, right_y = sorted_unique(right_x, right_y)
+  if len(left_x) < 8 or len(right_x) < 8:
+    return None, "lane_trajectory_incomplete"
+  start_x = max(0.0, float(left_x[0]), float(right_x[0]))
+  end_x = min(max_fit_distance_m, float(left_x[-1]), float(right_x[-1]))
+  if start_x > 1.5 or end_x - start_x < 15.0:
+    return None, "lane_origin_not_observed"
+  grid = np.linspace(start_x, end_x, 25)
+  left_grid = np.interp(grid, left_x, left_y)
+  right_grid = np.interp(grid, right_x, right_y)
+  center_grid = (left_grid + right_grid) * 0.5
+  width_grid = right_grid - left_grid
+
+  center_fit = _robust_quadratic_fit(grid, center_grid)
+  width_fit = _robust_quadratic_fit(grid, width_grid)
+  if center_fit is None or width_fit is None:
+    return None, "lane_fit_failed"
+  center_coefficients, center_spread = center_fit
+  width_coefficients, width_spread = width_fit
+  center_y = float(center_coefficients[0])
+  width = float(width_coefficients[0])
+  curvature = float(2.0 * center_coefficients[2] / ((1.0 + center_coefficients[1] ** 2) ** 1.5))
+  robust_spread = max(float(center_spread), float(width_spread) * 0.5)
+  if not LANE_WIDTH_MIN_M <= width <= LANE_WIDTH_MAX_M:
+    return None, "lane_width_invalid"
+  if robust_spread > LANE_FIT_SPREAD_MAX_M:
+    return None, "lane_fit_noisy"
+  return LaneCenterFit(center_y, -center_y, width, curvature, robust_spread), ""
 
 
 def reconstruct_pre_static_lane_path(model: Any, plan: Any, dynamic_offset_m: float,
@@ -605,6 +778,382 @@ def _lag_adjusted_plan_curvature(frame: FrameEvidence, car_state: Any, live_dela
     return NAN
 
 
+def _location_fixes(records: dict[str, list[tuple[int, Any]]]) -> tuple[list[LocationFix], str]:
+  llk_fixes: list[LocationFix] = []
+  for mono_time, location in records.get("liveLocationKalmanDEPRECATED", []):
+    position = _float_sequence(_nested(location, "positionGeodetic.value", []))
+    velocity = _float_sequence(_nested(location, "velocityNED.value", []))
+    valid = (
+      _enum_name(_nested(location, "status", "")) == "valid"
+      and bool(_nested(location, "gpsOK", False))
+      and bool(_nested(location, "inputsOK", False))
+      and bool(_nested(location, "positionGeodetic.valid", False))
+      and bool(_nested(location, "velocityNED.valid", False))
+      and len(position) >= 2 and len(velocity) >= 2
+    )
+    if not valid:
+      continue
+    latitude, longitude = float(position[0]), float(position[1])
+    speed = float(math.hypot(velocity[0], velocity[1]))
+    heading = float(math.degrees(math.atan2(velocity[1], velocity[0])) % 360.0)
+    if -90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0 and speed >= PHYSICAL_MIN_SPEED_MS:
+      llk_fixes.append(LocationFix(mono_time, latitude, longitude, heading, speed, "liveLocationKalman"))
+  if llk_fixes:
+    return llk_fixes, "liveLocationKalman"
+
+  gps_fixes: list[LocationFix] = []
+  for mono_time, location in records.get("gpsLocationExternal", []):
+    latitude = float(_nested(location, "latitude", NAN))
+    longitude = float(_nested(location, "longitude", NAN))
+    speed = float(_nested(location, "speed", NAN))
+    heading = float(_nested(location, "bearingDeg", NAN)) % 360.0
+    horizontal_accuracy = float(_nested(location, "horizontalAccuracy", NAN))
+    bearing_accuracy = float(_nested(location, "bearingAccuracyDeg", NAN))
+    speed_accuracy = float(_nested(location, "speedAccuracy", NAN))
+    accuracy_ok = (
+      (not math.isfinite(horizontal_accuracy) or horizontal_accuracy <= 10.0)
+      and (not math.isfinite(bearing_accuracy) or bearing_accuracy <= 15.0)
+      and (not math.isfinite(speed_accuracy) or speed_accuracy <= 3.0)
+    )
+    if (
+      bool(_nested(location, "hasFix", False)) and accuracy_ok
+      and all(math.isfinite(value) for value in (latitude, longitude, speed, heading))
+      and -90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0
+      and speed >= PHYSICAL_MIN_SPEED_MS
+    ):
+      gps_fixes.append(LocationFix(mono_time, latitude, longitude, heading, speed, "gpsLocationExternal"))
+  return gps_fixes, "gpsLocationExternal" if gps_fixes else "none"
+
+
+def extract_physical_lane_samples(events: Iterable[Any], *, expected_static_offset_m: float,
+                                  dynamic_zero_tolerance_m: float = ZERO_DYNAMIC_TOLERANCE_M,
+                                  location_max_delta_s: float = 0.20) -> PhysicalSampleSet:
+  """Extract strict, directly observable straight-lane samples from one route."""
+  records: dict[str, list[tuple[int, Any]]] = defaultdict(list)
+  models: dict[int, Any] = {}
+  plan_events: list[Any] = []
+  for event in sorted(events, key=lambda item: int(_nested(item, "logMonoTime", 0))):
+    if not bool(_nested(event, "valid", True)):
+      continue
+    try:
+      name = _which(event)
+    except Exception:
+      continue
+    mono_time = int(_nested(event, "logMonoTime", 0))
+    payload = _payload(event, name)
+    records[name].append((mono_time, payload))
+    if name == "modelV2":
+      models[mono_time] = payload
+    elif name == "lateralPlan":
+      plan_events.append(event)
+
+  location_fixes, location_source = _location_fixes(records)
+  location_records = [(fix.mono_time, fix) for fix in location_fixes]
+  controls_by_model: dict[int, list[tuple[int, Any]]] = defaultdict(list)
+  for mono_time, controls_state in records.get("controlsState", []):
+    controls_by_model[int(_nested(controls_state, "lateralPlanMonoTime", 0))].append((mono_time, controls_state))
+
+  samples: list[PhysicalLaneSample] = []
+  rejections: Counter[str] = Counter()
+
+  def reject(reason: str) -> None:
+    rejections[reason] += 1
+
+  for event in plan_events:
+    mono_time = int(_nested(event, "logMonoTime", 0))
+    plan = _payload(event, "lateralPlan")
+    model_time = int(_nested(plan, "modelMonoTime", 0))
+    model = models.get(model_time)
+    if model is None:
+      reject("model_link_missing")
+      continue
+
+    before_path = _float_sequence(_nested(plan, "pathBeforeStaticOffset", []))
+    final_path = _float_sequence(_nested(plan, "dPathPoints", []))
+    static_offset = float(_nested(plan, "staticPathOffset", NAN))
+    dynamic_offset = float(_nested(plan, "dynamicLaneOffset", NAN))
+    direct_ok = (
+      len(before_path) == TRAJECTORY_SIZE and len(final_path) == TRAJECTORY_SIZE
+      and math.isfinite(static_offset) and math.isfinite(dynamic_offset)
+      and abs(static_offset - expected_static_offset_m) <= DIRECT_OFFSET_TOLERANCE_M
+      and float(np.max(np.abs((final_path - before_path) - static_offset))) <= DIRECT_OFFSET_TOLERANCE_M
+    )
+    if not direct_ok:
+      reject("direct_numeric_evidence_invalid")
+      continue
+    if abs(dynamic_offset) > dynamic_zero_tolerance_m:
+      reject("dynamic_offset_nonzero")
+      continue
+    if not bool(_nested(plan, "useLaneLines", False)):
+      reject("lane_mode_inactive")
+      continue
+    if _enum_name(_nested(plan, "laneChangeState", "")) != "off" or \
+       _enum_name(_nested(model, "meta.desire", "")) != "none":
+      reject("lane_change_or_desire_active")
+      continue
+
+    probabilities = _float_sequence(_nested(model, "laneLineProbs", []))
+    standard_deviations = _float_sequence(_nested(model, "laneLineStds", []))
+    if len(probabilities) < 3 or len(standard_deviations) < 3 or \
+       min(probabilities[1], probabilities[2]) < LANE_PROBABILITY_MIN or \
+       max(standard_deviations[1], standard_deviations[2]) > LANE_STD_MAX_M:
+      reject("inner_lane_confidence_invalid")
+      continue
+
+    lane_fit, fit_error = fit_ego_right_from_lane_lines(model)
+    if lane_fit is None:
+      reject(fit_error)
+      continue
+    model_curvature = float(_nested(model, "action.desiredCurvature", NAN))
+    if not math.isfinite(model_curvature) or abs(model_curvature) > PHYSICAL_STRAIGHT_CURVATURE_MAX or \
+       abs(lane_fit.center_curvature) > PHYSICAL_STRAIGHT_CURVATURE_MAX:
+      reject("road_not_straight")
+      continue
+
+    controls_record = _nearest_record(controls_by_model.get(model_time, []), mono_time, 100_000_000)
+    if controls_record is None or not bool(_nested(controls_record[1], "activeLaneLine", False)):
+      reject("controls_lane_mode_inactive")
+      continue
+    controls_time = controls_record[0]
+    car_control_record = _nearest_record(records.get("carControl", []), controls_time, 50_000_000)
+    car_state_record = _nearest_record(records.get("carState", []), controls_time, 100_000_000)
+    if car_control_record is None or not bool(_nested(car_control_record[1], "latActive", False)):
+      reject("lateral_control_inactive")
+      continue
+    if car_state_record is None or bool(_nested(car_state_record[1], "steeringPressed", True)):
+      reject("driver_steering_override")
+      continue
+
+    location_record = _nearest_record(location_records, mono_time, int(location_max_delta_s * 1e9))
+    if location_record is None:
+      reject("location_match_missing")
+      continue
+    location = location_record[1]
+    car_speed = float(_nested(car_state_record[1], "vEgo", NAN))
+    if not math.isfinite(car_speed) or abs(car_speed - location.speed_ms) > 3.0:
+      reject("location_vehicle_speed_disagrees")
+      continue
+    samples.append(PhysicalLaneSample(
+      mono_time=mono_time,
+      latitude=location.latitude,
+      longitude=location.longitude,
+      heading_deg=location.heading_deg,
+      speed_ms=location.speed_ms,
+      ego_right_m=lane_fit.ego_right_of_lane_center_m,
+      lane_center_y_m=lane_fit.lane_center_y_m,
+      lane_width_m=lane_fit.lane_width_m,
+      fit_spread_m=lane_fit.robust_spread_m,
+      static_offset_m=static_offset,
+      dynamic_offset_m=dynamic_offset,
+      location_source=location.source,
+    ))
+  dongle_ids = tuple(sorted({
+    str(_nested(init_data, "dongleId", ""))
+    for _, init_data in records.get("initData", [])
+    if str(_nested(init_data, "dongleId", ""))
+  }))
+  car_fingerprints = tuple(sorted({
+    str(_nested(car_params, "carFingerprint", ""))
+    for _, car_params in records.get("carParams", [])
+    if str(_nested(car_params, "carFingerprint", ""))
+  }))
+  return PhysicalSampleSet(
+    samples, rejections, location_source, len(location_fixes), dongle_ids, car_fingerprints,
+  )
+
+
+def _local_metric_xy(latitude: float, longitude: float, reference_latitude: float,
+                     reference_longitude: float) -> tuple[float, float]:
+  north = math.radians(latitude - reference_latitude) * EARTH_RADIUS_M
+  east = math.radians(longitude - reference_longitude) * EARTH_RADIUS_M * math.cos(math.radians(reference_latitude))
+  return east, north
+
+
+def _bootstrap_median_interval(values: np.ndarray, *, iterations: int = 4000) -> tuple[float, float]:
+  if not len(values):
+    return NAN, NAN
+  if len(values) == 1:
+    return float(values[0]), float(values[0])
+  generator = np.random.default_rng(0xCA44010)
+  medians = np.empty(iterations, dtype=float)
+  for index in range(iterations):
+    medians[index] = float(np.median(generator.choice(values, size=len(values), replace=True)))
+  return float(np.percentile(medians, 2.5)), float(np.percentile(medians, 97.5))
+
+
+def analyze_physical_ab_events(baseline_events: Iterable[Any], variant_events: Iterable[Any], *,
+                               expected_delta_m: float = 0.10, minimum_spatial_bins: int = 8,
+                               match_distance_m: float = 8.0, match_heading_deg: float = 7.0,
+                               match_speed_ms: float = 2.0, spatial_bin_m: float = 20.0,
+                               physical_tolerance_m: float = 0.04,
+                               dynamic_zero_tolerance_m: float = ZERO_DYNAMIC_TOLERANCE_M) -> StageEvidence:
+  """Compare PathOffset=0 and +10 cm routes at matched physical locations."""
+  if minimum_spatial_bins < 1 or dynamic_zero_tolerance_m < 0.0 or \
+     min(match_distance_m, match_heading_deg, match_speed_ms, spatial_bin_m, physical_tolerance_m) <= 0.0:
+    raise ValueError("A/B sample counts and tolerances must be positive")
+  baseline = extract_physical_lane_samples(
+    baseline_events,
+    expected_static_offset_m=0.0,
+    dynamic_zero_tolerance_m=dynamic_zero_tolerance_m,
+  )
+  variant = extract_physical_lane_samples(
+    variant_events,
+    expected_static_offset_m=expected_delta_m,
+    dynamic_zero_tolerance_m=dynamic_zero_tolerance_m,
+  )
+  details: dict[str, Any] = {
+    "baseline_accepted_samples": len(baseline.samples),
+    "variant_accepted_samples": len(variant.samples),
+    "baseline_location_source": baseline.location_source,
+    "variant_location_source": variant.location_source,
+    "baseline_location_fixes": baseline.location_fix_count,
+    "variant_location_fixes": variant.location_fix_count,
+    "baseline_dongle_ids": list(baseline.dongle_ids),
+    "variant_dongle_ids": list(variant.dongle_ids),
+    "baseline_car_fingerprints": list(baseline.car_fingerprints),
+    "variant_car_fingerprints": list(variant.car_fingerprints),
+    "baseline_rejections": dict(baseline.rejections),
+    "variant_rejections": dict(variant.rejections),
+    "expected_rightward_delta_m": expected_delta_m,
+    "physical_tolerance_m": physical_tolerance_m,
+    "match_distance_m": match_distance_m,
+    "match_heading_deg": match_heading_deg,
+    "match_speed_ms": match_speed_ms,
+    "spatial_bin_m": spatial_bin_m,
+    "minimum_spatial_bins": minimum_spatial_bins,
+    "coordinate_sign": "ego_right = -lane_center_y; a rightward vehicle shift makes the observed lane center more negative",
+  }
+  same_vehicle = (
+    len(baseline.dongle_ids) == len(variant.dongle_ids) == 1
+    and baseline.dongle_ids == variant.dongle_ids
+    and len(baseline.car_fingerprints) == len(variant.car_fingerprints) == 1
+    and baseline.car_fingerprints == variant.car_fingerprints
+  )
+  details["same_vehicle_identity"] = same_vehicle
+  if not same_vehicle:
+    return StageEvidence(
+      "missing", "A/B routes do not establish the same dongle and vehicle fingerprint",
+      0, details,
+    )
+  if not baseline.samples or not variant.samples:
+    return StageEvidence(
+      "missing", "baseline or +10 cm route lacks strict direct/GPS/lane/control samples",
+      0, details,
+    )
+
+  all_samples = baseline.samples + variant.samples
+  reference_latitude = float(np.median([sample.latitude for sample in all_samples]))
+  reference_longitude = float(np.median([sample.longitude for sample in all_samples]))
+  baseline_xy = [
+    _local_metric_xy(sample.latitude, sample.longitude, reference_latitude, reference_longitude)
+    for sample in baseline.samples
+  ]
+  variant_xy = [
+    _local_metric_xy(sample.latitude, sample.longitude, reference_latitude, reference_longitude)
+    for sample in variant.samples
+  ]
+  cell_size = max(match_distance_m, 0.1)
+  baseline_cells: dict[tuple[int, int], list[int]] = defaultdict(list)
+  for index, (east, north) in enumerate(baseline_xy):
+    baseline_cells[(math.floor(east / cell_size), math.floor(north / cell_size))].append(index)
+
+  matches: list[tuple[int, int, float, float, float]] = []
+  for variant_index, ((east, north), variant_sample) in enumerate(zip(variant_xy, variant.samples, strict=True)):
+    cell_east = math.floor(east / cell_size)
+    cell_north = math.floor(north / cell_size)
+    candidates: list[tuple[float, int, float, float]] = []
+    for east_delta in (-1, 0, 1):
+      for north_delta in (-1, 0, 1):
+        for baseline_index in baseline_cells.get((cell_east + east_delta, cell_north + north_delta), []):
+          baseline_east, baseline_north = baseline_xy[baseline_index]
+          distance = math.hypot(east - baseline_east, north - baseline_north)
+          baseline_sample = baseline.samples[baseline_index]
+          heading_delta = _heading_difference_deg(variant_sample.heading_deg, baseline_sample.heading_deg)
+          speed_delta = abs(variant_sample.speed_ms - baseline_sample.speed_ms)
+          if distance <= match_distance_m and heading_delta <= match_heading_deg and speed_delta <= match_speed_ms:
+            score = distance / match_distance_m + heading_delta / match_heading_deg + speed_delta / match_speed_ms
+            candidates.append((score, baseline_index, distance, heading_delta))
+    if candidates:
+      _, baseline_index, distance, heading_delta = min(candidates)
+      speed_delta = abs(variant_sample.speed_ms - baseline.samples[baseline_index].speed_ms)
+      matches.append((variant_index, baseline_index, distance, heading_delta, speed_delta))
+
+  spatial_deltas: dict[tuple[int, int], list[float]] = defaultdict(list)
+  match_distances: list[float] = []
+  match_heading_deltas: list[float] = []
+  match_speed_deltas: list[float] = []
+  for variant_index, baseline_index, distance, heading_delta, speed_delta in matches:
+    east, north = variant_xy[variant_index]
+    spatial_key = (math.floor(east / spatial_bin_m), math.floor(north / spatial_bin_m))
+    spatial_deltas[spatial_key].append(
+      variant.samples[variant_index].ego_right_m - baseline.samples[baseline_index].ego_right_m
+    )
+    match_distances.append(distance)
+    match_heading_deltas.append(heading_delta)
+    match_speed_deltas.append(speed_delta)
+  bin_deltas = np.asarray([np.median(values) for values in spatial_deltas.values()], dtype=float)
+  details.update({
+    "matched_sample_pairs": len(matches),
+    "unique_baseline_samples_matched": len({match[1] for match in matches}),
+    "spatial_bin_count": len(bin_deltas),
+    "median_match_distance_m": _median(match_distances),
+    "median_match_heading_delta_deg": _median(match_heading_deltas),
+    "median_match_speed_delta_ms": _median(match_speed_deltas),
+  })
+  if not len(bin_deltas):
+    return StageEvidence(
+      "missing", f"only 0 independent spatial bins overlap; need {minimum_spatial_bins}", 0, details,
+    )
+
+  median_delta = float(np.median(bin_deltas))
+  robust_spread = 1.4826 * float(np.median(np.abs(bin_deltas - median_delta)))
+  confidence_low, confidence_high = _bootstrap_median_interval(bin_deltas)
+  details.update({
+    "median_rightward_delta_m": median_delta,
+    "robust_spread_m": robust_spread,
+    "median_bootstrap_ci95_m": [confidence_low, confidence_high],
+    "spatial_bin_deltas_m": sorted(float(value) for value in bin_deltas),
+    "fixed_bias_cancellation": (
+      "A fixed camera/extrinsic lateral bias cancels in variant minus baseline, assuming the logged dongle's camera mount " +
+      "and calibration did not change between runs."
+    ),
+  })
+  if len(bin_deltas) < minimum_spatial_bins:
+    return StageEvidence(
+      "missing", f"only {len(bin_deltas)} independent spatial bins overlap; need {minimum_spatial_bins}",
+      len(bin_deltas), details,
+    )
+
+  clearly_wrong = (
+    confidence_high < 0.0
+    or confidence_high < expected_delta_m - 1.5 * physical_tolerance_m
+    or confidence_low > expected_delta_m + 1.5 * physical_tolerance_m
+  )
+  if clearly_wrong:
+    return StageEvidence(
+      "contradicted",
+      f"matched A/B evidence gives {median_delta:+.3f} m, with sign or magnitude clearly inconsistent with {expected_delta_m:+.2f} m",
+      len(bin_deltas), details,
+    )
+  confidence_width = confidence_high - confidence_low
+  if (
+    abs(median_delta - expected_delta_m) <= physical_tolerance_m
+    and confidence_low > 0.0
+    and robust_spread <= 0.08
+    and confidence_width <= 0.10
+  ):
+    return StageEvidence(
+      "proven",
+      f"matched spatial A/B bins show {median_delta:+.3f} m vehicle-right displacement for +10 cm PathOffset",
+      len(bin_deltas), details,
+    )
+  return StageEvidence(
+    "missing",
+    f"A/B median is {median_delta:+.3f} m, but uncertainty or spread is too large for a +0.10 m claim",
+    len(bin_deltas), details,
+  )
+
+
 def analyze_events(events: Iterable[Any], *, source: str = "events", expected_path_offset_m: float = 0.10,
                    minimum_samples: int = 5, straight_curvature_limit: float = 0.001,
                    require_code_compatibility: bool = True,
@@ -935,6 +1484,41 @@ def analyze_log(identifier: str, **kwargs: Any) -> LaneOffsetReport:
   return analyze_events(LogReader(identifier, sort_by_time=True), source=identifier, **kwargs)
 
 
+def analyze_log_pair(baseline_identifier: str, variant_identifier: str, *,
+                     minimum_spatial_bins: int = 8, match_distance_m: float = 8.0,
+                     match_heading_deg: float = 7.0, match_speed_ms: float = 2.0,
+                     spatial_bin_m: float = 20.0, physical_tolerance_m: float = 0.04,
+                     dynamic_zero_tolerance_m: float = ZERO_DYNAMIC_TOLERANCE_M,
+                     **kwargs: Any) -> LaneOffsetReport:
+  from openpilot.tools.lib.logreader import LogReader
+
+  baseline_events = list(LogReader(baseline_identifier, sort_by_time=True))
+  variant_events = list(LogReader(variant_identifier, sort_by_time=True))
+  report = analyze_events(variant_events, source=variant_identifier, **kwargs)
+  report.stages["physical_rightward_displacement"] = analyze_physical_ab_events(
+    baseline_events,
+    variant_events,
+    expected_delta_m=report.expected_path_offset_m,
+    minimum_spatial_bins=minimum_spatial_bins,
+    match_distance_m=match_distance_m,
+    match_heading_deg=match_heading_deg,
+    match_speed_ms=match_speed_ms,
+    spatial_bin_m=spatial_bin_m,
+    physical_tolerance_m=physical_tolerance_m,
+    dynamic_zero_tolerance_m=dynamic_zero_tolerance_m,
+  )
+  report.stages["physical_rightward_displacement"].details.update({
+    "baseline_source": baseline_identifier,
+    "variant_source": variant_identifier,
+  })
+  if report.stages["physical_rightward_displacement"].status == "proven":
+    report.observability_gaps = [
+      gap for gap in report.observability_gaps
+      if "PathOffset=0/+10" not in gap
+    ]
+  return report
+
+
 def format_text(report: LaneOffsetReport) -> str:
   lines = [
     f"source: {report.source}",
@@ -962,23 +1546,46 @@ def main() -> int:
     epilog="exit status: 0 core propagation proven, 2 contradicted, 3 insufficient evidence",
   )
   parser.add_argument("log", help="local rlog/qlog path, URL, or LogReader route identifier")
+  parser.add_argument("--baseline-log",
+                      help="PathOffset=0 validation rlog/route; positional log must be the matched +10 cm variant")
   parser.add_argument("--path-offset-cm", type=float, default=10.0, help="expected static PathOffset in cm (default: 10)")
   parser.add_argument("--minimum-samples", type=int, default=5)
   parser.add_argument("--max-mpc-frames", type=int, default=20)
   parser.add_argument("--allow-code-mismatch", action="store_true",
                       help="allow reconstruction to count as proof even if route/current control sources differ")
   parser.add_argument("--skip-mpc-replay", action="store_true")
+  parser.add_argument("--minimum-spatial-bins", type=int, default=8)
+  parser.add_argument("--match-distance-m", type=float, default=8.0)
+  parser.add_argument("--match-heading-deg", type=float, default=7.0)
+  parser.add_argument("--match-speed-ms", type=float, default=2.0)
+  parser.add_argument("--spatial-bin-m", type=float, default=20.0)
+  parser.add_argument("--physical-tolerance-cm", type=float, default=4.0)
+  parser.add_argument("--dynamic-zero-tolerance-cm", type=float, default=0.5)
   parser.add_argument("--json", action="store_true", help="emit JSON")
   parser.add_argument("--include-frames", action="store_true", help="include per-frame evidence in JSON")
   args = parser.parse_args()
-  report = analyze_log(
-    args.log,
-    expected_path_offset_m=args.path_offset_cm * 0.01,
-    minimum_samples=args.minimum_samples,
-    require_code_compatibility=not args.allow_code_mismatch,
-    mpc_replayer=None if args.skip_mpc_replay else replay_mpc_static_counterfactual,
-    max_mpc_frames=args.max_mpc_frames,
-  )
+  common_arguments = {
+    "expected_path_offset_m": args.path_offset_cm * 0.01,
+    "minimum_samples": args.minimum_samples,
+    "require_code_compatibility": not args.allow_code_mismatch,
+    "mpc_replayer": None if args.skip_mpc_replay else replay_mpc_static_counterfactual,
+    "max_mpc_frames": args.max_mpc_frames,
+  }
+  if args.baseline_log:
+    report = analyze_log_pair(
+      args.baseline_log,
+      args.log,
+      minimum_spatial_bins=args.minimum_spatial_bins,
+      match_distance_m=args.match_distance_m,
+      match_heading_deg=args.match_heading_deg,
+      match_speed_ms=args.match_speed_ms,
+      spatial_bin_m=args.spatial_bin_m,
+      physical_tolerance_m=args.physical_tolerance_cm * 0.01,
+      dynamic_zero_tolerance_m=args.dynamic_zero_tolerance_cm * 0.01,
+      **common_arguments,
+    )
+  else:
+    report = analyze_log(args.log, **common_arguments)
   if args.json:
     print(json.dumps(report.to_dict(include_frames=args.include_frames), ensure_ascii=False, indent=2, sort_keys=True))
   else:
@@ -991,6 +1598,8 @@ def main() -> int:
     "controls_lane_plan_selection",
     "carcontroller_command_tracking",
   )
+  if args.baseline_log:
+    required_stages += ("physical_rightward_displacement",)
   if any(report.stages[name].status == "contradicted" for name in required_stages):
     return 2
   if any(report.stages[name].status != "proven" for name in required_stages):
