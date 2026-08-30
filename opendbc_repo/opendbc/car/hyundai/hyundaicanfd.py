@@ -336,11 +336,11 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudina
     values["LFA_ICON"] = 2 if lat_active else 1 if lat_enabled else 0
     values["LKA_ICON"] = 4 if lat_active else 3 if lat_enabled else 0
 
-    # With stock longitudinal, the camera/SCC still owns every OEM warning.
-    # Replacing ADRV_0x161 only to draw openpilot's lateral icons must not hide
-    # messages such as ALERTS_5=5 (use switch or pedal to accelerate), nor mute
-    # their associated sounds. Warning suppression is only appropriate when
-    # openpilot owns longitudinal control.
+    # With stock longitudinal, preserve the received OEM alert, sound, DAW,
+    # and mute fields while replacing ADRV_0x161's lateral icons. On variants
+    # that carry this message, ALERTS_5=5 is a decoded DBC value; this code does
+    # not establish its visible-cluster or audible association. Existing ADRV
+    # field suppression is retained only when openpilot owns longitudinal.
     if openpilot_longitudinal:
       if values["ALERTS_2"] in [1, 2, 5, 6, 10, 21, 22]:
         values["ALERTS_2"] = 0

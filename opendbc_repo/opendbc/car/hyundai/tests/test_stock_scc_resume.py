@@ -107,11 +107,11 @@ def build_control(*, lead_visible=True, lead_radar=1, lead_distance=5.0, lead_re
   )
 
 
-def enter_standstill_warning(controller, CC, CS, warning_frame=300):
+def enter_standstill_resume_state(controller, CC, CS, state_frame=300):
   for frame in range(30):
     controller.frame = frame
     controller._update_ka4_stock_scc_keepalive(CC, CS)
-  controller.frame = warning_frame
+  controller.frame = state_frame
   CS.scc_control["InfoDisplay"] = 4
   controller._update_ka4_stock_scc_keepalive(CC, CS)
 
@@ -141,12 +141,12 @@ def pulse_group_starts(pulse_frames):
           if index == 0 or frame != pulse_frames[index - 1] + KA4_STOCK_SCC_BUTTON_SOURCE_PERIOD_FRAMES]
 
 
-def test_ka4_stock_scc_warning_requests_short_resume_press():
+def test_ka4_stock_scc_resume_state_requests_short_resume_press():
   controller = build_controller()
   CC = build_control()
   CS = build_state()
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert controller.stock_scc_keepalive_pending
   pulse_frames = [frame for frame in range(300, 306)
@@ -163,20 +163,20 @@ def test_ka4_stock_scc_validation_switch_isolates_oem_behavior():
   CC = build_control()
   CS = build_state()
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert controller.stock_scc_stop_start_frame is None
   assert not controller.stock_scc_keepalive_pending
   assert controller.create_button_messages(CC, CS, use_clu11=False) == []
 
 
-@pytest.mark.parametrize("warning_frame, expected", [(2695, True), (2696, False), (2700, False), (3000, False)])
-def test_ka4_stock_scc_rearm_stops_before_thirty_seconds(warning_frame, expected):
+@pytest.mark.parametrize("state_frame, expected", [(2695, True), (2696, False), (2700, False), (3000, False)])
+def test_ka4_stock_scc_rearm_stops_before_thirty_seconds(state_frame, expected):
   controller = build_controller()
   CC = build_control()
   CS = build_state()
 
-  enter_standstill_warning(controller, CC, CS, warning_frame)
+  enter_standstill_resume_state(controller, CC, CS, state_frame)
 
   assert controller.stock_scc_keepalive_pending is expected
 
@@ -201,7 +201,7 @@ def test_ka4_stock_scc_rearm_requires_safe_stationary_lead(state_kwargs):
   CC = build_control()
   CS = build_state(**state_kwargs)
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -212,7 +212,7 @@ def test_ka4_stock_scc_rearm_allows_non_departing_relative_speed(relative_speed)
   CC = build_control()
   CS = build_state(acc_obj_rel_spd=relative_speed)
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert controller.stock_scc_keepalive_pending
 
@@ -226,7 +226,7 @@ def test_ka4_stock_scc_rearm_accepts_both_supported_hda_lead_states(hud_lead_inf
   CC = build_control()
   CS = build_state(hud_lead_info=hud_lead_info)
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert controller.stock_scc_keepalive_pending
 
@@ -237,7 +237,7 @@ def test_ka4_stock_scc_rearm_rejects_moving_lead_in_either_direction(relative_sp
   CC = build_control()
   CS = build_state(acc_obj_rel_spd=relative_speed)
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -248,7 +248,7 @@ def test_ka4_stock_scc_rearm_cancels_on_driver_button():
   CS = build_state()
   CS.cruise_buttons[-1] = Buttons.SET_DECEL
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -259,7 +259,7 @@ def test_ka4_stock_scc_rearm_cancels_on_main_button():
   CS = build_state()
   CS.main_buttons[-1] = 1
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -270,7 +270,7 @@ def test_ka4_stock_scc_rearm_cancels_on_acc_fault():
   CS = build_state()
   CS.out.accFaulted = True
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -295,7 +295,7 @@ def test_ka4_alt_rearm_vetoes_raw_source_button_even_if_deque_is_stale(signal, v
     signal: value,
   }
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert CS.cruise_buttons[-1] == Buttons.NONE
   assert not controller.stock_scc_keepalive_pending
@@ -306,7 +306,7 @@ def test_ka4_stock_scc_rearm_cancels_if_lead_control_state_changes(hud_lead_info
   controller = build_controller()
   CC = build_control()
   CS = build_state()
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
   assert controller.stock_scc_keepalive_pending
 
   CS.scc_control["HUD_LEAD_INFO"] = hud_lead_info
@@ -325,7 +325,7 @@ def test_ka4_stock_scc_short_press_aborts_on_every_safety_interlock(abort_case):
   controller = build_controller()
   CC = build_control()
   CS = build_state()
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert resume_message_sent(controller.create_button_messages(CC, CS, use_clu11=False))
   assert controller.stock_scc_keepalive_pending
@@ -383,7 +383,7 @@ def test_ka4_stock_scc_ignores_front_vehicle_departure_notice():
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_stock_scc_front_departure_notice_does_not_arm_warning_edge():
+def test_ka4_stock_scc_front_departure_notice_does_not_arm_stale_resume_state_edge():
   controller = build_controller()
   CC = build_control()
   CS = build_state()
@@ -401,7 +401,7 @@ def test_ka4_stock_scc_front_departure_notice_does_not_arm_warning_edge():
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_stock_scc_recovers_when_warning_is_already_active_at_stop_start():
+def test_ka4_stock_scc_responds_when_resume_state_is_already_active_at_stop_start():
   controller = build_controller()
   CC = build_control()
   CS = build_state(info_display=4)
@@ -414,7 +414,7 @@ def test_ka4_stock_scc_recovers_when_warning_is_already_active_at_stop_start():
   assert pulse_frames == [30, 32, 34]
 
 
-def test_ka4_stock_scc_active_warning_gets_one_fast_recovery_then_normal_cadence():
+def test_ka4_stock_scc_active_resume_state_gets_one_fast_response_then_normal_cadence():
   controller = build_controller()
   CC = build_control()
   CS = build_state(info_display=4)
@@ -449,7 +449,7 @@ def test_ka4_stock_scc_enabled_transient_does_not_reset_thirty_second_epoch():
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_stock_scc_timer_starts_when_scc_engages_after_manual_stop():
+def test_ka4_stock_scc_schedule_epoch_starts_when_scc_engages_after_manual_stop():
   controller = build_controller()
   CC = build_control()
   CS = build_state()
@@ -548,7 +548,7 @@ def test_stock_scc_rearm_is_limited_to_ka4_stock_longitudinal(fingerprint, pcm_c
   CC = build_control()
   CS = build_state()
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -559,7 +559,7 @@ def test_stock_scc_rearm_excludes_camera_scc_stock_longitudinal():
   CC = build_control()
   CS = build_state()
 
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
 
@@ -570,7 +570,7 @@ def test_keepalive_button_is_not_duplicated_by_button_spam_setting():
   CC = build_control()
   CC.cruiseControl.cancel = False
   CS = build_state()
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   messages = controller.create_button_messages(CC, CS, use_clu11=False)
 
@@ -595,7 +595,7 @@ def test_software_cancel_preempts_keepalive_quiet_period(alt_buttons):
       "NORMAL_CRUISE_MAIN_BTN": 0,
       "LFA_BTN": 0,
     }
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert resume_message_sent(controller.create_button_messages(CC, CS, use_clu11=False))
   controller.frame += 1
@@ -624,7 +624,7 @@ def test_software_cancel_preempts_keepalive_after_movement_reset(alt_buttons):
       "NORMAL_CRUISE_MAIN_BTN": 0,
       "LFA_BTN": 0,
     }
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert resume_message_sent(controller.create_button_messages(CC, CS, use_clu11=False))
   controller.frame += 1
@@ -668,7 +668,7 @@ def test_ka4_alt_button_keepalive_accepts_cached_scalar_or_list_values(list_valu
   CS = build_state()
   button_values = {"COUNTER": 17, "CRUISE_BUTTONS": Buttons.NONE, "LFA_BTN": 0}
   CS.cruise_buttons_msg = {key: [value] for key, value in button_values.items()} if list_values else button_values
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   emitted_counters = []
   for frame in range(300, 305):
@@ -691,7 +691,7 @@ def test_ka4_alt_button_keepalive_waits_for_source_message():
   CC = build_control()
   CC.cruiseControl.cancel = False
   CS = build_state()
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
 
   assert controller.create_button_messages(CC, CS, use_clu11=False) == []
   assert controller.stock_scc_keepalive_pending
@@ -712,7 +712,7 @@ def test_ka4_alt_button_keepalive_waits_for_source_message():
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_alt_button_warning_recovery_is_retried_if_source_arrives_late():
+def test_ka4_alt_button_resume_state_response_is_retried_if_source_arrives_late():
   controller = build_controller()
   controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
   CC = build_control()
@@ -733,7 +733,7 @@ def test_ka4_stock_scc_rearm_resets_after_vehicle_moves():
   controller = build_controller()
   CC = build_control()
   CS = build_state()
-  enter_standstill_warning(controller, CC, CS)
+  enter_standstill_resume_state(controller, CC, CS)
   assert controller.stock_scc_keepalive_pending
 
   CS.out.standstill = False
@@ -746,45 +746,45 @@ def test_ka4_stock_scc_rearm_resets_after_vehicle_moves():
   assert controller.stock_scc_last_keepalive_frame is None
 
 
-def test_ka4_stock_scc_keeps_oem_timer_quiet_until_thirty_seconds():
+def test_ka4_stock_scc_synthetic_schedule_delays_modeled_resume_state_until_thirty_seconds():
   controller = build_controller()
   CC = build_control()
   CS = build_state()
-  oem_warning_deadline = 300
-  warning_frames = []
+  modeled_state_deadline = 300
+  modeled_state_frames = []
   pulse_frames = []
 
   for frame in range(3050):
-    warning_active = frame >= oem_warning_deadline
-    CS.scc_control["InfoDisplay"] = 4 if warning_active else 0
-    if warning_active:
-      warning_frames.append(frame)
+    modeled_state_active = frame >= modeled_state_deadline
+    CS.scc_control["InfoDisplay"] = 4 if modeled_state_active else 0
+    if modeled_state_active:
+      modeled_state_frames.append(frame)
 
     if resume_message_sent(step_controller(controller, CC, CS, frame)):
       pulse_frames.append(frame)
-      # Model the stock SCC contract: an accepted short RES press restarts its
-      # own three-second driver-action timer.
-      oem_warning_deadline = frame + 300
+      # Advance only this test's synthetic InfoDisplay schedule. This does not
+      # prove SCC acceptance, an OEM timing change, or a visible cluster state.
+      modeled_state_deadline = frame + 300
 
   starts = pulse_group_starts(pulse_frames)
   assert starts[0] == 250
   assert starts[-1] == 2696
   assert all([frame for frame in pulse_frames if start <= frame <= start + 4] == [start, start + 2, start + 4]
              for start in starts)
-  assert warning_frames[0] == 3000
-  assert all(frame >= 3000 for frame in warning_frames)
+  assert modeled_state_frames[0] == 3000
+  assert all(frame >= 3000 for frame in modeled_state_frames)
   assert not any(frame > 2700 for frame in pulse_frames)
 
 
-@pytest.mark.parametrize("warning_frame", [2695, 2697])
-def test_ka4_stock_scc_reserves_a_distinct_final_press_window(warning_frame):
+@pytest.mark.parametrize("state_frame", [2695, 2697])
+def test_ka4_stock_scc_reserves_a_distinct_final_press_window(state_frame):
   controller = build_controller()
   CC = build_control()
   CS = build_state()
   pulse_frames = []
 
   for frame in range(2701):
-    CS.scc_control["InfoDisplay"] = 4 if frame >= warning_frame else 0
+    CS.scc_control["InfoDisplay"] = 4 if frame >= state_frame else 0
     if resume_message_sent(step_controller(controller, CC, CS, frame)):
       pulse_frames.append(frame)
 
@@ -816,7 +816,7 @@ def test_stock_longitudinal_preserves_oem_hda_state(oem_hda_state):
 
 
 @pytest.mark.parametrize("alerts_5", [3, 4, 5])
-def test_stock_longitudinal_preserves_every_oem_adrv_warning_and_sound(alerts_5):
+def test_stock_longitudinal_preserves_received_oem_alert_sound_daw_and_mute_fields(alerts_5):
   original = {
     "COUNTER": 17,
     "LFA_ICON": 0,
@@ -825,6 +825,7 @@ def test_stock_longitudinal_preserves_every_oem_adrv_warning_and_sound(alerts_5)
     "ALERTS_2": 21,
     "ALERTS_3": 26,
     "ALERTS_5": alerts_5,
+    "MUTE": 1,
     "DAW_ICON": 2,
     "SOUNDS_1": 1,
     "SOUNDS_2": 2,
@@ -843,13 +844,13 @@ def test_stock_longitudinal_preserves_every_oem_adrv_warning_and_sound(alerts_5)
   assert msg[2]["LFA_ICON"] == 2
   assert msg[2]["LKA_ICON"] == 4
   assert msg[3]["rx_counter"] == 17
-  for signal in ("ALERTS_1", "ALERTS_2", "ALERTS_3", "ALERTS_5", "DAW_ICON",
+  for signal in ("ALERTS_1", "ALERTS_2", "ALERTS_3", "ALERTS_5", "MUTE", "DAW_ICON",
                  "SOUNDS_1", "SOUNDS_2", "SOUNDS_3", "SOUNDS_4"):
     assert msg[2][signal] == original[signal]
   assert original == original_copy
 
 
-def test_openpilot_longitudinal_retains_existing_adrv_warning_suppression():
+def test_openpilot_longitudinal_retains_existing_adrv_field_suppression():
   original = {
     "COUNTER": 4,
     "LFA_ICON": 0,

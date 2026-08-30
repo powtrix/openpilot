@@ -135,14 +135,14 @@ const CanMsg HYUNDAI_CANFD_HDA1_STOCK_TX_MSGS[] = {
   {0x12A, 0, 16}, // LFA
   {0x1CF, 0, 8},  // CRUISE_BUTTON
   {0x1E0, 0, 16}, // LFAHDA_CLUSTER
-  {0x161, 0, 32}, // ADRV_0x161 lateral icons, OEM warnings preserved
+  {0x161, 0, 32}, // ADRV_0x161 lateral icons; received alert/sound/DAW/mute fields preserved
 };
 
 const CanMsg HYUNDAI_CANFD_HDA1_STOCK_ALT_BUTTONS_TX_MSGS[] = {
   {0x12A, 0, 16}, // LFA
   {0x1AA, 2, 16}, // CRUISE_ALT_BUTTONS
   {0x1E0, 0, 16}, // LFAHDA_CLUSTER
-  {0x161, 0, 32}, // ADRV_0x161 lateral icons, OEM warnings preserved
+  {0x161, 0, 32}, // ADRV_0x161 lateral icons; received alert/sound/DAW/mute fields preserved
 };
 
 

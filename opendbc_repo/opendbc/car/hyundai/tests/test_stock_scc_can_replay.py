@@ -90,8 +90,8 @@ class Ka4StockSccReplay:
     self.CC = build_control()
     self.CS = build_state()
     self.scc_parser = CANParser(DBC_NAME, [("SCC_CONTROL", SCC_CONTROL_FREQUENCY)], self.controller.CAN.ECAN)
-    self.warning_deadline = round(3.0 / DT_CTRL)
-    self.warning_frames: list[int] = []
+    self.modeled_state_deadline = round(3.0 / DT_CTRL)
+    self.modeled_state_frames: list[int] = []
     self.scc_packets: list[tuple[int, bytes, int]] = []
     self.injected: list[InjectedButton] = []
 
@@ -99,9 +99,9 @@ class Ka4StockSccReplay:
     scc_period_frames = round(1.0 / (SCC_CONTROL_FREQUENCY * DT_CTRL))
     if frame % scc_period_frames == 0:
       stock_counter = (frame // scc_period_frames) & 0xFF
-      info_display = 4 if frame >= self.warning_deadline else 0
+      info_display = 4 if frame >= self.modeled_state_deadline else 0
       if info_display == 4:
-        self.warning_frames.append(frame)
+        self.modeled_state_frames.append(frame)
 
       scc_packet = self.scc_packer.make_can_msg("SCC_CONTROL", self.controller.CAN.ECAN, {
         "COUNTER": stock_counter,
@@ -146,11 +146,10 @@ class Ka4StockSccReplay:
       decoded = decode_message(self.dbc, self.button_message_name, data)
       if decoded["CRUISE_BUTTONS"] == Buttons.RES_ACCEL:
         self.injected.append(InjectedButton(frame, address, bus, data, self.CS.buttons_counter))
-        # Model the contract assumed by the production design: an accepted RES
-        # frame restarts the SCC's three-second driver-action timer. The public
-        # KA4 reference routes contain no synthetic 0x1AA RES at an engaged
-        # stop, so hardware acceptance is outside this deterministic replay.
-        self.warning_deadline = frame + round(3.0 / DT_CTRL)
+        # Advance the synthetic InfoDisplay schedule assumed by this replay.
+        # Public KA4 routes do not establish that SCC accepts these injected
+        # frames, changes any OEM timing, or displays a corresponding warning.
+        self.modeled_state_deadline = frame + round(3.0 / DT_CTRL)
     return messages
 
 
@@ -236,7 +235,7 @@ def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkey
   ],
 )
 @pytest.mark.parametrize("hda2", [False, True], ids=["hda1", "hda2"])
-def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contract(
+def test_ka4_stock_scc_real_can_replay_emits_schedule_under_synthetic_state_model(
     alt_buttons, panda_bus_offset, button_phase_frames, hda2,
 ):
   replay = Ka4StockSccReplay(
@@ -311,14 +310,14 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contra
 
   # The controller creates three-frame presses and releases by ceasing its
   # injection. No injected RES is present in any quiet interval, after the
-  # final frame at 27.00 s, or when the OEM warning appears at 30.00 s.
+  # final frame at 27.00 s, or when modeled InfoDisplay=4 begins at 30.00 s.
   emitted = set(frames)
   assert all(len(group) == 3 for group in groups)
   assert all(not any(frame in emitted for frame in range(group[-1] + 1, next_group[0]))
              for group, next_group in zip(groups[:-1], groups[1:], strict=True))
   assert max(emitted) == (2700 if button_phase_frames == 0 else 2699)
   assert not any(frame > 2700 for frame in emitted)
-  assert replay.warning_frames[0] == 3000
+  assert replay.modeled_state_frames[0] == 3000
 
   # SCC_CONTROL uses and passes the Hyundai CAN-FD CRC. The KA4 standard
   # 0x1CF button definition instead names its byte `_CHECKSUM`, which means
@@ -468,8 +467,8 @@ def test_ka4_software_cancel_preempts_keepalive_on_the_next_frame(alt_buttons):
   for frame in range(30):
     replay.step(frame)
 
-  # Jump to the first stock warning, matching the warning-level recovery path
-  # used by enter_standstill_warning in the focused state-machine tests.
+  # Jump to the first modeled InfoDisplay=4 state, matching the state-triggered
+  # path used by enter_standstill_resume_state in the focused tests.
   first_messages = replay.step(300)
   assert len(first_messages) == 1
   first_values = decode_message(replay.dbc, replay.button_message_name, first_messages[0][1])

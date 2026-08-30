@@ -26,13 +26,19 @@ The report separates a sendcan request from Panda's TX-return echo
 (``can.src == physical_bus + 0xC0``). A TX-return proves that Panda accepted
 the frame into its transmit path, not that it won arbitration or that an ECU
 accepted or acted on it. The probe also records the raw camera-side and
-host replacement paths for ADRV_0x161 (including ``ALERTS_5=5``) and
-LFAHDA_CLUSTER. A sendcan request by itself is not proof that anything reached
-the vehicle bus. A TX-return records Panda's queued transmit attempt, but does
-not prove arbitration or ECU acceptance; neither it nor SCC_CONTROL
-InfoDisplay acknowledges that the SCC ECU reset its timer.
-Exit status is 0 only when the complete correlated observation matches the
-requested boundary, 1 for direct FAIL evidence, and 2 for partial evidence.
+host-replacement paths for ADRV_0x161 (including its stock-owned alert, sound,
+DAW, and mute fields) when that message exists, and for LFAHDA_CLUSTER. Public KA4
+captures show that 0x161 is not present on every recorded variant. Neither
+ALERTS_5 nor SCC_CONTROL InfoDisplay has been correlated here with the user's
+visible cluster prompt, and neither acknowledges that the SCC ECU reset a
+timer.
+
+This is a single-capture CAN observation tool, not a vehicle-acceptance test.
+It can report a direct contradiction, a matching synthetic/on-wire schedule,
+or missing evidence, but a controlled on-car A/B with synchronized cluster
+video is still required. Exit status is 1 for direct FAIL evidence and 2 for
+all non-failing observations so automation cannot mistake CAN correlation for
+physical acceptance.
 """
 
 from __future__ import annotations
@@ -64,6 +70,15 @@ ADRV_0X161_ADDRESS = 0x161
 LFAHDA_CLUSTER_ADDRESS = 0x1E0
 CRUISE_BUTTONS_ALT_ADDRESS = 0x1AA
 CRUISE_BUTTONS_ADDRESS = 0x1CF
+ADRV_STOCK_OWNED_FIELDS = (
+  "ALERTS_1", "ALERTS_2", "ALERTS_3", "ALERTS_4", "ALERTS_5", "MUTE",
+  "SOUNDS_1", "SOUNDS_2", "SOUNDS_3", "SOUNDS_4", "DAW_ICON",
+)
+LFAHDA_STOCK_OWNED_FIELDS = (
+  "HDA_OptUsmSta", "LFA_OptUsmSta", "HDA_CntrlModSta", "HDA_InfoPUDis",
+  "HDA_AutoSetSpdSta", "HDA_AutoSetSpdUpdtSta", "HDA_AutoSetSpdVal",
+  "HDA_LFA_WrnSnd", "HDA_InfoPUDis1", "HDA_TDMRMDclReq",
+)
 
 PANDA_RETURNED_BUS_OFFSET = 0x80
 PANDA_REJECTED_BUS_OFFSET = 0xC0
@@ -80,7 +95,7 @@ BUTTON_NAMES = {
   5: "LFA_BUTTON",
 }
 
-REPORT_SCHEMA_VERSION = 4
+REPORT_SCHEMA_VERSION = 5
 TARGET_FINGERPRINT = "KIA_CARNIVAL_4TH_GEN"
 # Older cereal logs serialized the human-readable platform value.
 TARGET_FINGERPRINT_ALIASES = (TARGET_FINGERPRINT, "KIA CARNIVAL 4TH GEN")
@@ -88,6 +103,13 @@ MIN_EXACT_PROOF_DURATION = 30.25
 EARLIEST_EXPECTED_FINAL_WARNING = 29.5
 LATEST_EXPECTED_FINAL_WARNING = 31.5
 TX_MATCH_WINDOW = 0.100
+MIN_DISTINCT_CAN_FRAME_GAP = 0.005
+STOCK_SOURCE_PERIOD = 0.020
+CLUSTER_SOURCE_PERIOD = 0.050
+CLUSTER_SOURCE_CADENCE_TOLERANCE = 0.015
+CONTROL_SERVICE_PERIOD = 0.010
+CONTROL_SERVICE_CADENCE_TOLERANCE = 0.005
+STOP_BOUNDARY_STATE_WINDOW = 0.050
 BUTTON_SOURCE_MAX_AGE = 0.025
 BUTTON_SOURCE_FUTURE_TOLERANCE = 0.002
 BUTTON_SOURCE_CADENCE_TOLERANCE = 0.006
@@ -144,6 +166,13 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def _is_finite_number(value: Any) -> bool:
+  try:
+    return math.isfinite(float(value))
+  except (TypeError, ValueError):
+    return False
+
+
 def _decode_param(value: bytes | str | None) -> str | None:
   if value is None:
     return None
@@ -177,6 +206,7 @@ class StateSample:
   cruise_standstill: bool
   v_ego: float
   v_ego_raw: float
+  kinematics_finite: bool
   can_valid: bool
   brake_pressed: bool
   gas_pressed: bool
@@ -271,6 +301,19 @@ class ClusterCanSample:
   counter: int
   alert_5: int | None
   hda_control_state: int | None
+  adrv_stock_owned_values: tuple[tuple[str, float | int], ...]
+  lfahda_stock_owned_values: tuple[tuple[str, float | int], ...]
+
+
+@dataclass(frozen=True)
+class CanDecodeErrorSample:
+  t: float
+  service: str
+  origin: str
+  src: int
+  bus: int
+  address: int
+  error: str
 
 
 @dataclass
@@ -333,15 +376,25 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
   openpilot_long = bool(_safe_get(cp, "openpilotLongitudinalControl", False))
   canfd_hda2 = bool(flags & int(HyundaiFlags.CANFD_HDA2))
   safety_configs = []
-  safety_canfd_alt_buttons = False
-  for cfg in _safe_get(cp, "safetyConfigs", ()) or ():
+  safety_canfd_alt_button_indices = []
+  for index, cfg in enumerate(_safe_get(cp, "safetyConfigs", ()) or ()):
     model = str(_safe_get(cfg, "safetyModel", ""))
     safety_param = int(_safe_get(cfg, "safetyParam", 0))
     safety_configs.append({"model": model, "param": safety_param})
-    safety_canfd_alt_buttons |= (
+    if (
       model == "hyundaiCanfd"
       and bool(safety_param & int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS))
-    )
+    ):
+      safety_canfd_alt_button_indices.append(index)
+  safety_canfd_alt_buttons = bool(safety_canfd_alt_button_indices)
+  safety_panda_uniquely_resolved = len(safety_canfd_alt_button_indices) == 1
+  active_safety_param = (
+    safety_configs[safety_canfd_alt_button_indices[0]]["param"]
+    if safety_panda_uniquely_resolved else None
+  )
+  panda_bus_offset = (
+    4 * safety_canfd_alt_button_indices[0] if safety_panda_uniquely_resolved else None
+  )
   gate = {
     "fingerprintIsKa4": fingerprint in TARGET_FINGERPRINT_ALIASES,
     "pcmCruise": pcm_cruise,
@@ -351,6 +404,19 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
     "notCameraScc": not bool(flags & int(HyundaiFlags.CAMERA_SCC)),
     "canFdAltButtons": bool(flags & int(HyundaiFlags.CANFD_ALT_BUTTONS)),
     "hyundaiCanfdSafetyAltButtons": safety_canfd_alt_buttons,
+    "exactlyOneHyundaiCanfdSafetyAltButtonsConfig": safety_panda_uniquely_resolved,
+    "hyundaiCanfdSafetyHda2MatchesCarParams": (
+      active_safety_param is not None
+      and bool(active_safety_param & int(HyundaiSafetyFlags.CANFD_LKA_STEERING)) == canfd_hda2
+    ),
+    "hyundaiCanfdSafetyStockLongitudinal": (
+      active_safety_param is not None
+      and not bool(active_safety_param & int(HyundaiSafetyFlags.LONG))
+    ),
+    "hyundaiCanfdSafetyNotCameraScc": (
+      active_safety_param is not None
+      and not bool(active_safety_param & int(HyundaiSafetyFlags.CAMERA_SCC))
+    ),
   }
   return {
     "carFingerprint": fingerprint,
@@ -367,7 +433,8 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
     "extFlagsHex": f"0x{ext_flags:X}",
     "extFlagNames": _flag_names(HyundaiExtFlags, ext_flags),
     "safetyConfigs": safety_configs,
-    "pandaBusOffset": 4 * max(0, len(safety_configs) - 1),
+    "hyundaiCanfdSafetyAltButtonsConfigIndices": safety_canfd_alt_button_indices,
+    "pandaBusOffset": panda_bus_offset,
     "ka4StockSccGate": gate,
     "ka4StockSccGatePassed": all(gate.values()),
   }
@@ -452,6 +519,7 @@ class ProbeAnalyzer:
     self.buttons: list[ButtonSample] = []
     self.cluster_can: list[ClusterCanSample] = []
     self.decode_errors: Counter[str] = Counter()
+    self.decode_error_samples: list[CanDecodeErrorSample] = []
     self.streams: dict[tuple[str, str, int, int, int], StreamStat] = {}
     self.first_t = math.inf
     self.last_t = -math.inf
@@ -485,6 +553,15 @@ class ProbeAnalyzer:
       values, checksum_valid = self.decoder.decode(message_name, data)
     except (KeyError, ValueError, IndexError) as exc:
       self.decode_errors[f"{service}:{origin}:0x{address:X}:{exc}"] += 1
+      self.decode_error_samples.append(CanDecodeErrorSample(
+        t=t,
+        service=service,
+        origin=origin,
+        src=src,
+        bus=bus,
+        address=address,
+        error=f"{type(exc).__name__}: {exc}",
+      ))
       checksum_valid = None
       values = {}
 
@@ -509,6 +586,12 @@ class ProbeAnalyzer:
         counter=int(values.get("COUNTER", 0)),
         alert_5=int(values["ALERTS_5"]) if "ALERTS_5" in values else None,
         hda_control_state=int(values["HDA_CntrlModSta"]) if "HDA_CntrlModSta" in values else None,
+        adrv_stock_owned_values=tuple(
+          (name, values[name]) for name in ADRV_STOCK_OWNED_FIELDS if name in values
+        ),
+        lfahda_stock_owned_values=tuple(
+          (name, values[name]) for name in LFAHDA_STOCK_OWNED_FIELDS if name in values
+        ),
       ))
       return
     if address == SCC_CONTROL_ADDRESS:
@@ -555,14 +638,17 @@ class ProbeAnalyzer:
   def feed_state(self, t: float, state: Any) -> None:
     self._touch(t)
     cruise = _safe_get(state, "cruiseState", SimpleNamespace())
-    v_ego = _finite_float(_safe_get(state, "vEgo", 0.0))
+    raw_v_ego = _safe_get(state, "vEgo", 0.0)
+    raw_v_ego_raw = _safe_get(state, "vEgoRaw", raw_v_ego)
+    v_ego = _finite_float(raw_v_ego)
     self.states.append(StateSample(
       t=t,
       standstill=bool(_safe_get(state, "standstill", False)),
       cruise_enabled=bool(_safe_get(cruise, "enabled", False)),
       cruise_standstill=bool(_safe_get(cruise, "standstill", False)),
       v_ego=v_ego,
-      v_ego_raw=_finite_float(_safe_get(state, "vEgoRaw", v_ego)),
+      v_ego_raw=_finite_float(raw_v_ego_raw),
+      kinematics_finite=_is_finite_number(raw_v_ego) and _is_finite_number(raw_v_ego_raw),
       can_valid=bool(_safe_get(state, "canValid", False)),
       brake_pressed=bool(_safe_get(state, "brakePressed", False)),
       gas_pressed=bool(_safe_get(state, "gasPressed", False)),
@@ -640,6 +726,12 @@ class ProbeAnalyzer:
       return max(button_counts, key=lambda bus: (button_counts[bus], -bus))
     scc_counts = Counter(sample.bus for sample in self.scc)
     return max(scc_counts, key=lambda bus: (scc_counts[bus], -bus)) if scc_counts else None
+
+  def _configured_panda_bus_offset(self) -> int | None:
+    if not self.car_params:
+      return None
+    value = self.car_params.get("pandaBusOffset")
+    return int(value) if isinstance(value, int) and value >= 0 else None
 
   def _scc_report(self) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -752,8 +844,8 @@ class ProbeAnalyzer:
         if index in used_echoes:
           continue
         delta = echo.t - request.t
-        if abs(delta) <= TX_MATCH_WINDOW:
-          candidates.append((abs(delta), index, echo, delta))
+        if 0.0 <= delta <= TX_MATCH_WINDOW:
+          candidates.append((delta, index, echo))
       if not candidates:
         status_by_id[id(request)] = "unobserved"
         matches.append({
@@ -769,7 +861,7 @@ class ProbeAnalyzer:
         })
         continue
 
-      _, index, echo, delta = min(candidates, key=lambda item: item[0])
+      delta, index, echo = min(candidates, key=lambda item: item[0])
       used_echoes.add(index)
       status = "returned" if echo.origin == "tx_returned" else "rejected"
       status_by_id[id(request)] = status
@@ -833,10 +925,10 @@ class ProbeAnalyzer:
         "transitions": transitions[:100],
       })
 
-    panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
+    panda_bus_offset = self._configured_panda_bus_offset()
     canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
-    expected_raw_camera_bus = panda_bus_offset + 2
-    expected_host_bus = None if canfd_hda2 else panda_bus_offset
+    expected_raw_camera_bus = None if panda_bus_offset is None else panda_bus_offset + 2
+    expected_host_bus = None if canfd_hda2 or panda_bus_offset is None else panda_bus_offset
     return {
       "topology": {
         "pandaBusOffset": panda_bus_offset,
@@ -846,7 +938,7 @@ class ProbeAnalyzer:
         "stockLongBehavior": (
           "HDA2 stock-long leaves raw camera ADRV/LFAHDA traffic on the unmodified forwarding path"
           if canfd_hda2 else
-          "HDA1 stock-long replaces ADRV/LFAHDA on ECAN while preserving stock-owned ALERTS_5; masking is a FAIL"
+          "HDA1 stock-long replaces observed ADRV/LFAHDA frames on ECAN; changing a received stock-owned field is a FAIL"
         ),
         "inferenceWarning": (
           "Bus topology describes the current branch; a vehicle_rx frame alone is not proof of cluster display."
@@ -875,8 +967,8 @@ class ProbeAnalyzer:
         if (echo.address, echo.bus, echo.data_hex) != (request.address, request.bus, request.data_hex):
           continue
         delta = echo.t - request.t
-        if abs(delta) <= TX_MATCH_WINDOW:
-          candidates.append((abs(delta), index, echo, delta))
+        if 0.0 <= delta <= TX_MATCH_WINDOW:
+          candidates.append((delta, index, echo))
       if not candidates:
         status_by_id[id(request)] = "unobserved"
         matches.append({
@@ -889,7 +981,7 @@ class ProbeAnalyzer:
         })
         continue
 
-      _, index, echo, delta = min(candidates, key=lambda item: item[0])
+      delta, index, echo = min(candidates, key=lambda item: item[0])
       used_echoes.add(index)
       status = "returned" if echo.origin == "tx_returned" else "rejected"
       status_by_id[id(request)] = status
@@ -1099,7 +1191,25 @@ class ProbeAnalyzer:
       if sample.stop_active:
         if current_start is None:
           current_start = sample.t
-          start_observed = previous is not None and not previous.stop_active and sample.t - previous.t <= STOP_STREAM_GAP
+          start_observed = (
+            previous is not None
+            and not previous.stop_active
+            and previous.can_valid
+            and previous.kinematics_finite
+            and previous.cruise_enabled
+            and not previous.standstill
+            and (
+              abs(previous.v_ego) > 0.05
+              or abs(previous.v_ego_raw) > 0.03
+            )
+            and not previous.interlock_active
+            and sample.can_valid
+            and sample.kinematics_finite
+            and not sample.interlock_active
+            and sample.t - previous.t <= (
+              CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE
+            )
+          )
         current_last = sample.t
       elif current_start is not None and current_last is not None:
         episodes.append((current_start, current_last, start_observed))
@@ -1134,6 +1244,7 @@ class ProbeAnalyzer:
         sample.standstill,
         sample.cruise_enabled,
         sample.can_valid,
+        sample.kinematics_finite,
         sample.brake_pressed,
         sample.gas_pressed,
         sample.brake_hold_active,
@@ -1149,6 +1260,7 @@ class ProbeAnalyzer:
           "vEgo": sample.v_ego,
           "vEgoRaw": sample.v_ego_raw,
           "canValid": sample.can_valid,
+          "kinematicsFinite": sample.kinematics_finite,
           "brakePressed": sample.brake_pressed,
           "gasPressed": sample.gas_pressed,
           "brakeHoldActive": sample.brake_hold_active,
@@ -1164,6 +1276,7 @@ class ProbeAnalyzer:
       "cruiseEnabledSamples": sum(sample.cruise_enabled for sample in states),
       "eligibleStopSamples": sum(sample.stop_active for sample in states),
       "canInvalidSamples": sum(not sample.can_valid for sample in states),
+      "kinematicsNonFiniteSamples": sum(not sample.kinematics_finite for sample in states),
       "brakePressedSamples": sum(sample.brake_pressed for sample in states),
       "gasPressedSamples": sum(sample.gas_pressed for sample in states),
       "brakeHoldActiveSamples": sum(sample.brake_hold_active for sample in states),
@@ -1281,7 +1394,7 @@ class ProbeAnalyzer:
       return None
     return bool(getattr(nearest, name))
 
-  def _warning_periods(self, samples: list[SccSample], start: float) -> list[dict[str, float]]:
+  def _info_display_4_periods(self, samples: list[SccSample], start: float) -> list[dict[str, float]]:
     periods: list[tuple[float, float]] = []
     period_start: float | None = None
     last_t: float | None = None
@@ -1307,13 +1420,13 @@ class ProbeAnalyzer:
   def _schedule_mode(self, samples: list[SccSample], start: float) -> tuple[str, list[dict[str, float]]]:
     """Classify the only two schedules implemented by the controller.
 
-    InfoDisplay=4 is an authoritative SCC state input, not proof that the
-    cluster showed the driver-action warning. The early recovery schedule is
+    InfoDisplay=4 is an authoritative SCC state input, not proof of a visible
+    cluster prompt. The early recovery schedule is
     supported only when that state is already active at the physical stop and
     remains continuously active through the 0.30 s qualification dwell.
     """
     samples = sorted(samples, key=lambda sample: sample.t)
-    periods = self._warning_periods(samples, start)
+    periods = self._info_display_4_periods(samples, start)
     if not samples or samples[0].t - start > INITIAL_RECOVERY_START_TOLERANCE:
       return SCHEDULE_MODE_UNKNOWN, periods
 
@@ -1395,6 +1508,74 @@ class ProbeAnalyzer:
     }
 
   @staticmethod
+  def _counter_sequence_integrity(samples: list[Any], start: float, through: float, *,
+                                  expected_period: float, cadence_tolerance: float,
+                                  modulus: int = 256) -> dict[str, Any]:
+    """Require one strictly ordered, sequential-counter frame per observed tick.
+
+    Coverage alone cannot distinguish a real periodic stream from a stream with
+    duplicated same-tick frames. Treat timestamp collisions, implausibly close
+    frames, and skipped/repeated counters as ambiguous CAN evidence.
+    """
+    window = sorted(
+      (sample for sample in samples if start <= float(sample.t) <= through),
+      key=lambda sample: sample.t,
+    )
+    timestamp_gaps = [
+      curr.t - prev.t for prev, curr in zip(window, window[1:], strict=False)
+    ]
+    counter_deltas = [
+      (curr.counter - prev.counter) % modulus
+      for prev, curr in zip(window, window[1:], strict=False)
+    ]
+    non_increasing_timestamps = sum(gap <= 0.0 for gap in timestamp_gaps)
+    too_close_frames = sum(gap < MIN_DISTINCT_CAN_FRAME_GAP for gap in timestamp_gaps)
+    cadence_violations = sum(
+      abs(gap - expected_period) > cadence_tolerance for gap in timestamp_gaps
+    )
+    counter_step_violations = sum(delta != 1 for delta in counter_deltas)
+    return {
+      "sampleCount": len(window),
+      "minimumDistinctFrameGapMs": MIN_DISTINCT_CAN_FRAME_GAP * 1000.0,
+      "expectedPeriodMs": expected_period * 1000.0,
+      "cadenceToleranceMs": cadence_tolerance * 1000.0,
+      "minimumObservedGapMs": round(min(timestamp_gaps) * 1000.0, 3) if timestamp_gaps else None,
+      "maximumObservedGapMs": round(max(timestamp_gaps) * 1000.0, 3) if timestamp_gaps else None,
+      "nonIncreasingTimestampPairs": non_increasing_timestamps,
+      "tooCloseFramePairs": too_close_frames,
+      "cadenceViolationPairs": cadence_violations,
+      "counterStepViolations": counter_step_violations,
+      "clean": bool(window) and not (
+        non_increasing_timestamps or too_close_frames or cadence_violations or counter_step_violations
+      ),
+    }
+
+  @staticmethod
+  def _time_sequence_integrity(samples: list[Any], start: float, through: float, *,
+                               expected_period: float, cadence_tolerance: float) -> dict[str, Any]:
+    window = sorted(
+      (sample for sample in samples if start <= float(sample.t) <= through),
+      key=lambda sample: sample.t,
+    )
+    timestamp_gaps = [
+      curr.t - prev.t for prev, curr in zip(window, window[1:], strict=False)
+    ]
+    non_increasing_timestamps = sum(gap <= 0.0 for gap in timestamp_gaps)
+    cadence_violations = sum(
+      abs(gap - expected_period) > cadence_tolerance for gap in timestamp_gaps
+    )
+    return {
+      "sampleCount": len(window),
+      "expectedPeriodMs": expected_period * 1000.0,
+      "cadenceToleranceMs": cadence_tolerance * 1000.0,
+      "minimumObservedGapMs": round(min(timestamp_gaps) * 1000.0, 3) if timestamp_gaps else None,
+      "maximumObservedGapMs": round(max(timestamp_gaps) * 1000.0, 3) if timestamp_gaps else None,
+      "nonIncreasingTimestampPairs": non_increasing_timestamps,
+      "cadenceViolationPairs": cadence_violations,
+      "clean": bool(window) and not (non_increasing_timestamps or cadence_violations),
+    }
+
+  @staticmethod
   def _pair_cluster_frames_by_counter(
       sources: list[ClusterCanSample], outputs: list[ClusterCanSample], start: float, through: float,
   ) -> tuple[list[tuple[ClusterCanSample, ClusterCanSample]], dict[str, Any]]:
@@ -1405,43 +1586,42 @@ class ProbeAnalyzer:
     the output lets one sparse host frame stand in for several raw frames. Keep
     the time bound and consume each output at most once.
     """
-    all_sources = sorted(sources, key=lambda sample: sample.t)
+    proof_sources = sorted(
+      (source for source in sources if start <= source.t <= through),
+      key=lambda sample: sample.t,
+    )
     all_outputs = sorted(outputs, key=lambda sample: sample.t)
+    proof_output_indices = {
+      index for index, output in enumerate(all_outputs)
+      if start <= output.t <= through
+      or any(
+        source.counter == output.counter and 0.0 <= output.t - source.t <= TX_MATCH_WINDOW
+        for source in proof_sources
+      )
+    }
     used_outputs: set[int] = set()
-    all_pairs: list[tuple[ClusterCanSample, int, ClusterCanSample]] = []
-    for source in all_sources:
+    pairs_with_index: list[tuple[ClusterCanSample, int, ClusterCanSample]] = []
+    for source in proof_sources:
       candidates = [
-        (abs(output.t - source.t), index, output)
+        (output.t - source.t, index, output)
         for index, output in enumerate(all_outputs)
-        if index not in used_outputs
+        if index in proof_output_indices
+        and index not in used_outputs
         and output.counter == source.counter
-        and abs(output.t - source.t) <= TX_MATCH_WINDOW
+        and 0.0 <= output.t - source.t <= TX_MATCH_WINDOW
       ]
       if not candidates:
         continue
       _, output_index, output = min(candidates, key=lambda candidate: candidate[0])
       used_outputs.add(output_index)
-      all_pairs.append((source, output_index, output))
+      pairs_with_index.append((source, output_index, output))
 
-    proof_sources = [source for source in all_sources if start <= source.t <= through]
-    proof_pairs_with_index = [pair for pair in all_pairs if start <= pair[0].t <= through]
-    pairs = [(source, output) for source, _, output in proof_pairs_with_index]
-    proof_output_indices = {index for _, index, _ in proof_pairs_with_index}
-    unpaired_proof_outputs = [
-      output for index, output in enumerate(all_outputs)
-      if index not in used_outputs
-      and (
-        start <= output.t <= through
-        or any(
-          source.counter == output.counter and abs(source.t - output.t) <= TX_MATCH_WINDOW
-          for source in proof_sources
-        )
-      )
-    ]
+    pairs = [(source, output) for source, _, output in pairs_with_index]
+    unused_output_indices = proof_output_indices - used_outputs
     source_count = len(proof_sources)
     paired_count = len(pairs)
-    output_count = len(proof_output_indices) + len(unpaired_proof_outputs)
-    unused_output_count = len(unpaired_proof_outputs)
+    output_count = len(proof_output_indices)
+    unused_output_count = len(unused_output_indices)
     exact_one_to_one = (
       source_count > 0
       and source_count == output_count == paired_count
@@ -1461,9 +1641,9 @@ class ProbeAnalyzer:
 
   def _cluster_episode_evidence(self, start: float, end: float,
                                 tx_status_by_id: dict[int, str]) -> dict[str, Any]:
-    panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
+    panda_bus_offset = self._configured_panda_bus_offset()
     canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
-    raw_camera_bus = panda_bus_offset + 2
+    raw_camera_bus = None if panda_bus_offset is None else panda_bus_offset + 2
     host_bus = panda_bus_offset
     samples = [sample for sample in self.cluster_can if start - 0.150 <= sample.t <= end + 0.150]
     raw_adrv = sorted((sample for sample in samples
@@ -1484,6 +1664,11 @@ class ProbeAnalyzer:
     returned_hda = sorted((sample for sample in samples
                            if sample.origin == "tx_returned" and sample.address == LFAHDA_CLUSTER_ADDRESS),
                           key=lambda sample: sample.t)
+    rejected_cluster_echoes = [
+      sample for sample in samples
+      if sample.origin in ("tx_rejected", "tx_rejected_returned")
+      and sample.address in (ADRV_0X161_ADDRESS, LFAHDA_CLUSTER_ADDRESS)
+    ]
     raw_cluster_samples = [*raw_adrv, *raw_hda]
     replacement_cluster_samples = [*adrv_requests, *hda_requests, *returned_adrv, *returned_hda]
     cluster_request_samples = [*adrv_requests, *hda_requests]
@@ -1497,25 +1682,159 @@ class ProbeAnalyzer:
     host_hda_requests = [sample for sample in hda_requests if sample.bus == host_bus]
     host_returned_adrv = [sample for sample in returned_adrv if sample.bus == host_bus]
     host_returned_hda = [sample for sample in returned_hda if sample.bus == host_bus]
-    raw_adrv_coverage = self._continuous_coverage(raw_adrv, start, coverage_through)
-    raw_hda_coverage = self._continuous_coverage(raw_hda, start, coverage_through)
+    raw_adrv_transport_stats = [
+      stat for (_, origin, _, bus, address), stat in self.streams.items()
+      if origin == "vehicle_rx"
+      and bus == raw_camera_bus
+      and address == ADRV_0X161_ADDRESS
+      and stat.last_t >= start - 0.150
+      and stat.first_t <= end + 0.150
+    ]
+    raw_adrv_transport_observed = bool(raw_adrv_transport_stats)
+    host_adrv_transport_stats = [
+      stat for (_, origin, _, bus, address), stat in self.streams.items()
+      if origin in ("send_request", "tx_returned", "tx_rejected", "tx_rejected_returned")
+      and bus == host_bus
+      and address == ADRV_0X161_ADDRESS
+      and stat.last_t >= start - 0.150
+      and stat.first_t <= end + 0.150
+    ]
+    host_adrv_transport_observed = bool(host_adrv_transport_stats)
+    adrv_transport_entries = [
+      (origin, bus, stat)
+      for (_, origin, _, bus, address), stat in self.streams.items()
+      if address == ADRV_0X161_ADDRESS
+      and stat.last_t >= start - 0.150
+      and stat.first_t <= end + 0.150
+    ]
+    any_adrv_transport_observed = bool(adrv_transport_entries)
+    unexpected_adrv_transport_observed = any(
+      not (
+        (origin == "vehicle_rx" and bus == raw_camera_bus)
+        or (
+          not canfd_hda2
+          and origin in ("send_request", "tx_returned", "tx_rejected", "tx_rejected_returned")
+          and bus == host_bus
+        )
+      )
+      for origin, bus, _ in adrv_transport_entries
+    )
+    hda_transport_entries = [
+      (origin, bus, stat)
+      for (_, origin, _, bus, address), stat in self.streams.items()
+      if address == LFAHDA_CLUSTER_ADDRESS
+      and stat.last_t >= start - 0.150
+      and stat.first_t <= end + 0.150
+    ]
+    unexpected_hda_transport_observed = any(
+      not (
+        (origin == "vehicle_rx" and bus == raw_camera_bus)
+        or (
+          not canfd_hda2
+          and origin in ("send_request", "tx_returned", "tx_rejected", "tx_rejected_returned")
+          and bus == host_bus
+        )
+      )
+      for origin, bus, _ in hda_transport_entries
+    )
+    cluster_decode_errors = [
+      sample for sample in self.decode_error_samples
+      if start - 0.150 <= sample.t <= end + 0.150
+      and sample.address in (ADRV_0X161_ADDRESS, LFAHDA_CLUSTER_ADDRESS)
+    ]
+    adrv_decode_errors = [
+      sample for sample in cluster_decode_errors if sample.address == ADRV_0X161_ADDRESS
+    ]
+    raw_adrv_decode_errors = [
+      sample for sample in adrv_decode_errors
+      if sample.origin == "vehicle_rx" and sample.bus == raw_camera_bus
+    ]
+    hda_decode_errors = [
+      sample for sample in cluster_decode_errors if sample.address == LFAHDA_CLUSTER_ADDRESS
+    ]
+    raw_hda_decode_errors = [
+      sample for sample in hda_decode_errors
+      if sample.origin == "vehicle_rx" and sample.bus == raw_camera_bus
+    ]
+    host_cluster_decode_errors = [
+      sample for sample in cluster_decode_errors if sample.origin != "vehicle_rx"
+    ]
+    rejected_cluster_decode_errors = [
+      sample for sample in cluster_decode_errors
+      if sample.origin in ("tx_rejected", "tx_rejected_returned")
+    ]
+    raw_adrv_coverage = self._continuous_coverage(
+      raw_adrv, start, coverage_through,
+      max_gap=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      edge_tolerance=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+    )
+    raw_hda_coverage = self._continuous_coverage(
+      raw_hda, start, coverage_through,
+      max_gap=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      edge_tolerance=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+    )
     host_stream_coverage = {
-      "adrvRequests": self._continuous_coverage(host_adrv_requests, start, coverage_through),
-      "adrvReturned": self._continuous_coverage(host_returned_adrv, start, coverage_through),
-      "lfaHdaRequests": self._continuous_coverage(host_hda_requests, start, coverage_through),
-      "lfaHdaReturned": self._continuous_coverage(host_returned_hda, start, coverage_through),
+      name: self._continuous_coverage(
+        stream, start, coverage_through,
+        max_gap=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+        edge_tolerance=CLUSTER_SOURCE_PERIOD + CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      )
+      for name, stream in (
+        ("adrvRequests", host_adrv_requests),
+        ("adrvReturned", host_returned_adrv),
+        ("lfaHdaRequests", host_hda_requests),
+        ("lfaHdaReturned", host_returned_hda),
+      )
+    }
+    counter_sequence_integrity = {
+      "rawAdrv": self._counter_sequence_integrity(
+        raw_adrv, start, end,
+        expected_period=CLUSTER_SOURCE_PERIOD,
+        cadence_tolerance=CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "rawLfaHda": self._counter_sequence_integrity(
+        raw_hda, start, end,
+        expected_period=CLUSTER_SOURCE_PERIOD,
+        cadence_tolerance=CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "adrvRequests": self._counter_sequence_integrity(
+        host_adrv_requests, start, end,
+        expected_period=CLUSTER_SOURCE_PERIOD,
+        cadence_tolerance=CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "adrvReturned": self._counter_sequence_integrity(
+        host_returned_adrv, start, end,
+        expected_period=CLUSTER_SOURCE_PERIOD,
+        cadence_tolerance=CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "lfaHdaRequests": self._counter_sequence_integrity(
+        host_hda_requests, start, end,
+        expected_period=CLUSTER_SOURCE_PERIOD,
+        cadence_tolerance=CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "lfaHdaReturned": self._counter_sequence_integrity(
+        host_returned_hda, start, end,
+        expected_period=CLUSTER_SOURCE_PERIOD,
+        cadence_tolerance=CLUSTER_SOURCE_CADENCE_TOLERANCE,
+      ),
     }
     _, adrv_request_pairing = self._pair_cluster_frames_by_counter(
       raw_adrv, host_adrv_requests, start, coverage_through,
     )
-    _, adrv_return_pairing = self._pair_cluster_frames_by_counter(
+    adrv_return_pairs, adrv_return_pairing = self._pair_cluster_frames_by_counter(
       raw_adrv, host_returned_adrv, start, coverage_through,
+    )
+    _, adrv_episode_return_pairing = self._pair_cluster_frames_by_counter(
+      raw_adrv, host_returned_adrv, start, end,
     )
     _, hda_request_pairing = self._pair_cluster_frames_by_counter(
       raw_hda, host_hda_requests, start, coverage_through,
     )
     hda_return_pairs, hda_return_pairing = self._pair_cluster_frames_by_counter(
       raw_hda, host_returned_hda, start, coverage_through,
+    )
+    _, hda_episode_return_pairing = self._pair_cluster_frames_by_counter(
+      raw_hda, host_returned_hda, start, end,
     )
     exact_adrv_replacement_pairing = (
       adrv_request_pairing["exactOneToOneByCounterAndTime"]
@@ -1526,90 +1845,247 @@ class ProbeAnalyzer:
       and hda_return_pairing["exactOneToOneByCounterAndTime"]
     )
 
-    raw_warning_periods = self._cluster_signal_periods(
+    raw_alert5_value5_periods = self._cluster_signal_periods(
       [sample for sample in raw_adrv if start <= sample.t <= end], start, "alert_5",
       USE_SWITCH_OR_PEDAL_TO_ACCELERATE,
     )
-    first_raw_warning = raw_warning_periods[0]["startAfterStop"] if raw_warning_periods else None
-    raw_warning_frames = [sample for sample in raw_adrv
-                          if start <= sample.t <= end
-                          and sample.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE]
-    warning_output_pairs = []
-    used_warning_outputs: set[int] = set()
-    for raw in raw_warning_frames:
+    first_raw_alert5_value5 = (
+      raw_alert5_value5_periods[0]["startAfterStop"] if raw_alert5_value5_periods else None
+    )
+    raw_alert5_value5_frames = [sample for sample in raw_adrv
+                                if start <= sample.t <= end
+                                and sample.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE]
+    alert5_value5_output_pairs = []
+    used_alert5_value5_outputs: set[int] = set()
+    for raw in raw_alert5_value5_frames:
       candidates = [
-        (abs(sample.t - raw.t), index, sample)
+        (sample.t - raw.t, index, sample)
         for index, sample in enumerate(returned_adrv)
-        if index not in used_warning_outputs
+        if index not in used_alert5_value5_outputs
         and sample.bus == host_bus
         and sample.counter == raw.counter
-        and abs(sample.t - raw.t) <= TX_MATCH_WINDOW
+        and 0.0 <= sample.t - raw.t <= TX_MATCH_WINDOW
       ]
       if candidates:
         _, index, output = min(candidates, key=lambda candidate: candidate[0])
-        used_warning_outputs.add(index)
-        warning_output_pairs.append((raw, output))
-    masked_warning_frames = sum(output.alert_5 != USE_SWITCH_OR_PEDAL_TO_ACCELERATE
-                                for _, output in warning_output_pairs)
-    forwarded_warning_frames = sum(output.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
-                                   for _, output in warning_output_pairs)
-    unpaired_warning_frames = len(raw_warning_frames) - len(warning_output_pairs)
-    if canfd_hda2:
-      warning_preservation_ok = not adrv_requests and not returned_adrv
-      warning_preservation_topology = "hda2_raw_no_host_replacement"
-    elif not raw_warning_frames:
-      warning_preservation_ok = True
-      warning_preservation_topology = "hda1_no_raw_warning_to_preserve"
-    else:
-      warning_preservation_ok = (
-        unpaired_warning_frames == 0
-        and masked_warning_frames == 0
-        and forwarded_warning_frames == len(raw_warning_frames)
-      )
-      warning_preservation_topology = "hda1_host_replacement"
+        used_alert5_value5_outputs.add(index)
+        alert5_value5_output_pairs.append((raw, output))
+    changed_alert5_value5_frames = sum(output.alert_5 != USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+                                       for _, output in alert5_value5_output_pairs)
+    preserved_alert5_value5_frames = sum(output.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+                                         for _, output in alert5_value5_output_pairs)
+    unpaired_alert5_value5_frames = len(raw_alert5_value5_frames) - len(alert5_value5_output_pairs)
 
+    if raw_adrv:
+      adrv_applicability = "OBSERVED_WITH_DECODE_ERRORS" if adrv_decode_errors else "OBSERVED"
+    elif raw_adrv_transport_observed:
+      adrv_applicability = "OBSERVED_BUT_UNDECODED"
+    elif any_adrv_transport_observed:
+      adrv_applicability = "EXPECTED_RAW_NOT_OBSERVED_OTHER_TRAFFIC_PRESENT"
+    else:
+      adrv_applicability = "NOT_OBSERVED_IN_CAPTURE"
+
+    if adrv_applicability == "NOT_OBSERVED_IN_CAPTURE":
+      candidate_alert5_correlation = "NOT_OBSERVED"
+    elif adrv_decode_errors:
+      candidate_alert5_correlation = "UNAVAILABLE_DUE_TO_DECODE_ERRORS"
+    elif not raw_adrv:
+      candidate_alert5_correlation = "UNAVAILABLE_WITHOUT_DECODED_RAW"
+    elif first_raw_alert5_value5 is None:
+      candidate_alert5_correlation = (
+        "CLEAR_THROUGH_30S" if raw_adrv_coverage["continuous"] else
+        "NO_VALUE_5_WITH_INCOMPLETE_COVERAGE"
+      )
+    elif first_raw_alert5_value5 < EARLIEST_EXPECTED_FINAL_WARNING:
+      candidate_alert5_correlation = "EARLY"
+    elif first_raw_alert5_value5 > LATEST_EXPECTED_FINAL_WARNING:
+      candidate_alert5_correlation = "LATE"
+    else:
+      candidate_alert5_correlation = "MATCHED_AT_30S"
+
+    if not raw_alert5_value5_frames:
+      alert5_value5_preservation = "NOT_APPLICABLE"
+      path_preserves_observed_alert5_value5: bool | None = None
+    elif canfd_hda2:
+      path_preserves_observed_alert5_value5 = not adrv_requests and not returned_adrv
+      alert5_value5_preservation = (
+        "RAW_PATH_WITHOUT_HOST_REPLACEMENT" if path_preserves_observed_alert5_value5 else
+        "UNEXPECTED_HOST_REPLACEMENT"
+      )
+    else:
+      path_preserves_observed_alert5_value5 = (
+        unpaired_alert5_value5_frames == 0
+        and changed_alert5_value5_frames == 0
+        and preserved_alert5_value5_frames == len(raw_alert5_value5_frames)
+      )
+      alert5_value5_preservation = (
+        "PRESERVED" if path_preserves_observed_alert5_value5 else "CHANGED_OR_UNPAIRED"
+      )
+
+    hda_all_return_value_pairs = []
+    for output in host_returned_hda:
+      if not start <= output.t <= end:
+        continue
+      candidates = [
+        raw for raw in raw_hda
+        if raw.counter == output.counter and 0.0 <= output.t - raw.t <= TX_MATCH_WINDOW
+      ]
+      if candidates:
+        raw = min(candidates, key=lambda sample: output.t - sample.t)
+        hda_all_return_value_pairs.append((raw, output))
     hda_state_mismatches = sum(raw.hda_control_state != output.hda_control_state
-                               for raw, output in hda_return_pairs)
+                               for raw, output in hda_all_return_value_pairs)
+    lfahda_stock_owned_field_mismatch_counts: Counter[str] = Counter()
+    lfahda_stock_owned_mismatch_frames = 0
+    for raw, output in hda_all_return_value_pairs:
+      raw_values = dict(raw.lfahda_stock_owned_values)
+      output_values = dict(output.lfahda_stock_owned_values)
+      mismatched_fields = [
+        name for name in LFAHDA_STOCK_OWNED_FIELDS if raw_values.get(name) != output_values.get(name)
+      ]
+      if mismatched_fields:
+        lfahda_stock_owned_mismatch_frames += 1
+        lfahda_stock_owned_field_mismatch_counts.update(mismatched_fields)
+    unexpected_hda_returned_frames = hda_episode_return_pairing["unusedOutputFrames"]
+    # Check every returned output independently. A one-to-one matcher may
+    # legitimately choose the normal return and leave a second, mutated return
+    # unused; that extra output must not evade the ALERTS_5 preservation check.
+    adrv_all_return_value_pairs = []
+    for output in host_returned_adrv:
+      if not start <= output.t <= end:
+        continue
+      candidates = [
+        raw for raw in raw_adrv
+        if raw.counter == output.counter and 0.0 <= output.t - raw.t <= TX_MATCH_WINDOW
+      ]
+      if candidates:
+        raw = min(candidates, key=lambda sample: output.t - sample.t)
+        adrv_all_return_value_pairs.append((raw, output))
+    adrv_alert5_mismatches = sum(raw.alert_5 != output.alert_5
+                                 for raw, output in adrv_all_return_value_pairs)
+    adrv_stock_owned_field_mismatch_counts: Counter[str] = Counter()
+    adrv_stock_owned_mismatch_frames = 0
+    for raw, output in adrv_all_return_value_pairs:
+      raw_values = dict(raw.adrv_stock_owned_values)
+      output_values = dict(output.adrv_stock_owned_values)
+      mismatched_fields = [
+        name for name in ADRV_STOCK_OWNED_FIELDS if raw_values.get(name) != output_values.get(name)
+      ]
+      if mismatched_fields:
+        adrv_stock_owned_mismatch_frames += 1
+        adrv_stock_owned_field_mismatch_counts.update(mismatched_fields)
+    adrv_alert5_value5_mismatches = sum(
+      raw.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+      and output.alert_5 != USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+      for raw, output in adrv_all_return_value_pairs
+    )
+    unexpected_adrv_returned_frames = adrv_episode_return_pairing["unusedOutputFrames"]
+    if raw_alert5_value5_frames and not canfd_hda2 and adrv_alert5_value5_mismatches:
+      path_preserves_observed_alert5_value5 = False
+      alert5_value5_preservation = "CHANGED_OR_UNPAIRED"
 
-    if raw_warning_frames and masked_warning_frames:
-      warning_path = "hostReplacementMaskedRawWarning"
-    elif raw_warning_frames and forwarded_warning_frames:
-      warning_path = "hostReplacementForwardedRawWarning"
-    elif raw_warning_frames and canfd_hda2 and not adrv_requests:
-      warning_path = "hda2RawUnmodifiedForwardingTopology"
-    elif raw_warning_frames:
-      warning_path = "rawWarningObservedButDeliveryUnproven"
+    if not raw_alert5_value5_frames:
+      alert5_value_path = "alert5Value5NotObserved"
+    elif canfd_hda2:
+      alert5_value_path = (
+        "hda2RawAlert5Value5NoHostReplacement"
+        if path_preserves_observed_alert5_value5 else
+        "hda2UnexpectedHostReplacement"
+      )
+    elif adrv_alert5_value5_mismatches:
+      alert5_value_path = "hostReplacementChangedAlert5Value5"
+    elif unexpected_adrv_returned_frames:
+      alert5_value_path = "hostReplacementHasUnexpectedReturnedFrames"
+    elif unpaired_alert5_value5_frames:
+      alert5_value_path = "hostReplacementMissingAlert5Value5Pair"
+    elif path_preserves_observed_alert5_value5:
+      alert5_value_path = "hostReplacementPreservedAlert5Value5"
     else:
-      warning_path = "noRawWarningObserved"
+      alert5_value_path = "rawAlert5Value5ObservedDeliveryUnproven"
 
-    all_adrv_returned = bool(adrv_requests) and all(
-      tx_status_by_id.get(id(request)) == "returned" for request in adrv_requests)
-    all_hda_returned = bool(hda_requests) and all(
-      tx_status_by_id.get(id(request)) == "returned" for request in hda_requests)
-    if canfd_hda2:
-      hda_path_consistent = (
-        raw_adrv_coverage["continuous"]
-        and raw_hda_coverage["continuous"]
+    all_adrv_returned = (
+      all(tx_status_by_id.get(id(request)) == "returned" for request in adrv_requests)
+      if adrv_requests else None
+    )
+    all_hda_returned = (
+      all(tx_status_by_id.get(id(request)) == "returned" for request in hda_requests)
+      if hda_requests else None
+    )
+    if unexpected_adrv_transport_observed:
+      adrv_path_consistent = False
+    elif adrv_decode_errors:
+      adrv_path_consistent = False
+    elif raw_adrv:
+      if canfd_hda2:
+        adrv_path_consistent = (
+          raw_adrv_coverage["continuous"]
+          and counter_sequence_integrity["rawAdrv"]["clean"]
+          and not adrv_requests
+          and not returned_adrv
+        )
+      else:
+        adrv_path_consistent = (
+          raw_adrv_coverage["continuous"]
+          and host_stream_coverage["adrvRequests"]["continuous"]
+          and host_stream_coverage["adrvReturned"]["continuous"]
+          and counter_sequence_integrity["rawAdrv"]["clean"]
+          and counter_sequence_integrity["adrvRequests"]["clean"]
+          and counter_sequence_integrity["adrvReturned"]["clean"]
+          and exact_adrv_replacement_pairing
+          and all_adrv_returned
+          and adrv_stock_owned_mismatch_frames == 0
+          and adrv_alert5_mismatches == 0
+          and unexpected_adrv_returned_frames == 0
+          and all(request.bus == host_bus for request in adrv_requests)
+          and all(sample.bus == host_bus for sample in returned_adrv)
+        )
+    elif raw_adrv_transport_observed:
+      # A raw transport stream without decoded samples is not equivalent to
+      # a vehicle variant that does not carry 0x161. Keep the proof
+      # inconclusive so a DBC/length/decode failure cannot look like absence.
+      adrv_path_consistent = False
+    else:
+      # Current code does not synthesize 0x161 when the received variant does
+      # not carry it. Absence is therefore a supported topology, not a missing
+      # generic KA4 proof prerequisite.
+      adrv_path_consistent = (
+        not host_adrv_transport_observed
         and not adrv_requests
-        and not hda_requests
         and not returned_adrv
+      )
+
+    if unexpected_hda_transport_observed:
+      lfa_hda_path_consistent = False
+    elif hda_decode_errors:
+      lfa_hda_path_consistent = False
+    elif canfd_hda2:
+      lfa_hda_path_consistent = (
+        raw_hda_coverage["continuous"]
+        and counter_sequence_integrity["rawLfaHda"]["clean"]
+        and not hda_requests
         and not returned_hda
-        and warning_preservation_ok
       )
     else:
-      hda_path_consistent = (
-        raw_adrv_coverage["continuous"]
-        and raw_hda_coverage["continuous"]
-        and all(coverage["continuous"] for coverage in host_stream_coverage.values())
-        and exact_adrv_replacement_pairing
+      lfa_hda_path_consistent = (
+        raw_hda_coverage["continuous"]
+        and host_stream_coverage["lfaHdaRequests"]["continuous"]
+        and host_stream_coverage["lfaHdaReturned"]["continuous"]
+        and counter_sequence_integrity["rawLfaHda"]["clean"]
+        and counter_sequence_integrity["lfaHdaRequests"]["clean"]
+        and counter_sequence_integrity["lfaHdaReturned"]["clean"]
         and exact_hda_replacement_pairing
-        and all_adrv_returned
         and all_hda_returned
+        and lfahda_stock_owned_mismatch_frames == 0
         and hda_state_mismatches == 0
-        and all(request.bus == host_bus for request in (*adrv_requests, *hda_requests))
-        and all(sample.bus == host_bus for sample in (*returned_adrv, *returned_hda))
-        and warning_preservation_ok
+        and unexpected_hda_returned_frames == 0
+        and all(request.bus == host_bus for request in hda_requests)
+        and all(sample.bus == host_bus for sample in returned_hda)
       )
+    hda_path_consistent = (
+      adrv_path_consistent
+      and lfa_hda_path_consistent
+      and path_preserves_observed_alert5_value5 is not False
+    )
 
     raw_hda_transitions = []
     previous_hda_state: int | None | object = object()
@@ -1628,14 +2104,20 @@ class ProbeAnalyzer:
                     if start <= sample.t <= end and sample.origin == "send_request"
                     and sample.button == BUTTON_RES_ACCEL]
     last_res_after_stop = round(max(sample.t for sample in res_requests) - start, 3) if res_requests else None
-    warning_after_last_res = (
-      round(first_raw_warning - last_res_after_stop, 3)
-      if first_raw_warning is not None and last_res_after_stop is not None else None
+    alert5_value5_after_last_res = (
+      round(first_raw_alert5_value5 - last_res_after_stop, 3)
+      if first_raw_alert5_value5 is not None and last_res_after_stop is not None else None
     )
     return {
       "rawCameraBus": raw_camera_bus,
       "hostReplacementBus": None if canfd_hda2 else host_bus,
       "canFdHda2": canfd_hda2,
+      "adrv0x161Applicability": adrv_applicability,
+      "rawAdrvTransportObserved": raw_adrv_transport_observed,
+      "hostAdrvTransportObserved": host_adrv_transport_observed,
+      "anyAdrvTransportObserved": any_adrv_transport_observed,
+      "unexpectedAdrvTransportObserved": unexpected_adrv_transport_observed,
+      "unexpectedLfaHdaTransportObserved": unexpected_hda_transport_observed,
       "rawAdrvSamples": len(raw_adrv),
       "rawLfaHdaSamples": len(raw_hda),
       "rawAdrvContinuousThrough30_25s": raw_adrv_coverage["continuous"],
@@ -1643,6 +2125,7 @@ class ProbeAnalyzer:
       "rawAdrvCoverage": raw_adrv_coverage,
       "rawLfaHdaCoverage": raw_hda_coverage,
       "hostReplacementCoverage": host_stream_coverage,
+      "counterSequenceIntegrity": counter_sequence_integrity,
       "hostReplacementPairing": {
         "adrvRawToRequest": adrv_request_pairing,
         "adrvRawToReturned": adrv_return_pairing,
@@ -1652,32 +2135,51 @@ class ProbeAnalyzer:
         "exactLfaHdaRawRequestReturnedPairing": exact_hda_replacement_pairing,
       },
       "integrity": {
-        "rawAdrvAllCrcValid": bool(raw_adrv) and all(sample.checksum_valid is True for sample in raw_adrv),
-        "rawLfaHdaAllCrcValid": bool(raw_hda) and all(sample.checksum_valid is True for sample in raw_hda),
+        "rawAdrvAllCrcValid": (
+          not raw_adrv_decode_errors
+          and all(sample.checksum_valid is True for sample in raw_adrv) if raw_adrv else None
+        ),
+        "rawLfaHdaAllCrcValid": (
+          bool(raw_hda)
+          and not raw_hda_decode_errors
+          and all(sample.checksum_valid is True for sample in raw_hda)
+        ),
         "hostReplacementAllCrcValid": (
-          not replacement_cluster_samples if canfd_hda2 else
+          (not replacement_cluster_samples and not host_cluster_decode_errors) if canfd_hda2 else
           bool(replacement_cluster_samples)
+          and not host_cluster_decode_errors
           and all(sample.checksum_valid is True for sample in replacement_cluster_samples)
         ),
         "invalidSampleCount": len(invalid_cluster_samples),
+        "decodeErrorCount": len(cluster_decode_errors),
         "rejectedRequestCount": len(rejected_cluster_requests),
+        "rejectedEchoCount": len(rejected_cluster_echoes) + len(rejected_cluster_decode_errors),
       },
-      "rawAccelerateWarningPeriods": raw_warning_periods,
-      "firstRawAccelerateWarningAfterStop": first_raw_warning,
-      "warningPathObservation": warning_path,
-      "warningOutputPairCounts": {
-        "rawWarningFrames": len(raw_warning_frames),
-        "pairedWithTxReturn": len(warning_output_pairs),
-        "unpairedRawWarningFrames": unpaired_warning_frames,
-        "maskedByReturnedFrame": masked_warning_frames,
-        "forwardedByReturnedFrame": forwarded_warning_frames,
+      "candidateAlert5Correlation": candidate_alert5_correlation,
+      "rawAlert5Value5Periods": raw_alert5_value5_periods,
+      "firstRawAlert5Value5AfterStop": first_raw_alert5_value5,
+      "alert5ValuePathObservation": alert5_value_path,
+      "alert5ValuePairCounts": {
+        "rawAlert5Value5Frames": len(raw_alert5_value5_frames),
+        "pairedWithTxReturn": len(alert5_value5_output_pairs),
+        "unpairedRawAlert5Value5Frames": unpaired_alert5_value5_frames,
+        "changedByReturnedFrame": changed_alert5_value5_frames,
+        "allReturnedValueMismatches": adrv_alert5_mismatches,
+        "allReturnedValue5Mismatches": adrv_alert5_value5_mismatches,
+        "preservedByReturnedFrame": preserved_alert5_value5_frames,
       },
-      "warningPreservation": {
-        "topology": warning_preservation_topology,
-        "requiredForObservedRawWarning": bool(raw_warning_frames),
-        "allRawWarningFramesPairedByCounterAndTime": unpaired_warning_frames == 0,
-        "allPairedReturnedFramesPreserveAlert5": masked_warning_frames == 0,
-        "pathPreservesRawWarning": warning_preservation_ok,
+      "alert5ValuePreservation": {
+        "assessment": alert5_value5_preservation,
+        "requiredForObservedValue5": bool(raw_alert5_value5_frames),
+        "allRawValue5FramesPairedByCounterAndTime": (
+          unpaired_alert5_value5_frames == 0
+          if raw_alert5_value5_frames and not canfd_hda2 else None
+        ),
+        "allPairedReturnedFramesPreserveValue5": (
+          changed_alert5_value5_frames == 0
+          if raw_alert5_value5_frames and not canfd_hda2 else None
+        ),
+        "pathPreservesObservedValue5": path_preserves_observed_alert5_value5,
       },
       "hdaControlStateCounts": {str(value): count for value, count in sorted(Counter(
         sample.hda_control_state for sample in raw_hda).items(), key=lambda item: str(item[0]))},
@@ -1685,23 +2187,45 @@ class ProbeAnalyzer:
       "hdaReplacementComparison": {
         "pairedFrames": len(hda_return_pairs),
         "stateMismatches": hda_state_mismatches,
+        "lfaHdaStockOwnedFieldMismatchFrames": lfahda_stock_owned_mismatch_frames,
+        "lfaHdaStockOwnedFieldMismatchCounts": dict(sorted(lfahda_stock_owned_field_mismatch_counts.items())),
+        "unexpectedLfaHdaReturnedFrames": unexpected_hda_returned_frames,
+        "adrvAlert5ValueMismatches": adrv_alert5_mismatches,
+        "adrvStockOwnedFieldMismatchFrames": adrv_stock_owned_mismatch_frames,
+        "adrvStockOwnedFieldMismatchCounts": dict(sorted(adrv_stock_owned_field_mismatch_counts.items())),
+        "unexpectedAdrvReturnedFrames": unexpected_adrv_returned_frames,
         "allAdrvRequestsReturned": all_adrv_returned,
         "allLfaHdaRequestsReturned": all_hda_returned,
+        "adrvPathConsistentWithObservedVariant": adrv_path_consistent,
+        "lfaHdaPathConsistent": lfa_hda_path_consistent,
         "pathConsistentWithCurrentStockLongTopology": hda_path_consistent,
       },
       "postResObservation": {
         "lastResAfterStop": last_res_after_stop,
-        "firstRawWarningAfterLastRes": warning_after_last_res,
+        "firstRawAlert5Value5AfterLastRes": alert5_value5_after_last_res,
         "note": "Temporal ordering is observation only; it is not an SCC timer-reset acknowledgement.",
       },
     }
 
   def _episode_report(self, start: float, end: float, start_observed: bool,
-                      res_groups: list[dict[str, Any]], cluster_tx_status_by_id: dict[int, str]) -> dict[str, Any]:
+                      res_groups: list[dict[str, Any]], button_tx_status_by_id: dict[int, str],
+                      cluster_tx_status_by_id: dict[int, str]) -> dict[str, Any]:
+    evidence_start = start - PROOF_STREAM_EDGE_TOLERANCE
+    evidence_end = end + PROOF_STREAM_EDGE_TOLERANCE
+    panda_bus_offset = self._configured_panda_bus_offset()
+    canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
+    expected_stock_bus = (
+      None if panda_bus_offset is None else panda_bus_offset + (1 if canfd_hda2 else 0)
+    )
     states = [sample for sample in self.states if start <= sample.t <= end]
     stock_bus = self._stock_rx_bus()
     scc = [sample for sample in self.scc if start <= sample.t <= end and
            (stock_bus is None or sample.bus == stock_bus)]
+    scc_evidence_samples = [
+      sample for sample in self.scc
+      if evidence_start <= sample.t <= evidence_end
+      and (stock_bus is None or sample.bus == stock_bus)
+    ]
     controls = [sample for sample in self.controls if start <= sample.t <= end]
     alerts = [sample for sample in self.alerts if start <= sample.t <= end and
               (sample.alert_type or sample.alert_text_1 or sample.alert_text_2)]
@@ -1713,18 +2237,102 @@ class ProbeAnalyzer:
     raw_alt_stock_bus = [sample for sample in self.buttons if start <= sample.t <= end and
                          sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS and
                          sample.bus == stock_bus]
-    raw_standard_stock_bus = [sample for sample in self.buttons if start <= sample.t <= end and
-                              sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ADDRESS and
-                              sample.bus == stock_bus]
+    raw_alt_evidence_samples = [
+      sample for sample in self.buttons
+      if evidence_start <= sample.t <= evidence_end
+      and sample.origin == "vehicle_rx"
+      and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+      and sample.bus == stock_bus
+    ]
     rearm_requests = [sample for sample in self.buttons if start <= sample.t <= end and
                       sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL]
+    host_button_requests = [
+      sample for sample in self.buttons
+      if start <= sample.t <= end and sample.origin == "send_request"
+      and sample.address in (CRUISE_BUTTONS_ALT_ADDRESS, CRUISE_BUTTONS_ADDRESS)
+    ]
+    returned_button_echoes = [
+      sample for sample in self.buttons
+      if start <= sample.t <= end and sample.origin == "tx_returned"
+      and sample.address in (CRUISE_BUTTONS_ALT_ADDRESS, CRUISE_BUTTONS_ADDRESS)
+    ]
+    boundary_margin_host_button_traffic = [
+      sample for sample in self.buttons
+      if evidence_start <= sample.t <= evidence_end
+      and not start <= sample.t <= end
+      and sample.origin != "vehicle_rx"
+      and sample.address in (CRUISE_BUTTONS_ALT_ADDRESS, CRUISE_BUTTONS_ADDRESS)
+    ]
+    unexpected_host_button_requests = [
+      sample for sample in host_button_requests
+      if sample.address != CRUISE_BUTTONS_ALT_ADDRESS or sample.button != BUTTON_RES_ACCEL
+    ]
+    unexpected_returned_button_echoes = [
+      sample for sample in returned_button_echoes
+      if sample.address != CRUISE_BUTTONS_ALT_ADDRESS or sample.button != BUTTON_RES_ACCEL
+    ]
+    episode_decode_errors = [
+      sample for sample in self.decode_error_samples
+      if evidence_start <= sample.t <= evidence_end
+    ]
+    scc_decode_errors = [
+      sample for sample in episode_decode_errors
+      if sample.origin == "vehicle_rx"
+      and sample.address == SCC_CONTROL_ADDRESS
+      and (stock_bus is None or sample.bus == stock_bus)
+    ]
+    raw_alt_decode_errors = [
+      sample for sample in episode_decode_errors
+      if sample.origin == "vehicle_rx"
+      and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+      and (stock_bus is None or sample.bus == stock_bus)
+    ]
+    rearm_decode_errors = [
+      sample for sample in episode_decode_errors
+      if sample.origin != "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+    ]
+    rejected_button_echoes = [
+      sample for sample in self.buttons
+      if start <= sample.t <= end
+      and sample.origin in ("tx_rejected", "tx_rejected_returned")
+      and sample.address in (CRUISE_BUTTONS_ALT_ADDRESS, CRUISE_BUTTONS_ADDRESS)
+    ]
+    rejected_button_decode_errors = [
+      sample for sample in episode_decode_errors
+      if sample.origin in ("tx_rejected", "tx_rejected_returned")
+      and sample.address in (CRUISE_BUTTONS_ALT_ADDRESS, CRUISE_BUTTONS_ADDRESS)
+    ]
+    rejected_button_echo_count = len(rejected_button_echoes) + len(rejected_button_decode_errors)
+    relevant_transport_entries = [
+      (origin, bus, address, stat)
+      for (_, origin, _, bus, address), stat in self.streams.items()
+      if address in (SCC_CONTROL_ADDRESS, CRUISE_BUTTONS_ALT_ADDRESS, CRUISE_BUTTONS_ADDRESS)
+      and stat.last_t >= evidence_start
+      and stat.first_t <= evidence_end
+    ]
+    unexpected_scc_transport_observed = any(
+      address == SCC_CONTROL_ADDRESS
+      and (origin != "vehicle_rx" or stock_bus is None or bus != stock_bus)
+      for origin, bus, address, _ in relevant_transport_entries
+    )
+    unexpected_raw_alt_transport_observed = any(
+      address == CRUISE_BUTTONS_ALT_ADDRESS
+      and origin == "vehicle_rx"
+      and (stock_bus is None or bus != stock_bus)
+      for origin, bus, address, _ in relevant_transport_entries
+    )
+    raw_standard_transport_observed = any(
+      origin == "vehicle_rx"
+      and address == CRUISE_BUTTONS_ADDRESS
+      for origin, _, address, _ in relevant_transport_entries
+    )
 
     safe_scc = [sample for sample in scc if sample.raw_lead_safe]
     valid_state = [sample for sample in states if sample.can_valid]
     no_interlock = [sample for sample in states if not sample.interlock_active]
     enabled_controls = [sample for sample in controls if sample.enabled]
     control_cancel_clear = bool(controls) and all(not sample.cancel for sample in controls)
-    raw_driver_buttons_clear = bool(raw_alt_stock_bus) and all(
+    raw_driver_buttons_clear = bool(raw_alt_stock_bus) and not raw_alt_decode_errors and all(
       sample.button == BUTTON_NONE
       and sample.adaptive_main == 0
       and sample.normal_main == 0
@@ -1733,7 +2341,7 @@ class ProbeAnalyzer:
     )
     schedule_mode, info_display_4_periods = self._schedule_mode(scc, start)
     cluster_evidence = self._cluster_episode_evidence(start, end, cluster_tx_status_by_id)
-    first_raw_warning = cluster_evidence["firstRawAccelerateWarningAfterStop"]
+    first_raw_alert5_value5 = cluster_evidence["firstRawAlert5Value5AfterStop"]
 
     group_times = [group["start"] - start_rel for group in episode_groups]
     gaps = [curr - prev for prev, curr in zip(group_times, group_times[1:], strict=False)]
@@ -1781,13 +2389,72 @@ class ProbeAnalyzer:
 
     coverage_through = min(end, start + MIN_EXACT_PROOF_DURATION)
     stream_coverage = {
-      "carState": self._continuous_coverage(states, start, coverage_through),
-      "carControl": self._continuous_coverage(controls, start, coverage_through),
-      "rawScc0x1a0": self._continuous_coverage(scc, start, coverage_through),
-      "rawStockButtons0x1aa": self._continuous_coverage(raw_alt_stock_bus, start, coverage_through),
+      "carState": self._continuous_coverage(
+        states, start, coverage_through,
+        max_gap=CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        edge_tolerance=CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+      ),
+      "carControl": self._continuous_coverage(
+        controls, start, coverage_through,
+        max_gap=CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+        edge_tolerance=CONTROL_SERVICE_PERIOD + CONTROL_SERVICE_CADENCE_TOLERANCE,
+      ),
+      "rawScc0x1a0": self._continuous_coverage(
+        scc, start, coverage_through,
+        max_gap=STOCK_SOURCE_PERIOD + BUTTON_SOURCE_CADENCE_TOLERANCE,
+        edge_tolerance=STOCK_SOURCE_PERIOD + BUTTON_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "rawStockButtons0x1aa": self._continuous_coverage(
+        raw_alt_stock_bus, start, coverage_through,
+        max_gap=STOCK_SOURCE_PERIOD + BUTTON_SOURCE_CADENCE_TOLERANCE,
+        edge_tolerance=STOCK_SOURCE_PERIOD + BUTTON_SOURCE_CADENCE_TOLERANCE,
+      ),
+    }
+    boundary_states = [
+      sample for sample in self.states
+      if start - STOP_BOUNDARY_STATE_WINDOW <= sample.t <= start
+    ]
+    boundary_state_integrity = self._time_sequence_integrity(
+      boundary_states,
+      start - STOP_BOUNDARY_STATE_WINDOW,
+      start,
+      expected_period=CONTROL_SERVICE_PERIOD,
+      cadence_tolerance=CONTROL_SERVICE_CADENCE_TOLERANCE,
+    )
+    boundary_state_integrity["enoughSamples"] = len(boundary_states) >= 2
+    boundary_state_integrity["allCanValid"] = (
+      bool(boundary_states) and all(sample.can_valid for sample in boundary_states)
+    )
+    boundary_state_integrity["allKinematicsFinite"] = (
+      bool(boundary_states) and all(sample.kinematics_finite for sample in boundary_states)
+    )
+    service_cadence_integrity = {
+      "carState": self._time_sequence_integrity(
+        states, start, end,
+        expected_period=CONTROL_SERVICE_PERIOD,
+        cadence_tolerance=CONTROL_SERVICE_CADENCE_TOLERANCE,
+      ),
+      "carControl": self._time_sequence_integrity(
+        controls, start, end,
+        expected_period=CONTROL_SERVICE_PERIOD,
+        cadence_tolerance=CONTROL_SERVICE_CADENCE_TOLERANCE,
+      ),
+    }
+    source_counter_sequence_integrity = {
+      "rawScc0x1a0": self._counter_sequence_integrity(
+        scc_evidence_samples, evidence_start, evidence_end,
+        expected_period=STOCK_SOURCE_PERIOD,
+        cadence_tolerance=BUTTON_SOURCE_CADENCE_TOLERANCE,
+      ),
+      "rawStockButtons0x1aa": self._counter_sequence_integrity(
+        raw_alt_evidence_samples, evidence_start, evidence_end,
+        expected_period=STOCK_SOURCE_PERIOD,
+        cadence_tolerance=BUTTON_SOURCE_CADENCE_TOLERANCE,
+      ),
     }
     gate_passed = bool(self.car_params and self.car_params.get("ka4StockSccGatePassed"))
     state_coverage_ok = bool(states) and len(valid_state) == len(states)
+    state_kinematics_finite = bool(states) and all(sample.kinematics_finite for sample in states)
     no_interlocks = (
       bool(states)
       and len(no_interlock) == len(states)
@@ -1795,21 +2462,43 @@ class ProbeAnalyzer:
       and raw_driver_buttons_clear
     )
     control_coverage_ok = bool(controls) and len(enabled_controls) == len(controls)
-    raw_scc_coverage_ok = bool(scc) and len(safe_scc) == len(scc)
-    stopped_motion_ok = bool(states) and all(
-      sample.standstill
-      and abs(sample.v_ego) <= 0.05
-      and abs(sample.v_ego_raw) <= 0.03
+    raw_scc_coverage_ok = bool(scc) and not scc_decode_errors and len(safe_scc) == len(scc)
+    direct_stopped_motion_violation = any(
+      sample.kinematics_finite
+      and (
+        not sample.standstill
+        or abs(sample.v_ego) > 0.05
+        or abs(sample.v_ego_raw) > 0.03
+      )
       for sample in states
     )
+    stopped_motion_ok = bool(states) and state_kinematics_finite and not direct_stopped_motion_violation
     exact_duration = duration >= MIN_EXACT_PROOF_DURATION
     all_tx_returned = bool(episode_groups) and all(group["allReturned"] for group in episode_groups)
-    any_rejected = any(group["statuses"].get("rejected", 0) for group in episode_groups)
-    all_scc_crc_valid = bool(scc) and all(sample.checksum_valid is True for sample in scc)
-    all_raw_button_crc_valid = bool(raw_alt_stock_bus) and all(
-      sample.checksum_valid is True for sample in raw_alt_stock_bus
+    returned_button_request_count = sum(
+      button_tx_status_by_id.get(id(request)) == "returned" for request in host_button_requests
     )
-    all_rearm_crc_valid = bool(episode_groups) and all(group["allRequestChecksumsValid"] for group in episode_groups)
+    button_request_return_one_to_one = (
+      bool(host_button_requests)
+      and returned_button_request_count == len(host_button_requests) == len(returned_button_echoes)
+    )
+    any_rejected = (
+      any(group["statuses"].get("rejected", 0) for group in episode_groups)
+      or rejected_button_echo_count > 0
+    )
+    all_scc_crc_valid = (
+      bool(scc_evidence_samples)
+      and not scc_decode_errors
+      and all(sample.checksum_valid is True for sample in scc_evidence_samples)
+    )
+    all_raw_button_crc_valid = bool(raw_alt_evidence_samples) and not raw_alt_decode_errors and all(
+      sample.checksum_valid is True for sample in raw_alt_evidence_samples
+    )
+    all_rearm_crc_valid = (
+      bool(episode_groups)
+      and not rearm_decode_errors
+      and all(group["allRequestChecksumsValid"] for group in episode_groups)
+    )
     source_plus_one = bool(episode_groups) and all(group["sourcePlusOneAllFrames"] for group in episode_groups)
     source_counters_fresh = bool(episode_groups) and all(
       group["sourceCountersFreshSequential"] for group in episode_groups)
@@ -1821,9 +2510,10 @@ class ProbeAnalyzer:
       group["postBurstSameCounterThenNextCounterObserved"] for group in episode_groups)
     stock_fields_preserved = bool(episode_groups) and all(
       group["latestStockNonButtonFieldsPreserved"] for group in episode_groups)
-    panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
-    canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
-    expected_send_bus = stock_bus if canfd_hda2 else panda_bus_offset + 2
+    expected_send_bus = (
+      stock_bus if canfd_hda2 else
+      None if panda_bus_offset is None else panda_bus_offset + 2
+    )
     send_bus_matches = (
       expected_send_bus is not None
       and bool(rearm_requests)
@@ -1831,13 +2521,16 @@ class ProbeAnalyzer:
     )
     same_safety_panda = (
       stock_bus is not None
+      and panda_bus_offset is not None
       and stock_bus // 4 == panda_bus_offset // 4
       and bool(rearm_requests)
       and all(request.bus // 4 == panda_bus_offset // 4 for request in rearm_requests)
     )
     exact_alt_layout = (
       bool(raw_alt_stock_bus)
-      and not raw_standard_stock_bus
+      and stock_bus == expected_stock_bus
+      and not raw_standard_transport_observed
+      and not unexpected_raw_alt_transport_observed
       and send_bus_matches
       and same_safety_panda
       and all(request.address == CRUISE_BUTTONS_ALT_ADDRESS for request in rearm_requests)
@@ -1847,11 +2540,16 @@ class ProbeAnalyzer:
     # ``start + 30`` makes it empty for every proof-length episode (whose end
     # is already later than 30 s), silently hiding a false start at release.
     next_states = [sample for sample in self.states if end < sample.t <= end + 0.250]
+    post_stop_observation_available = bool(next_states)
+    post_stop_states_finite = bool(next_states) and all(sample.kinematics_finite for sample in next_states)
+    post_stop_states_valid = bool(next_states) and all(sample.can_valid for sample in next_states)
     last_safe_scc = scc[-1].raw_lead_safe if scc else False
     potential_false_start = any(
-      not sample.standstill
+      sample.can_valid
+      and sample.kinematics_finite
+      and not sample.standstill
       and sample.cruise_enabled
-      and max(abs(sample.v_ego), abs(sample.v_ego_raw)) > 0.05
+      and (abs(sample.v_ego) > 0.05 or abs(sample.v_ego_raw) > 0.03)
       and not sample.interlock_active
       for sample in next_states
     ) and last_safe_scc
@@ -1866,15 +2564,33 @@ class ProbeAnalyzer:
       or any(group["frameCount"] > 3 for group in episode_groups)
     )
     direct_crc_failure = (
-      any(sample.checksum_valid is False for sample in scc)
-      or any(sample.checksum_valid is False for sample in raw_alt_stock_bus)
+      any(sample.checksum_valid is False for sample in scc_evidence_samples)
+      or any(sample.checksum_valid is False for sample in raw_alt_evidence_samples)
       or any(not group["allRequestChecksumsValid"] for group in episode_groups)
       or cluster_evidence["integrity"]["invalidSampleCount"] > 0
     )
-    any_cluster_rejected = cluster_evidence["integrity"]["rejectedRequestCount"] > 0
-    direct_warning_masking = (
+    any_cluster_rejected = (
+      cluster_evidence["integrity"]["rejectedRequestCount"] > 0
+      or cluster_evidence["integrity"]["rejectedEchoCount"] > 0
+    )
+    direct_alert5_value_mutation = (
       not canfd_hda2
-      and cluster_evidence["warningOutputPairCounts"]["maskedByReturnedFrame"] > 0
+      and cluster_evidence["hdaReplacementComparison"]["adrvAlert5ValueMismatches"] > 0
+    )
+    direct_adrv_stock_owned_field_mutation = (
+      not canfd_hda2
+      and cluster_evidence["hdaReplacementComparison"]["adrvStockOwnedFieldMismatchFrames"] > 0
+    )
+    direct_hda_control_state_mutation = (
+      not canfd_hda2
+      and cluster_evidence["hdaReplacementComparison"]["stateMismatches"] > 0
+    )
+    direct_lfahda_stock_owned_field_mutation = (
+      not canfd_hda2
+      and cluster_evidence["hdaReplacementComparison"]["lfaHdaStockOwnedFieldMismatchFrames"] > 0
+    )
+    direct_unexpected_host_button_action = bool(
+      unexpected_host_button_requests or unexpected_returned_button_echoes
     )
     direct_source_policy_failure = bool(episode_groups) and any(
       group["sourceSequenceFullyObserved"]
@@ -1890,18 +2606,43 @@ class ProbeAnalyzer:
     prerequisites = {
       "ka4StockSccCarParamsGate": gate_passed,
       "physicalStopStartObserved": start_observed,
+      "physicalStopBoundaryStateSequenceUnambiguous": (
+        boundary_state_integrity["clean"] and boundary_state_integrity["enoughSamples"]
+      ),
+      "physicalStopBoundaryStatesValidAndFinite": (
+        boundary_state_integrity["allCanValid"]
+        and boundary_state_integrity["allKinematicsFinite"]
+      ),
       "durationAtLeast30_25s": exact_duration,
       "carStateContinuousCoverage": stream_coverage["carState"]["continuous"],
       "carControlContinuousCoverage": stream_coverage["carControl"]["continuous"],
+      "carStateCadenceUnambiguous": service_cadence_integrity["carState"]["clean"],
+      "carControlCadenceUnambiguous": service_cadence_integrity["carControl"]["clean"],
       "rawScc0x1a0ContinuousCoverage": stream_coverage["rawScc0x1a0"]["continuous"],
       "rawStockButtons0x1aaContinuousCoverage": stream_coverage["rawStockButtons0x1aa"]["continuous"],
+      "preferredStockRxBusMatchesCarParamsEcan": (
+        expected_stock_bus is not None and stock_bus == expected_stock_bus
+      ),
+      "stockScc0x1a0TransportOnlyOnPreferredRxBus": not unexpected_scc_transport_observed,
+      "rawStockButtons0x1aaTransportOnlyOnPreferredRxBus": not unexpected_raw_alt_transport_observed,
+      "rawStandardButtons0x1cfAbsentOnAllRxBuses": not raw_standard_transport_observed,
+      "rawScc0x1a0CounterSequenceUnambiguous": source_counter_sequence_integrity[
+        "rawScc0x1a0"]["clean"],
+      "rawStockButtons0x1aaCounterSequenceUnambiguous": source_counter_sequence_integrity[
+        "rawStockButtons0x1aa"]["clean"],
       "carStateCanValidAllSamples": state_coverage_ok,
+      "carStateKinematicsFiniteAllSamples": state_kinematics_finite,
       "driverInterlocksClearAllSamples": no_interlocks,
       "carControlEnabledAllSamples": control_coverage_ok,
       "wheelStandstillAndRawSpeedNearZeroAllSamples": stopped_motion_ok,
       "noPotentialFalseStart": not potential_false_start,
+      "postStopObservationAvailable": post_stop_observation_available,
+      "postStopObservationKinematicsFinite": post_stop_states_finite,
+      "postStopObservationCanValidAllSamples": post_stop_states_valid,
       "rawSccLeadGateValidAllSamples": raw_scc_coverage_ok,
-      "raw0x1aaStockBusPresentAnd0x1cfAbsent": bool(raw_alt_stock_bus) and not raw_standard_stock_bus,
+      "raw0x1aaStockBusPresentAnd0x1cfAbsent": (
+        bool(raw_alt_stock_bus) and not raw_standard_transport_observed
+      ),
       "send0x1aaUsesExpectedBus": send_bus_matches,
       "stockAndSendBusesUseSafetyPanda": same_safety_panda,
       "allScc0x1a0CrcValid": all_scc_crc_valid,
@@ -1918,95 +2659,132 @@ class ProbeAnalyzer:
       "exactAltBusAndAddressLayout": exact_alt_layout,
       "exactSupportedRearmSchedule": returned_schedule_ok,
       "allObservedRearmRequestsReturned": all_tx_returned,
-      "rawAdrv0x161ContinuousThrough30_25s": cluster_evidence["rawAdrvContinuousThrough30_25s"],
+      "buttonRequestsAndReturnedEchoesOneToOne": button_request_return_one_to_one,
+      "noHostButtonTrafficInEpisodeBoundaryMargin": not boundary_margin_host_button_traffic,
+      "onlyResAccelHostButtonRequestsAndReturns": not direct_unexpected_host_button_action,
+      "allProofRelevantCanFramesDecoded": (
+        not episode_decode_errors
+        and cluster_evidence["integrity"]["decodeErrorCount"] == 0
+      ),
       "rawLfaHda0x1e0ContinuousThrough30_25s": cluster_evidence["rawLfaHdaContinuousThrough30_25s"],
-      "rawAdrv0x161CrcValidAllSamples": cluster_evidence["integrity"]["rawAdrvAllCrcValid"],
       "rawLfaHda0x1e0Observed": cluster_evidence["rawLfaHdaSamples"] > 0,
       "rawLfaHda0x1e0CrcValidAllSamples": cluster_evidence["integrity"]["rawLfaHdaAllCrcValid"],
       "hostClusterReplacementCrcValidAllSamples": cluster_evidence["integrity"]["hostReplacementAllCrcValid"],
-      "hda1HostReplacementStreamsContinuousOrHda2NoReplacement": (
-        canfd_hda2
-        or all(coverage["continuous"]
-               for coverage in cluster_evidence["hostReplacementCoverage"].values())
-      ),
-      "hda1RawAdrvExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement": (
-        canfd_hda2
-        or cluster_evidence["hostReplacementPairing"]["exactAdrvRawRequestReturnedPairing"]
-      ),
-      "hda1RawLfaHdaExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement": (
-        canfd_hda2
-        or cluster_evidence["hostReplacementPairing"]["exactLfaHdaRawRequestReturnedPairing"]
-      ),
-      "rawAdrvWarningPreservedAcrossActiveTopology": cluster_evidence[
-        "warningPreservation"]["pathPreservesRawWarning"],
-      "hdaPathConsistentWithCurrentStockLongTopology": cluster_evidence[
+      "clusterCanDecodedAllObservedSamples": cluster_evidence["integrity"]["decodeErrorCount"] == 0,
+      "adrvAndLfaHdaPathsConsistentWithObservedVariant": cluster_evidence[
         "hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"],
+    }
+    signal_specific_checks = {
+      "adrv0x161": {
+        "applicability": cluster_evidence["adrv0x161Applicability"],
+        "continuousThrough30_25s": (
+          cluster_evidence["rawAdrvContinuousThrough30_25s"]
+          if cluster_evidence["rawAdrvSamples"] else None
+        ),
+        "crcValidAllSamples": cluster_evidence["integrity"]["rawAdrvAllCrcValid"],
+        "candidateAlert5Correlation": cluster_evidence["candidateAlert5Correlation"],
+        "pathPreservesObservedValue5": cluster_evidence[
+          "alert5ValuePreservation"]["pathPreservesObservedValue5"],
+      },
     }
 
     verdict = "INCONCLUSIVE"
+    can_evidence_verdict = "INCONCLUSIVE"
     reasons = []
     if any_rejected or any_cluster_rejected:
       verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
       reasons.append("Panda safety rejected one or more 0x1AA RES or cluster replacement requests")
-    elif direct_warning_masking:
+    elif direct_unexpected_host_button_action:
       verdict = "FAIL"
-      reasons.append("HDA1 returned host replacement masked raw ADRV_0x161 ALERTS_5=5")
+      can_evidence_verdict = "FAIL"
+      reasons.append("host button traffic contained an action other than the supported 0x1AA RES schedule")
+    elif direct_alert5_value_mutation:
+      verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
+      reasons.append("HDA1 returned replacement changed an observed ADRV_0x161 ALERTS_5 value")
+    elif direct_adrv_stock_owned_field_mutation:
+      verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
+      changed_fields = ", ".join(
+        cluster_evidence["hdaReplacementComparison"]["adrvStockOwnedFieldMismatchCounts"]
+      )
+      reasons.append(f"HDA1 returned replacement changed received ADRV fields: {changed_fields}")
+    elif direct_hda_control_state_mutation:
+      verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
+      reasons.append("HDA1 returned replacement changed the received LFAHDA HDA_CntrlModSta value")
+    elif direct_lfahda_stock_owned_field_mutation:
+      verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
+      changed_fields = ", ".join(
+        cluster_evidence["hdaReplacementComparison"]["lfaHdaStockOwnedFieldMismatchCounts"]
+      )
+      reasons.append(f"HDA1 returned replacement changed received LFAHDA fields: {changed_fields}")
     elif direct_schedule_violation:
       verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
       reasons.append("0x1AA RES traffic exceeded the supported schedule or continued after 27.00s")
     elif direct_crc_failure:
       verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
       reasons.append("an SCC, button, ADRV, or LFAHDA frame failed the Hyundai CAN-FD CRC")
     elif direct_source_policy_failure:
       verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
       reasons.append(
         "a RES group violated fresh sequential source/emitted counters, source+1, or stock non-button fields"
       )
     elif potential_false_start:
       verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
       reasons.append("vehicle moved while the stationary-lead gate was still valid; potential false start")
-    elif states and not stopped_motion_ok:
+    elif direct_stopped_motion_violation:
       verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
       reasons.append("standstill evidence contained motion above the vEgo/vEgoRaw gate or a false standstill sample")
-    elif first_raw_warning is not None and first_raw_warning < EARLIEST_EXPECTED_FINAL_WARNING:
-      verdict = "FAIL"
-      reasons.append(
-        f"raw ADRV_0x161 ALERTS_5=5 appeared early at {first_raw_warning:.3f}s after stop"
-      )
-    elif first_raw_warning is not None and first_raw_warning > LATEST_EXPECTED_FINAL_WARNING:
-      verdict = "FAIL"
-      reasons.append(
-        f"raw ADRV_0x161 ALERTS_5=5 appeared late at {first_raw_warning:.3f}s after stop"
-      )
     elif schedule_mode == SCHEDULE_MODE_MIXED:
       reasons.append(
-        "InfoDisplay=4 changed during the pre-warning stop window, so neither supported schedule can be proven"
+        "InfoDisplay=4 changed during the pre-boundary stop window, so neither supported schedule can be matched"
       )
     elif schedule_mode == SCHEDULE_MODE_UNKNOWN:
       reasons.append("authoritative SCC status did not cover the physical stop boundary")
     elif all(prerequisites.values()):
-      raw_boundary_observed = (
-        first_raw_warning is not None
-        and EARLIEST_EXPECTED_FINAL_WARNING <= first_raw_warning <= LATEST_EXPECTED_FINAL_WARNING
-      )
-      if raw_boundary_observed:
-        verdict = "PASS"
+      alert5_correlation = cluster_evidence["candidateAlert5Correlation"]
+      if alert5_correlation == "MATCHED_AT_30S":
+        can_evidence_verdict = "OBSERVED_SCHEDULE_AND_ALERT5_TIMING"
         reasons.append(
           " ".join((
-            f"the returned {schedule_mode} 0x1AA schedule and raw ADRV ALERTS_5=5 source aligned",
-            "at the 30s boundary; TX return does not prove arbitration, ECU acceptance, or an individual timer reset",
+            f"the returned {schedule_mode} 0x1AA schedule and raw ADRV ALERTS_5=5 observation aligned",
+            "near 30s; this is CAN-field correlation, not a visible-prompt or timer-reset acknowledgement",
           ))
         )
-      elif first_raw_warning is None:
-        verdict = "PASS_AT_LEAST_30S"
+      elif alert5_correlation == "CLEAR_THROUGH_30S":
+        can_evidence_verdict = "OBSERVED_SCHEDULE_ALERT5_CLEAR_THROUGH_30S"
         reasons.append(
-          "the continuously observed raw ADRV warning source stayed clear for at least 30s; the final timeout and individual RES timer resets remain unproven"
+          "the returned RES schedule matched and a continuously observed 0x161 stream contained no ALERTS_5=5 through 30s"
+        )
+      elif alert5_correlation == "NOT_OBSERVED":
+        can_evidence_verdict = "OBSERVED_RES_SCHEDULE_ONLY"
+        reasons.append(
+          "the returned RES schedule matched, but the capture contained no raw ADRV_0x161"
+        )
+      elif alert5_correlation in ("EARLY", "LATE"):
+        can_evidence_verdict = "OBSERVED_SCHEDULE_WITH_ALERT5_TIMING_DIFFERENCE"
+        assert first_raw_alert5_value5 is not None
+        reasons.append(
+          f"ADRV_0x161 ALERTS_5 first equaled 5 at {first_raw_alert5_value5:.3f}s; " +
+          "its visible-cluster applicability is not established"
         )
       else:
-        reasons.append("raw ADRV ALERTS_5 did not establish the approximately-30s warning boundary")
+        can_evidence_verdict = "OBSERVED_RES_SCHEDULE_ONLY"
+        reasons.append("the returned RES schedule matched, but 0x161 coverage was incomplete")
+      reasons.append(
+        "vehicle behavior remains inconclusive until a controlled on-car A/B and synchronized cluster video"
+      )
     else:
       failed = [name for name, passed in prerequisites.items() if not passed]
-      reasons.append("missing proof prerequisites: " + ", ".join(failed))
+      reasons.append("missing CAN-observation prerequisites: " + ", ".join(failed))
 
     return {
       "start": start_rel,
@@ -2020,18 +2798,45 @@ class ProbeAnalyzer:
       "resGroups": episode_groups,
       "returnedSchedule": schedule,
       "streamCoverage": stream_coverage,
+      "serviceCadenceIntegrity": service_cadence_integrity,
+      "physicalStopBoundaryStateIntegrity": boundary_state_integrity,
+      "sourceCounterSequenceIntegrity": source_counter_sequence_integrity,
+      "decodeErrors": [
+        {
+          **asdict(sample),
+          "t": self._rel(sample.t),
+          "addressHex": f"0x{sample.address:X}",
+        }
+        for sample in episode_decode_errors[:100]
+      ],
+      "rejectedButtonEchoCount": rejected_button_echo_count,
+      "hostButtonTraffic": {
+        "requestCount": len(host_button_requests),
+        "returnedEchoCount": len(returned_button_echoes),
+        "matchedReturnedRequestCount": returned_button_request_count,
+        "unexpectedRequestCount": len(unexpected_host_button_requests),
+        "unexpectedReturnedEchoCount": len(unexpected_returned_button_echoes),
+        "oneToOne": button_request_return_one_to_one,
+        "boundaryMarginTrafficCount": len(boundary_margin_host_button_traffic),
+      },
       "busLayout": {
         "stockBus": stock_bus,
+        "expectedStockBus": expected_stock_bus,
         "pandaBusOffset": panda_bus_offset,
         "canFdHda2": canfd_hda2,
         "expectedSendBus": expected_send_bus,
         "observedSendBuses": sorted({request.bus for request in rearm_requests}),
+        "unexpectedSccTransportObserved": unexpected_scc_transport_observed,
+        "unexpectedRaw0x1aaTransportObserved": unexpected_raw_alt_transport_observed,
+        "raw0x1cfTransportObservedOnAnyRxBus": raw_standard_transport_observed,
       },
       "potentialFalseStart": potential_false_start,
       "infoDisplay4Periods": info_display_4_periods,
       "clusterEvidence": cluster_evidence,
       "alerts": [{**asdict(alert), "t": self._rel(alert.t)} for alert in alerts[:20]],
       "prerequisites": prerequisites,
+      "signalSpecificChecks": signal_specific_checks,
+      "canEvidenceVerdict": can_evidence_verdict,
       "verdict": verdict,
       "reasons": reasons,
     }
@@ -2042,14 +2847,28 @@ class ProbeAnalyzer:
     tx_matches, status_by_id = self._match_button_tx()
     cluster_tx_matches, cluster_status_by_id = self._cluster_tx_matches()
     res_groups = self._res_groups(status_by_id)
-    episodes = [self._episode_report(start, end, observed, res_groups, cluster_status_by_id)
+    episodes = [self._episode_report(start, end, observed, res_groups, status_by_id, cluster_status_by_id)
                 for start, end, observed in self._stop_episodes()]
 
-    verdict_order = {"FAIL": 4, "PASS": 3, "PASS_AT_LEAST_30S": 2, "INCONCLUSIVE": 1}
-    if episodes:
-      overall = max((episode["verdict"] for episode in episodes), key=lambda verdict: verdict_order[verdict])
+    overall = "FAIL" if any(episode["verdict"] == "FAIL" for episode in episodes) else "INCONCLUSIVE"
+    episode_can_verdicts = [episode["canEvidenceVerdict"] for episode in episodes]
+    unique_episode_can_verdicts = set(episode_can_verdicts)
+    if "FAIL" in unique_episode_can_verdicts:
+      can_evidence_verdict = "FAIL"
+    elif (
+      not episode_can_verdicts
+      or "INCONCLUSIVE" in unique_episode_can_verdicts
+      or len(unique_episode_can_verdicts) != 1
+    ):
+      # The top-level field describes the whole capture, not its best episode.
+      # Never let one complete stop hide another incomplete or contradictory
+      # stop boundary in the same log.
+      can_evidence_verdict = "INCONCLUSIVE"
     else:
-      overall = "INCONCLUSIVE"
+      can_evidence_verdict = episode_can_verdicts[0]
+    vehicle_acceptance_verdict = (
+      "BLOCKED_BY_CAN_EVIDENCE" if overall == "FAIL" else "REQUIRES_ON_CAR_A_B"
+    )
 
     return {
       "schemaVersion": REPORT_SCHEMA_VERSION,
@@ -2074,19 +2893,32 @@ class ProbeAnalyzer:
       "resGroups": res_groups,
       "correlatedTimeline": self._correlated_timeline(status_by_id, cluster_status_by_id),
       "stopEpisodes": episodes,
+      "canEvidenceVerdict": can_evidence_verdict,
       "overallVerdict": overall,
+      "vehicleAcceptanceVerdict": vehicle_acceptance_verdict,
       "interpretation": {
-        "PASS": (
-          " ".join((
-            "A qualified capture observed a supported TX-return schedule plus the raw ADRV warning source",
-            "at approximately 30s. This does not prove arbitration, ECU acceptance, or which RES frame reset an SCC timer.",
-          ))
-        ),
-        "PASS_AT_LEAST_30S": (
-          "The continuously observed raw ADRV warning source stayed clear for 30s, but the final timeout and individual SCC timer resets remain unproven."
-        ),
         "FAIL": "Direct on-wire or stock-SCC status evidence contradicts the requested behavior.",
-        "INCONCLUSIVE": "The capture lacks one or more prerequisites; do not treat absence of an error as success.",
+        "INCONCLUSIVE": (
+          "A passive single capture cannot prove SCC acceptance, timer reset, or the visible cluster result. " +
+          "Use the CAN evidence verdict only as an observation and complete the controlled on-car A/B."
+        ),
+      },
+      "canEvidenceInterpretation": {
+        "FAIL": "Direct CAN, safety, integrity, schedule, or motion evidence failed.",
+        "OBSERVED_SCHEDULE_WITH_ALERT5_TIMING_DIFFERENCE": (
+          "The RES schedule matched, and the observed ALERTS_5=5 timing differed from the modeled boundary; " +
+          "the field has no established visible-cluster applicability on this vehicle."
+        ),
+        "OBSERVED_SCHEDULE_AND_ALERT5_TIMING": (
+          "The RES schedule and an ALERTS_5=5 CAN-field transition were both observed near the modeled boundary."
+        ),
+        "OBSERVED_SCHEDULE_ALERT5_CLEAR_THROUGH_30S": (
+          "The RES schedule matched and the continuously captured 0x161 field did not equal 5 through 30 seconds."
+        ),
+        "OBSERVED_RES_SCHEDULE_ONLY": (
+          "The RES schedule matched, but no applicable complete ALERTS_5=5 correlation was available."
+        ),
+        "INCONCLUSIVE": "The capture lacks one or more CAN-observation prerequisites.",
       },
       "limitations": [
         "A sendcan row is only a request; can.src +0x80 shows that Panda returned the queued transmit attempt.",
@@ -2097,11 +2929,16 @@ class ProbeAnalyzer:
           "camera-bus capture can prove release timing and counter continuity seen by the receiving ECU."
         ),
         "Neither +0x80 TX-return nor stock 0x1A0 InfoDisplay acknowledges SCC acceptance or a timer reset.",
-        "SCC_CONTROL InfoDisplay=4 selects the regular/recovery state schedule only; it is not used as visible-warning success or failure evidence.",
-        "Raw ADRV_0x161 ALERTS_5=5 is source evidence, not display proof; HDA1 PASS requires its returned replacement to preserve value 5.",
+        "SCC_CONTROL InfoDisplay=4 selects the regular/recovery state schedule only; it is not visible-prompt evidence.",
+        (
+          "ADRV_0x161 ALERTS_5=5 is only a raw CAN-field observation on variants where 0x161 exists; " +
+          "it has no established cluster-display or driver-action correlation here."
+        ),
+        "When 0x161 is present on HDA1, a returned replacement must preserve each observed ALERTS_5 value.",
         "HDA2 raw-path visibility is inferred from current-branch topology and absence of a host replacement, not a cluster display acknowledgement.",
         "Start the capture before the physical stop and keep recording past 31 seconds.",
         "Use a full rlog when possible; qlogs can omit or downsample CAN/sendcan/state evidence.",
+        "Final acceptance requires matched OFF, physical-RES, and ON captures plus synchronized cluster video.",
       ],
     }
 
@@ -2164,14 +3001,17 @@ def _demo_car_params(bus_offset: int = 0, hda2: bool = False) -> Any:
       [SimpleNamespace(safetyModel="noOutput", safetyParam=0)] if bus_offset else []
     ) + [SimpleNamespace(
       safetyModel="hyundaiCanfd",
-      safetyParam=int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
+      safetyParam=int(
+        HyundaiSafetyFlags.CANFD_ALT_BUTTONS
+        | (HyundaiSafetyFlags.CANFD_LKA_STEERING if hda2 else 0)
+      ),
     )],
   )
 
 
 def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
              schedule_mode: str = SCHEDULE_MODE_REGULAR, button_source_phase_frames: int = 0,
-             raw_warning_time: float | None = None, mask_hda1_warning: bool = False,
+             raw_alert5_value5_time: float | None = None, change_hda1_alert5_value: bool = False,
              button_counter_offset: int = 0) -> ProbeAnalyzer:
   """Generate deterministic, real-DBC frames for an offline dry run."""
   from opendbc.can import CANPacker
@@ -2185,8 +3025,8 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
   analyzer.set_car_params(_demo_car_params(bus_offset, hda2), "demo")
   packer = CANPacker(DBC_NAME)
   base = 1_000.0
-  if raw_warning_time is None:
-    raw_warning_time = 30.0 if outcome == "pass" else 3.0
+  if raw_alert5_value5_time is None:
+    raw_alert5_value5_time = 30.0 if outcome == "pass" else 3.0
 
   def demo_info_display(elapsed: float) -> int:
     final_state = elapsed >= 30.0
@@ -2202,10 +3042,11 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
     brakeHoldActive=False, parkingBrake=False, accFaulted=False,
     cruiseState=SimpleNamespace(enabled=True, standstill=False),
   )
-  analyzer.feed_state(base - 0.05, moving_state)
-  analyzer.feed_control(base - 0.05, SimpleNamespace(enabled=True))
+  analyzer.feed_state(base - CONTROL_SERVICE_PERIOD, moving_state)
+  analyzer.feed_control(base - CONTROL_SERVICE_PERIOD, SimpleNamespace(enabled=True))
 
   stop_duration = 35.0
+  stock_bus = bus_offset + (1 if hda2 else 0)
   for frame in range(round(stop_duration * 100) + 1):
     elapsed = frame / 100.0
     t = base + elapsed
@@ -2221,7 +3062,7 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
         "SysFailState": 0,
         "TakeOverReq": 0,
       })
-      analyzer.feed_can("can", t, bus_offset, scc[0], scc[1])
+      analyzer.feed_can("can", t, stock_bus, scc[0], scc[1])
 
     if frame >= button_source_phase_frames and (frame - button_source_phase_frames) % 2 == 0:
       stock_button = packer.make_can_msg("CRUISE_BUTTONS_ALT", 0, {
@@ -2230,26 +3071,27 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
         "DISTANCE_UNIT": 1,
         "SET_ME_2": 3,
       })
-      analyzer.feed_can("can", t, bus_offset, stock_button[0], stock_button[1])
+      analyzer.feed_can("can", t, stock_bus, stock_button[0], stock_button[1])
 
-    if frame % 4 == 0:
-      stopped_state = SimpleNamespace(
-        standstill=True, vEgo=0.0, vEgoRaw=0.0, canValid=True, brakePressed=False, gasPressed=False,
-        brakeHoldActive=False, parkingBrake=False, accFaulted=False,
-        cruiseState=SimpleNamespace(enabled=True, standstill=info_display >= 4),
-      )
-      analyzer.feed_state(t, stopped_state)
-      analyzer.feed_control(t, SimpleNamespace(enabled=True))
+    stopped_state = SimpleNamespace(
+      standstill=True, vEgo=0.0, vEgoRaw=0.0, canValid=True, brakePressed=False, gasPressed=False,
+      brakeHoldActive=False, parkingBrake=False, accFaulted=False,
+      cruiseState=SimpleNamespace(enabled=True, standstill=info_display >= 4),
+    )
+    analyzer.feed_state(t, stopped_state)
+    analyzer.feed_control(t, SimpleNamespace(enabled=True))
 
   # Real-DBC camera source and host replacement evidence. HDA1 stock-long
-  # replaces both messages on ECAN while preserving stock-owned warnings.
+  # replaces both messages on ECAN while preserving the synthetic source
+  # field values used by this demo.
   # HDA2 stock-long does not synthesize these frames, leaving the raw camera
-  # path unmodified. mask_hda1_warning generates the explicit regression case.
+  # path unmodified. change_hda1_alert5_value generates the explicit field-
+  # mutation regression case.
   raw_camera_bus = bus_offset + 2
   for frame in range(round(stop_duration * 20) + 1):
     elapsed = frame / 20.0
     t = base + elapsed
-    raw_alert = USE_SWITCH_OR_PEDAL_TO_ACCELERATE if elapsed >= raw_warning_time else 0
+    raw_alert = USE_SWITCH_OR_PEDAL_TO_ACCELERATE if elapsed >= raw_alert5_value5_time else 0
     raw_adrv = packer.make_can_msg("ADRV_0x161", raw_camera_bus, {
       "COUNTER": frame & 0xFF,
       "ALERTS_5": raw_alert,
@@ -2264,7 +3106,7 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
     if not hda2:
       host_adrv = packer.make_can_msg("ADRV_0x161", bus_offset, {
         "COUNTER": frame & 0xFF,
-        "ALERTS_5": 0 if mask_hda1_warning else raw_alert,
+        "ALERTS_5": 0 if change_hda1_alert5_value else raw_alert,
       })
       host_hda = packer.make_can_msg("LFAHDA_CLUSTER", bus_offset, {
         "COUNTER": frame & 0xFF,
@@ -2274,6 +3116,17 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
       for message in (host_adrv, host_hda):
         analyzer.feed_can("sendcan", t + 0.001, bus_offset, message[0], message[1])
         analyzer.feed_can("can", t + 0.003, bus_offset + PANDA_RETURNED_BUS_OFFSET, message[0], message[1])
+
+  # Close the synthetic stop with one valid, stationary disengaged sample so
+  # the probe can verify that the capture did not simply end at the boundary.
+  analyzer.feed_state(
+    base + stop_duration + CONTROL_SERVICE_PERIOD,
+    SimpleNamespace(
+      standstill=True, vEgo=0.0, vEgoRaw=0.0, canValid=True, brakePressed=False, gasPressed=False,
+      brakeHoldActive=False, parkingBrake=False, accFaulted=False,
+      cruiseState=SimpleNamespace(enabled=False, standstill=False),
+    ),
+  )
 
   if outcome != "missing-tx":
     schedule_variants = (
@@ -2289,7 +3142,7 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
           ((source_frame - button_source_phase_frames) // 2) + button_counter_offset
         ) & 0xFF
         counter = (source_counter + 1) & 0xFF
-        send_bus = bus_offset if hda2 else bus_offset + 2
+        send_bus = stock_bus if hda2 else bus_offset + 2
         tx = packer.make_can_msg("CRUISE_BUTTONS_ALT", send_bus, {
           "COUNTER": counter,
           "CRUISE_BUTTONS": BUTTON_RES_ACCEL,
@@ -2382,7 +3235,8 @@ def print_human(report: dict[str, Any]) -> None:
     print("  none (need carState.standstill && cruiseState.enabled)")
   for index, episode in enumerate(report["stopEpisodes"], 1):
     print(
-      f"  #{index}: {episode['duration']:.3f}s verdict={episode['verdict']} ",
+      f"  #{index}: {episode['duration']:.3f}s vehicle={episode['verdict']} ",
+      f"can={episode['canEvidenceVerdict']} ",
       f"mode={episode['scheduleMode']} 0x1A0={episode['sccSamples']} RES-groups={len(episode['resGroups'])}",
       sep="",
     )
@@ -2411,13 +3265,16 @@ def print_human(report: dict[str, Any]) -> None:
   rejected = sum(match["status"] == "rejected" for match in report["txMatches"])
   unobserved = sum(match["status"] == "unobserved" for match in report["txMatches"])
   print(f"0x1AA TX correlation: returned={returned} rejected={rejected} unobserved={unobserved}")
-  print(f"OVERALL: {report['overallVerdict']}")
+  print(f"CAN EVIDENCE: {report['canEvidenceVerdict']}")
+  print(report["canEvidenceInterpretation"][report["canEvidenceVerdict"]])
+  print(f"OVERALL VEHICLE BEHAVIOR: {report['overallVerdict']}")
   print(report["interpretation"][report["overallVerdict"]])
+  print(f"VEHICLE ACCEPTANCE: {report['vehicleAcceptanceVerdict']}")
 
 
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
-    description="Read-only KA4 stock-SCC 30-second re-arm evidence probe",
+    description="Read-only KA4 stock-SCC RES-schedule and CAN-state observation probe",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
   )
   parser.add_argument("--json", action="store_true", help="print one JSON report instead of the human report")
@@ -2439,7 +3296,7 @@ def main(argv: Iterable[str] | None = None) -> int:
   args = build_parser().parse_args(argv)
   if args.command == "live":
     if args.duration != 0 and args.duration < MIN_EXACT_PROOF_DURATION:
-      print(f"warning: {args.duration:.2f}s cannot prove the 30s requirement", file=sys.stderr)
+      print(f"warning: {args.duration:.2f}s cannot cover the 30s observation window", file=sys.stderr)
     analyzer = run_live(args.duration, args.messaging_address)
   elif args.command == "log":
     analyzer = run_log(args.source)
@@ -2451,11 +3308,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(json.dumps(report, indent=2, sort_keys=True))
   else:
     print_human(report)
-  if report["overallVerdict"] == "PASS":
-    return 0
   if report["overallVerdict"] == "FAIL":
     return 1
-  # Partial or missing evidence must not look green in automation.
+  # CAN correlation is not physical vehicle acceptance and must not look green
+  # in automation without the controlled A/B and synchronized cluster video.
   return 2
 
 

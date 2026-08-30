@@ -45,10 +45,11 @@ CANFD_JERK_RELEASE_THRESHOLD = 0.1
 KA4_STOCK_SCC_MAX_STANDSTILL_GRACE = 30.0
 KA4_STOCK_SCC_OEM_REARM_INTERVAL = 3.0
 # This validation path treats SCC_CONTROL.InfoDisplay == 4 as an observed
-# standstill/resume-state input. It is not the cluster's driver-action warning
-# (that is carried separately as ADRV_0x161.ALERTS_5 == 5), and the assumption
-# that a synthetic RES resets an OEM timer still requires on-car validation.
-# Stop requesting early enough that the assumed final interval ends near 30 s.
+# standstill/resume-state input. On variants that carry ADRV_0x161,
+# ALERTS_5 == 5 is a separate decoded DBC value; available public logs do not
+# establish that value's visible-cluster association. The synthetic schedule's
+# assumption that an accepted RES changes the OEM timing remains unproven on-car.
+# Stop requesting early enough that the modeled final interval ends near 30 s.
 KA4_STOCK_SCC_REARM_CUTOFF = KA4_STOCK_SCC_MAX_STANDSTILL_GRACE - KA4_STOCK_SCC_OEM_REARM_INTERVAL
 KA4_STOCK_SCC_FIRST_REARM_DELAY = 2.5
 KA4_STOCK_SCC_MIN_REARM_INTERVAL = 2.5
@@ -889,13 +890,13 @@ class CarController(CarControllerBase):
     """Keep KA4 radar-SCC auto-resume ready for at most 30 seconds.
 
     This validation path uses InfoDisplay == 4 as an observed stock
-    standstill/resume state; the actual driver-action alert is the separate
-    ADRV_0x161 ALERTS_5 == 5 signal. It assumes, but does not yet prove from a
-    route or on-car capture, that an accepted short RES press resets the OEM
-    timer. Periodic presses stop with a final short press ending no later than
-    27 seconds, so an assumed three-second OEM interval ends near 30 seconds.
-    An already-active state is level-triggered and retried at a bounded rate
-    instead of depending on a 0-to-4 edge.
+    standstill/resume state. On variants that carry ADRV_0x161, ALERTS_5 == 5
+    is a separate decoded DBC value; neither its visible-cluster association
+    nor an OEM timing change after an accepted short RES is established by the
+    available routes. The synthetic schedule ends its final short press no
+    later than 27 seconds, so its modeled three-second interval ends near 30
+    seconds. An already-active InfoDisplay state is level-triggered and retried
+    at a bounded rate instead of depending on a 0-to-4 edge.
 
     This is deliberately limited to radar-SCC KA4 and never bypasses brake,
     accelerator, Auto Hold, parking-brake, driver-button, SCC failure, or
@@ -1038,7 +1039,7 @@ class CarController(CarControllerBase):
     )
     if (self.stock_scc_keepalive_pending and normal_press_start_cutoff < stopped_frames < final_press_request_frame and
         self.stock_scc_keepalive_press_frames == KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES):
-      # An unsent normal/warning request must not occupy the reserved final
+      # An unsent normal/state-triggered request must not occupy the reserved final
       # press window. A burst that already started is allowed to finish.
       self.stock_scc_keepalive_pending = False
       self.stock_scc_keepalive_pending_frame = None
