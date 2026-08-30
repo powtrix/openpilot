@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,13 +70,15 @@ def decode_message(dbc: DBC, message_name: str, data: bytes) -> dict[str, int]:
 class Ka4StockSccReplay:
   """50 Hz stock-CAN inputs driving the real 100 Hz button output path."""
 
-  def __init__(self, *, alt_buttons: bool = False):
+  def __init__(self, *, alt_buttons: bool = False, panda_bus_offset: int = 0):
     self.alt_buttons = alt_buttons
+    self.panda_bus_offset = panda_bus_offset
     self.button_message_name = "CRUISE_BUTTONS_ALT" if alt_buttons else "CRUISE_BUTTONS"
     self.dbc = DBC(DBC_NAME)
     self.scc_packer = CANPacker(DBC_NAME)
     self.oem_button_packer = CANPacker(DBC_NAME)
     self.controller = build_controller()
+    self.controller.CAN = SimpleNamespace(ECAN=panda_bus_offset, CAM=panda_bus_offset + 2)
     if alt_buttons:
       self.controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
     self.controller.packer = CANPacker(DBC_NAME)
@@ -168,7 +171,8 @@ def test_ka4_public_reference_uses_crc_protected_alt_button_payload():
   assert values["CHECKSUM"] == checksum.calc_checksum(message.address, checksum, bytearray(KA4_ALT_BUTTON_PUBLIC_SAMPLE))
 
 
-def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkeypatch):
+@pytest.mark.parametrize("ecan_bus", [0, 4], ids=["single-panda", "second-panda-offset"])
+def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkeypatch, ecan_bus):
   class ZeroParams:
     def get_bool(self, _key):
       return False
@@ -189,10 +193,10 @@ def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkey
   # payload fixture above: 0x1AA is present and 0x1CF is absent. This tests the
   # complete fingerprint -> interface flags -> Panda safety-param path.
   fingerprint = gen_empty_fingerprint()
-  fingerprint[0][CRUISE_BUTTONS_ALT_ADDRESS] = len(KA4_ALT_BUTTON_PUBLIC_SAMPLE)
-  fingerprint[0][SCC_CONTROL_ADDRESS] = 32
-  assert CRUISE_BUTTONS_ALT_ADDRESS in fingerprint[0]
-  assert CRUISE_BUTTONS_ADDRESS not in fingerprint[0]
+  fingerprint[ecan_bus][CRUISE_BUTTONS_ALT_ADDRESS] = len(KA4_ALT_BUTTON_PUBLIC_SAMPLE)
+  fingerprint[ecan_bus][SCC_CONTROL_ADDRESS] = 32
+  assert CRUISE_BUTTONS_ALT_ADDRESS in fingerprint[ecan_bus]
+  assert CRUISE_BUTTONS_ADDRESS not in fingerprint[ecan_bus]
 
   CP = CarInterface.get_params(CAR.KIA_CARNIVAL_4TH_GEN, fingerprint, [], False, False, False)
 
@@ -203,14 +207,20 @@ def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkey
   assert not CP.flags & HyundaiFlags.CAMERA_SCC
   assert CP.pcmCruise
   assert not CP.openpilotLongitudinalControl
-  assert len(CP.safetyConfigs) == 1
-  assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.hyundaiCanfd
-  assert CP.safetyConfigs[0].safetyParam == int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS)
+  assert len(CP.safetyConfigs) == (1 if ecan_bus == 0 else 2)
+  if ecan_bus == 4:
+    assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+  assert CP.safetyConfigs[-1].safetyModel == CarParams.SafetyModel.hyundaiCanfd
+  assert CP.safetyConfigs[-1].safetyParam == int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS)
 
 
-@pytest.mark.parametrize("alt_buttons", [False, True], ids=["standard-0x1cf", "ka4-alt-0x1aa"])
-def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contract(alt_buttons):
-  replay = Ka4StockSccReplay(alt_buttons=alt_buttons)
+@pytest.mark.parametrize(
+  "alt_buttons,panda_bus_offset",
+  [(False, 0), (True, 0), (False, 4), (True, 4)],
+  ids=["standard-0x1cf", "ka4-alt-0x1aa", "standard-second-panda", "ka4-alt-second-panda"],
+)
+def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contract(alt_buttons, panda_bus_offset):
+  replay = Ka4StockSccReplay(alt_buttons=alt_buttons, panda_bus_offset=panda_bus_offset)
 
   safety = libsafety_py.libsafety
   safety_param = HyundaiSafetyFlags.CANFD_ALT_BUTTONS if alt_buttons else 0
@@ -221,7 +231,9 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contra
   for frame in range(3051):
     messages = replay.step(frame)
     for address, data, bus in messages:
-      assert safety.safety_tx_hook(libsafety_py.make_CANPacket(address, bus, data))
+      # card publishes global bus numbers. pandad routes the frame to the
+      # selected Panda and that Panda's safety hook sees its local 0..2 bus.
+      assert safety.safety_tx_hook(libsafety_py.make_CANPacket(address, bus - panda_bus_offset, data))
 
   frames = [message.frame for message in replay.injected]
   groups = pulse_groups(frames)
