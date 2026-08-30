@@ -70,15 +70,20 @@ def decode_message(dbc: DBC, message_name: str, data: bytes) -> dict[str, int]:
 class Ka4StockSccReplay:
   """50 Hz stock-CAN inputs driving the real 100 Hz button output path."""
 
-  def __init__(self, *, alt_buttons: bool = False, panda_bus_offset: int = 0):
+  def __init__(self, *, alt_buttons: bool = False, hda2: bool = False,
+               panda_bus_offset: int = 0, button_phase_frames: int = 0):
     self.alt_buttons = alt_buttons
+    self.hda2 = hda2
     self.panda_bus_offset = panda_bus_offset
+    self.button_phase_frames = button_phase_frames
     self.button_message_name = "CRUISE_BUTTONS_ALT" if alt_buttons else "CRUISE_BUTTONS"
     self.dbc = DBC(DBC_NAME)
     self.scc_packer = CANPacker(DBC_NAME)
     self.oem_button_packer = CANPacker(DBC_NAME)
     self.controller = build_controller()
-    self.controller.CAN = SimpleNamespace(ECAN=panda_bus_offset, CAM=panda_bus_offset + 2)
+    self.controller.CAN = SimpleNamespace(ECAN=panda_bus_offset + (1 if hda2 else 0), CAM=panda_bus_offset + 2)
+    if hda2:
+      self.controller.CP.flags |= HyundaiFlags.CANFD_HDA2
     if alt_buttons:
       self.controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
     self.controller.packer = CANPacker(DBC_NAME)
@@ -91,34 +96,37 @@ class Ka4StockSccReplay:
     self.injected: list[InjectedButton] = []
 
   def _update_stock_inputs(self, frame: int) -> None:
-    if frame % round(1.0 / (SCC_CONTROL_FREQUENCY * DT_CTRL)) != 0:
-      return
+    scc_period_frames = round(1.0 / (SCC_CONTROL_FREQUENCY * DT_CTRL))
+    if frame % scc_period_frames == 0:
+      stock_counter = (frame // scc_period_frames) & 0xFF
+      info_display = 4 if frame >= self.warning_deadline else 0
+      if info_display == 4:
+        self.warning_frames.append(frame)
 
-    stock_counter = (frame // 2) & 0xFF
-    info_display = 4 if frame >= self.warning_deadline else 0
-    if info_display == 4:
-      self.warning_frames.append(frame)
-
-    scc_packet = self.scc_packer.make_can_msg("SCC_CONTROL", self.controller.CAN.ECAN, {
-      "COUNTER": stock_counter,
-      "ACCMode": 1,
-      "ACC_ObjDist": 5.0,
-      "ACC_ObjRelSpd": 0.0,
-      "HUD_LEAD_INFO": 2,
-      "InfoDisplay": info_display,
-      "SysFailState": 0,
-      "TakeOverReq": 0,
-    })
-    self.scc_packets.append(scc_packet)
-    self.scc_parser.update([round(frame * DT_CTRL * 1e9), [scc_packet]])
-    assert self.scc_parser.can_valid
-    self.CS.scc_control = dict(self.scc_parser.vl["SCC_CONTROL"])
+      scc_packet = self.scc_packer.make_can_msg("SCC_CONTROL", self.controller.CAN.ECAN, {
+        "COUNTER": stock_counter,
+        "ACCMode": 1,
+        "ACC_ObjDist": 5.0,
+        "ACC_ObjRelSpd": 0.0,
+        "HUD_LEAD_INFO": 2,
+        "InfoDisplay": info_display,
+        "SysFailState": 0,
+        "TakeOverReq": 0,
+      })
+      self.scc_packets.append(scc_packet)
+      self.scc_parser.update([round(frame * DT_CTRL * 1e9), [scc_packet]])
+      assert self.scc_parser.can_valid
+      self.CS.scc_control = dict(self.scc_parser.vl["SCC_CONTROL"])
 
     # CarState reads this value from the stock 0x1CF/0x1AA received at 50 Hz.
     # Build and decode that packet rather than assigning an invented
-    # controller-only counter sequence.
+    # controller-only counter sequence. Exercise both possible phases relative
+    # to the 100 Hz controller; SCC_CONTROL remains on its independent phase.
     button_period_frames = round(1.0 / (CRUISE_BUTTONS_FREQUENCY * DT_CTRL))
-    oem_counter = (frame // button_period_frames) & (0xFF if self.alt_buttons else 0xF)
+    if frame < self.button_phase_frames or (frame - self.button_phase_frames) % button_period_frames != 0:
+      return
+
+    oem_counter = ((frame - self.button_phase_frames) // button_period_frames) & (0xFF if self.alt_buttons else 0xF)
     oem_values = dict(KA4_ALT_BUTTON_STOCK_VALUES) if self.alt_buttons else {"SET_ME_1": 1}
     oem_values.update({
       "COUNTER": oem_counter,
@@ -149,7 +157,7 @@ class Ka4StockSccReplay:
 def pulse_groups(frames: list[int]) -> list[list[int]]:
   groups: list[list[int]] = []
   for frame in frames:
-    if not groups or frame != groups[-1][-1] + 1:
+    if not groups or frame != groups[-1][-1] + round(1.0 / (CRUISE_BUTTONS_FREQUENCY * DT_CTRL)):
       groups.append([])
     groups[-1].append(frame)
   return groups
@@ -215,15 +223,31 @@ def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkey
 
 
 @pytest.mark.parametrize(
-  "alt_buttons,panda_bus_offset",
-  [(False, 0), (True, 0), (False, 4), (True, 4)],
-  ids=["standard-0x1cf", "ka4-alt-0x1aa", "standard-second-panda", "ka4-alt-second-panda"],
+  "alt_buttons,panda_bus_offset,button_phase_frames",
+  [
+    (False, 0, 0), (True, 0, 0), (False, 4, 0), (True, 4, 0),
+    (False, 0, 1), (True, 0, 1), (False, 4, 1), (True, 4, 1),
+  ],
+  ids=[
+    "standard-0x1cf-phase-0", "ka4-alt-0x1aa-phase-0",
+    "standard-second-panda-phase-0", "ka4-alt-second-panda-phase-0",
+    "standard-0x1cf-phase-1", "ka4-alt-0x1aa-phase-1",
+    "standard-second-panda-phase-1", "ka4-alt-second-panda-phase-1",
+  ],
 )
-def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contract(alt_buttons, panda_bus_offset):
-  replay = Ka4StockSccReplay(alt_buttons=alt_buttons, panda_bus_offset=panda_bus_offset)
+@pytest.mark.parametrize("hda2", [False, True], ids=["hda1", "hda2"])
+def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contract(
+    alt_buttons, panda_bus_offset, button_phase_frames, hda2,
+):
+  replay = Ka4StockSccReplay(
+    alt_buttons=alt_buttons, hda2=hda2,
+    panda_bus_offset=panda_bus_offset, button_phase_frames=button_phase_frames,
+  )
 
   safety = libsafety_py.libsafety
-  safety_param = HyundaiSafetyFlags.CANFD_ALT_BUTTONS if alt_buttons else 0
+  safety_param = HyundaiSafetyFlags.CANFD_LKA_STEERING if hda2 else 0
+  if alt_buttons:
+    safety_param |= HyundaiSafetyFlags.CANFD_ALT_BUTTONS
   assert safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(safety_param)) == 0
   safety.init_tests()
   safety.set_controls_allowed(True)
@@ -237,19 +261,12 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contra
 
   frames = [message.frame for message in replay.injected]
   groups = pulse_groups(frames)
-  assert groups == [
-    [250, 251, 252],
-    [502, 503, 504],
-    [754, 755, 756],
-    [1006, 1007, 1008],
-    [1258, 1259, 1260],
-    [1510, 1511, 1512],
-    [1762, 1763, 1764],
-    [2014, 2015, 2016],
-    [2266, 2267, 2268],
-    [2518, 2519, 2520],
-    [2698, 2699, 2700],
-  ]
+  expected_starts = (
+    [250, 504, 758, 1012, 1266, 1520, 1774, 2028, 2282, 2536, 2696]
+    if button_phase_frames == 0 else
+    [251, 505, 759, 1013, 1267, 1521, 1775, 2029, 2283, 2537, 2695]
+  )
+  assert groups == [[start, start + 2, start + 4] for start in expected_starts]
 
   # Every generated frame uses its real DBC layout and physical bus, follows
   # the latest 50 Hz stock counter, and contains no stale controls from the
@@ -258,7 +275,7 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contra
     values = decode_message(replay.dbc, replay.button_message_name, message.data)
     if alt_buttons:
       assert message.address == CRUISE_BUTTONS_ALT_ADDRESS
-      assert message.bus == replay.controller.CAN.CAM
+      assert message.bus == (replay.controller.CAN.ECAN if hda2 else replay.controller.CAN.CAM)
       assert len(message.data) == 16
       assert values["COUNTER"] == (message.oem_counter + 1) & 0xFF
       assert values["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
@@ -281,17 +298,16 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contra
         "SET_ME_1_": 0,
       }
 
-  # The controller runs at 100 Hz while the stock switch counter advances at
-  # 50 Hz. Therefore each three-frame injection is intentionally encoded as
-  # source+1, source+1, next-source+1. This proves what reaches Panda; it must
-  # not be mistaken for proof that an SCC ECU accepts the duplicate counter.
+  # Each three-frame injection replaces three fresh 50 Hz OEM switch frames.
+  # The injected counters therefore advance once per 20 ms source transition;
+  # this proves what reaches Panda, not that SCC accepts or acts on those RES
+  # frames or that they reset any OEM standstill timer.
   counter_mask = 0xFF if alt_buttons else 0xF
-  counters = [decode_message(replay.dbc, replay.button_message_name, message.data)["COUNTER"]
-              for message in replay.injected]
-  for index in range(0, len(counters), 3):
-    first, second, third = counters[index:index + 3]
-    assert first == second
-    assert third == (second + 1) & counter_mask
+  for group_index in range(0, len(replay.injected), 3):
+    group = replay.injected[group_index:group_index + 3]
+    assert [message.frame for message in group] == [group[0].frame, group[0].frame + 2, group[0].frame + 4]
+    counters = [decode_message(replay.dbc, replay.button_message_name, message.data)["COUNTER"] for message in group]
+    assert counters == [counters[0], (counters[0] + 1) & counter_mask, (counters[0] + 2) & counter_mask]
 
   # The controller creates three-frame presses and releases by ceasing its
   # injection. No injected RES is present in any quiet interval, after the
@@ -300,7 +316,7 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_assumed_timer_contra
   assert all(len(group) == 3 for group in groups)
   assert all(not any(frame in emitted for frame in range(group[-1] + 1, next_group[0]))
              for group, next_group in zip(groups[:-1], groups[1:], strict=True))
-  assert max(emitted) == 2700
+  assert max(emitted) == (2700 if button_phase_frames == 0 else 2699)
   assert not any(frame > 2700 for frame in emitted)
   assert replay.warning_frames[0] == 3000
 
@@ -335,6 +351,7 @@ INTERLOCKS = (
   "parking_brake",
   "driver_button",
   "cruise_disabled",
+  "can_invalid",
   "control_cancel",
   "movement",
   "scc_failure",
@@ -360,6 +377,8 @@ def activate_interlock(replay: Ka4StockSccReplay, interlock: str) -> None:
   elif interlock == "cruise_disabled":
     replay.CC.enabled = False
     replay.CS.out.cruiseState.enabled = False
+  elif interlock == "can_invalid":
+    replay.CS.out.canValid = False
   elif interlock == "control_cancel":
     replay.CC.cruiseControl.cancel = True
   elif interlock == "movement":

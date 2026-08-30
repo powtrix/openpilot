@@ -21,13 +21,16 @@ Machine-readable output and an offline self-check are available with::
 
   python3 tools/car_porting/ka4_stock_scc_probe.py --json demo --outcome pass
 
-The report separates a sendcan request from Panda's actual TX-return echo
+The report separates a sendcan request from Panda's TX-return echo
 (``can.src == physical_bus + 0x80``) and safety rejection echo
-(``can.src == physical_bus + 0xC0``). It also records the raw camera-side and
+(``can.src == physical_bus + 0xC0``). A TX-return proves that Panda accepted
+the frame into its transmit path, not that it won arbitration or that an ECU
+accepted or acted on it. The probe also records the raw camera-side and
 host replacement paths for ADRV_0x161 (including ``ALERTS_5=5``) and
 LFAHDA_CLUSTER. A sendcan request by itself is not proof that anything reached
-the vehicle bus. A TX-return proves Panda transmission, but neither TX-return
-nor SCC_CONTROL InfoDisplay acknowledges that the SCC ECU reset its timer.
+the vehicle bus. A TX-return records Panda's queued transmit attempt, but does
+not prove arbitration or ECU acceptance; neither it nor SCC_CONTROL
+InfoDisplay acknowledges that the SCC ECU reset its timer.
 Exit status is 0 only when the complete correlated observation matches the
 requested boundary, 1 for direct FAIL evidence, and 2 for partial evidence.
 """
@@ -82,12 +85,31 @@ MIN_EXACT_PROOF_DURATION = 30.25
 EARLIEST_EXPECTED_FINAL_WARNING = 29.5
 LATEST_EXPECTED_FINAL_WARNING = 31.5
 TX_MATCH_WINDOW = 0.100
+BUTTON_SOURCE_MAX_AGE = 0.025
+BUTTON_SOURCE_FUTURE_TOLERANCE = 0.002
+BUTTON_SOURCE_CADENCE_TOLERANCE = 0.006
 STOP_STREAM_GAP = 0.500
-EXPECTED_REARM_GROUP_STARTS = (2.50, 5.02, 7.54, 10.06, 12.58, 15.10, 17.62, 20.14, 22.66, 25.18, 26.98)
-REARM_TIMING_TOLERANCE = 0.060
+REGULAR_REARM_GROUP_STARTS = (
+  (2.50, 5.04, 7.58, 10.12, 12.66, 15.20, 17.74, 20.28, 22.82, 25.36, 26.96),
+  (2.51, 5.05, 7.59, 10.13, 12.67, 15.21, 17.75, 20.29, 22.83, 25.37, 26.95),
+)
+RECOVERY_REARM_GROUP_STARTS = (
+  (0.30, 2.84, 5.38, 7.92, 10.46, 13.00, 15.54, 18.08, 20.62, 23.16, 25.70, 26.96),
+  (0.31, 2.85, 5.39, 7.93, 10.47, 13.01, 15.55, 18.09, 20.63, 23.17, 25.71, 26.95),
+)
+SCHEDULE_MODE_REGULAR = "regular"
+SCHEDULE_MODE_INITIAL_RECOVERY = "initial_info_display_4_recovery"
+SCHEDULE_MODE_MIXED = "mixed_info_display_recovery"
+SCHEDULE_MODE_UNKNOWN = "unknown"
+INITIAL_RECOVERY_REQUIRED_DURATION = 0.30
+INITIAL_RECOVERY_START_TOLERANCE = 0.060
+REARM_START_TIMING_TOLERANCE = 0.060
+REARM_CADENCE_TOLERANCE = 0.008
 FINAL_REARM_FRAME_TIME = 27.00
 USE_SWITCH_OR_PEDAL_TO_ACCELERATE = 5
 CLUSTER_STREAM_MAX_GAP = 0.250
+PROOF_STREAM_MAX_GAP = 0.100
+PROOF_STREAM_EDGE_TOLERANCE = 0.100
 
 LIVE_PARAM_KEYS = (
   "CarName",
@@ -151,6 +173,7 @@ class StateSample:
   cruise_enabled: bool
   cruise_standstill: bool
   v_ego: float
+  v_ego_raw: float
   can_valid: bool
   brake_pressed: bool
   gas_pressed: bool
@@ -207,7 +230,7 @@ class SccSample:
       and self.acc_mode in (1, 2)
       and self.sys_fail_state == 0
       and self.takeover_request == 0
-      and self.lead_info == 2
+      and self.lead_info in (2, 3)
       and 0.0 < self.lead_distance <= 20.0
       and abs(self.lead_relative_speed) <= 0.5
     )
@@ -529,12 +552,14 @@ class ProbeAnalyzer:
   def feed_state(self, t: float, state: Any) -> None:
     self._touch(t)
     cruise = _safe_get(state, "cruiseState", SimpleNamespace())
+    v_ego = _finite_float(_safe_get(state, "vEgo", 0.0))
     self.states.append(StateSample(
       t=t,
       standstill=bool(_safe_get(state, "standstill", False)),
       cruise_enabled=bool(_safe_get(cruise, "enabled", False)),
       cruise_standstill=bool(_safe_get(cruise, "standstill", False)),
-      v_ego=_finite_float(_safe_get(state, "vEgo", 0.0)),
+      v_ego=v_ego,
+      v_ego_raw=_finite_float(_safe_get(state, "vEgoRaw", v_ego)),
       can_valid=bool(_safe_get(state, "canValid", False)),
       brake_pressed=bool(_safe_get(state, "brakePressed", False)),
       gas_pressed=bool(_safe_get(state, "gasPressed", False)),
@@ -818,7 +843,7 @@ class ProbeAnalyzer:
         "stockLongBehavior": (
           "HDA2 stock-long leaves raw camera ADRV/LFAHDA traffic on the unmodified forwarding path"
           if canfd_hda2 else
-          "HDA1 stock-long replaces ADRV/LFAHDA on ECAN; current ADRV code masks ALERTS_5 values 1..5"
+          "HDA1 stock-long replaces ADRV/LFAHDA on ECAN while preserving stock-owned ALERTS_5; masking is a FAIL"
         ),
         "inferenceWarning": (
           "Bus topology describes the current branch; a vehicle_rx frame alone is not proof of cluster display."
@@ -901,26 +926,95 @@ class ProbeAnalyzer:
       statuses = Counter(status_by_id.get(id(sample), "unobserved") for sample in group)
       previous_stock = [sample for sample in stock if 0 <= group[0].t - sample.t <= 0.100]
       oem_counter = previous_stock[-1].counter if previous_stock else None
-      expected_counters = None if oem_counter is None else [
-        (oem_counter + 1) & 0xFF,
-        (oem_counter + 1) & 0xFF,
-        (oem_counter + 2) & 0xFF,
-      ]
       counters = [sample.counter for sample in group]
       source_plus_one = []
       latest_stock_preserved = []
       source_counters = []
+      source_times = []
+      source_age_ms = []
+      source_indices = []
+      used_source_indices: set[int] = set()
       for request in group:
-        # CAN and sendcan batches representing the same 10 ms control tick can
+        # CAN and sendcan batches representing the same 50 Hz source tick can
         # differ by sub-millisecond publication/float rounding. A source up to
         # 2 ms later is still the same-tick source, not a future counter.
-        sources = [sample for sample in stock if -0.002 <= request.t - sample.t <= 0.100]
-        source = sources[-1] if sources else None
+        candidates = [
+          (abs(request.t - sample.t), index, sample, request.t - sample.t)
+          for index, sample in enumerate(stock)
+          if index not in used_source_indices
+          and -BUTTON_SOURCE_FUTURE_TOLERANCE <= request.t - sample.t <= BUTTON_SOURCE_MAX_AGE
+        ]
+        if candidates:
+          _, source_index, source, source_age = min(candidates, key=lambda candidate: candidate[0])
+          used_source_indices.add(source_index)
+        else:
+          source = None
+          source_index = None
+          source_age = None
+        source_indices.append(source_index)
         source_counters.append(source.counter if source is not None else None)
+        source_times.append(self._rel(source.t) if source is not None else None)
+        source_age_ms.append(round(source_age * 1000.0, 3) if source_age is not None else None)
         source_plus_one.append(source is not None and request.counter == (source.counter + 1) & 0xFF)
         latest_stock_preserved.append(
           source is not None and request.non_button_values == source.non_button_values
         )
+      expected_counters = [
+        None if source_counter is None else (source_counter + 1) & 0xFF
+        for source_counter in source_counters
+      ]
+      source_counter_deltas = [
+        None if prev is None or curr is None else (curr - prev) & 0xFF
+        for prev, curr in zip(source_counters, source_counters[1:], strict=False)
+      ]
+      source_timestamp_deltas_ms = [
+        None if prev is None or curr is None else round((curr - prev) * 1000.0, 3)
+        for prev, curr in zip(source_times, source_times[1:], strict=False)
+      ]
+      emitted_counter_deltas = [
+        (curr - prev) & 0xFF
+        for prev, curr in zip(counters, counters[1:], strict=False)
+      ]
+      source_counters_fresh_sequential = (
+        all(counter is not None for counter in source_counters)
+        and all(delta == 1 for delta in source_counter_deltas)
+      )
+      source_timestamps_fresh_sequential = (
+        all(source_time is not None for source_time in source_times)
+        and all(
+          abs(delta - 20.0) <= BUTTON_SOURCE_CADENCE_TOLERANCE * 1000.0
+          for delta in source_timestamp_deltas_ms
+        )
+      )
+      source_sequence_fully_observed = (
+        all(counter is not None for counter in source_counters)
+        and source_timestamps_fresh_sequential
+      )
+      emitted_counters_fresh_sequential = all(delta == 1 for delta in emitted_counter_deltas)
+      post_burst_candidates = []
+      post_burst_sequence_observed = False
+      if counters and source_indices and source_indices[-1] is not None:
+        final_source = stock[source_indices[-1]]
+        candidates = stock[source_indices[-1] + 1:source_indices[-1] + 3]
+        post_burst_candidates = [{
+          "time": self._rel(sample.t),
+          "afterFinalSourceMs": round((sample.t - final_source.t) * 1000.0, 3),
+          "counter": sample.counter,
+          "button": BUTTON_NAMES.get(sample.button, str(sample.button)),
+          "checksumValid": sample.checksum_valid,
+        } for sample in candidates]
+        if len(candidates) == 2:
+          same_counter_raw, next_counter_raw = candidates
+          post_burst_sequence_observed = (
+            same_counter_raw.counter == counters[-1]
+            and next_counter_raw.counter == ((counters[-1] + 1) & 0xFF)
+            and abs((same_counter_raw.t - final_source.t) - 0.020) <= BUTTON_SOURCE_CADENCE_TOLERANCE
+            and abs((next_counter_raw.t - same_counter_raw.t) - 0.020) <= BUTTON_SOURCE_CADENCE_TOLERANCE
+            and same_counter_raw.button == BUTTON_NONE
+            and next_counter_raw.button == BUTTON_NONE
+            and same_counter_raw.checksum_valid is True
+            and next_counter_raw.checksum_valid is True
+          )
       result.append({
         "start": self._rel(group[0].t),
         "end": self._rel(group[-1].t),
@@ -929,10 +1023,27 @@ class ProbeAnalyzer:
         "frameCount": len(group),
         "counters": counters,
         "precedingOemCounter": oem_counter,
+        "sourceTimesPerFrame": source_times,
+        "sourceAgeMsPerFrame": source_age_ms,
+        "sourceTimestampDeltasMs": source_timestamp_deltas_ms,
         "sourceCountersPerFrame": source_counters,
+        "sourceCounterDeltasMod256": source_counter_deltas,
         "sourceAvailableAllFrames": all(counter is not None for counter in source_counters),
+        "sourceTimestampsFreshSequential": source_timestamps_fresh_sequential,
+        "sourceSequenceFullyObserved": source_sequence_fully_observed,
+        "sourceCountersFreshSequential": source_counters_fresh_sequential,
         "expectedCurrentControllerCounters": expected_counters,
-        "counterPatternMatchesCurrentController": counters == expected_counters,
+        "counterPatternMatchesCurrentController": (
+          all(counter is not None for counter in source_counters) and counters == expected_counters
+        ),
+        "emittedCounterDeltasMod256": emitted_counter_deltas,
+        "emittedCountersFreshSequential": emitted_counters_fresh_sequential,
+        "postBurstRawCandidates": post_burst_candidates,
+        "postBurstSameCounterThenNextCounterObserved": post_burst_sequence_observed,
+        "postBurstObservationNote": (
+          "These are host-observed raw source candidates only; the log does not expose whether Panda " +
+          "suppressed the same-counter frame or forwarded the next-counter release frame to the camera bus."
+        ),
         "sourcePlusOneAllFrames": all(source_plus_one),
         "latestStockNonButtonFieldsPreserved": all(latest_stock_preserved),
         "allRequestChecksumsValid": all(sample.checksum_valid is True for sample in group),
@@ -1008,6 +1119,7 @@ class ProbeAnalyzer:
           "standstill": sample.standstill,
           "cruiseEnabled": sample.cruise_enabled,
           "vEgo": sample.v_ego,
+          "vEgoRaw": sample.v_ego_raw,
         }))
         previous_stop = sample.stop_active
 
@@ -1121,6 +1233,43 @@ class ProbeAnalyzer:
       "duration": round(period_end - period_start, 3),
     } for period_start, period_end in periods]
 
+  def _schedule_mode(self, samples: list[SccSample], start: float) -> tuple[str, list[dict[str, float]]]:
+    """Classify the only two schedules implemented by the controller.
+
+    InfoDisplay=4 is an authoritative SCC state input, not proof that the
+    cluster showed the driver-action warning. The early recovery schedule is
+    supported only when that state is already active at the physical stop and
+    remains continuously active through the 0.30 s qualification dwell.
+    """
+    samples = sorted(samples, key=lambda sample: sample.t)
+    periods = self._warning_periods(samples, start)
+    if not samples or samples[0].t - start > INITIAL_RECOVERY_START_TOLERANCE:
+      return SCHEDULE_MODE_UNKNOWN, periods
+
+    early_periods = [
+      period for period in periods
+      if period["startAfterStop"] < EARLIEST_EXPECTED_FINAL_WARNING
+    ]
+    if not early_periods:
+      return SCHEDULE_MODE_REGULAR, periods
+
+    first = early_periods[0]
+    initial_recovery = (
+      len(early_periods) == 1
+      and samples[0].info_display == 4
+      and first["startAfterStop"] <= INITIAL_RECOVERY_START_TOLERANCE
+      and first["endAfterStop"] >= INITIAL_RECOVERY_REQUIRED_DURATION
+    )
+    return (SCHEDULE_MODE_INITIAL_RECOVERY if initial_recovery else SCHEDULE_MODE_MIXED), periods
+
+  @staticmethod
+  def _expected_rearm_schedules(schedule_mode: str) -> tuple[tuple[float, ...], ...]:
+    if schedule_mode == SCHEDULE_MODE_REGULAR:
+      return REGULAR_REARM_GROUP_STARTS
+    if schedule_mode == SCHEDULE_MODE_INITIAL_RECOVERY:
+      return RECOVERY_REARM_GROUP_STARTS
+    return ()
+
   @staticmethod
   def _cluster_signal_periods(samples: list[ClusterCanSample], start: float, attr: str,
                               active_value: int) -> list[dict[str, float]]:
@@ -1147,13 +1296,97 @@ class ProbeAnalyzer:
     } for period_start, period_end in periods]
 
   @staticmethod
-  def _continuous_cluster_coverage(samples: list[ClusterCanSample], start: float, through: float) -> bool:
-    samples = sorted((sample for sample in samples if start - 0.150 <= sample.t <= through + 0.150),
-                     key=lambda sample: sample.t)
-    if not samples or samples[0].t > start + 0.150 or samples[-1].t < through - 0.150:
-      return False
-    return all(curr.t - prev.t <= CLUSTER_STREAM_MAX_GAP
-               for prev, curr in zip(samples, samples[1:], strict=False))
+  def _continuous_coverage(samples: list[Any], start: float, through: float, *,
+                           max_gap: float = PROOF_STREAM_MAX_GAP,
+                           edge_tolerance: float = PROOF_STREAM_EDGE_TOLERANCE) -> dict[str, Any]:
+    times = sorted(
+      float(sample.t) for sample in samples
+      if start - edge_tolerance <= float(sample.t) <= through + edge_tolerance
+    )
+    gaps = [curr - prev for prev, curr in zip(times, times[1:], strict=False)]
+    start_edge_covered = bool(times) and times[0] <= start + edge_tolerance
+    end_edge_covered = bool(times) and times[-1] >= through - edge_tolerance
+    gaps_within_limit = bool(times) and all(gap <= max_gap + 1e-9 for gap in gaps)
+    continuous = start_edge_covered and end_edge_covered and gaps_within_limit
+    return {
+      "requiredStartAfterStop": 0.0,
+      "requiredEndAfterStop": round(through - start, 3),
+      "maxAllowedGapMs": max_gap * 1000.0,
+      "edgeToleranceMs": edge_tolerance * 1000.0,
+      "sampleCount": len(times),
+      "firstSampleAfterStop": round(times[0] - start, 3) if times else None,
+      "lastSampleAfterStop": round(times[-1] - start, 3) if times else None,
+      "startEdgeCovered": start_edge_covered,
+      "endEdgeCovered": end_edge_covered,
+      "maxObservedGapMs": round(max(gaps) * 1000.0, 3) if gaps else None,
+      "gapsOverLimit": sum(gap > max_gap + 1e-9 for gap in gaps),
+      "continuous": continuous,
+    }
+
+  @staticmethod
+  def _pair_cluster_frames_by_counter(
+      sources: list[ClusterCanSample], outputs: list[ClusterCanSample], start: float, through: float,
+  ) -> tuple[list[tuple[ClusterCanSample, ClusterCanSample]], dict[str, Any]]:
+    """Pair every proof-window source with one same-counter, same-tick output.
+
+    Counters wrap several times during a 30 second capture, so a counter match
+    alone is insufficient. Conversely, nearest-time matching without consuming
+    the output lets one sparse host frame stand in for several raw frames. Keep
+    the time bound and consume each output at most once.
+    """
+    all_sources = sorted(sources, key=lambda sample: sample.t)
+    all_outputs = sorted(outputs, key=lambda sample: sample.t)
+    used_outputs: set[int] = set()
+    all_pairs: list[tuple[ClusterCanSample, int, ClusterCanSample]] = []
+    for source in all_sources:
+      candidates = [
+        (abs(output.t - source.t), index, output)
+        for index, output in enumerate(all_outputs)
+        if index not in used_outputs
+        and output.counter == source.counter
+        and abs(output.t - source.t) <= TX_MATCH_WINDOW
+      ]
+      if not candidates:
+        continue
+      _, output_index, output = min(candidates, key=lambda candidate: candidate[0])
+      used_outputs.add(output_index)
+      all_pairs.append((source, output_index, output))
+
+    proof_sources = [source for source in all_sources if start <= source.t <= through]
+    proof_pairs_with_index = [pair for pair in all_pairs if start <= pair[0].t <= through]
+    pairs = [(source, output) for source, _, output in proof_pairs_with_index]
+    proof_output_indices = {index for _, index, _ in proof_pairs_with_index}
+    unpaired_proof_outputs = [
+      output for index, output in enumerate(all_outputs)
+      if index not in used_outputs
+      and (
+        start <= output.t <= through
+        or any(
+          source.counter == output.counter and abs(source.t - output.t) <= TX_MATCH_WINDOW
+          for source in proof_sources
+        )
+      )
+    ]
+    source_count = len(proof_sources)
+    paired_count = len(pairs)
+    output_count = len(proof_output_indices) + len(unpaired_proof_outputs)
+    unused_output_count = len(unpaired_proof_outputs)
+    exact_one_to_one = (
+      source_count > 0
+      and source_count == output_count == paired_count
+      and unused_output_count == 0
+    )
+    return pairs, {
+      "sourceFramesInProofWindow": source_count,
+      "outputFramesInProofWindow": output_count,
+      "pairedFrames": paired_count,
+      "unpairedSourceFrames": source_count - paired_count,
+      "unusedOutputFrames": unused_output_count,
+      "sourceCoverageRatio": paired_count / source_count if source_count else 0.0,
+      "allSourceFramesPairedByCounterAndTime": source_count > 0 and paired_count == source_count,
+      "outputsReused": 0,
+      "exactOneToOneByCounterAndTime": exact_one_to_one,
+    }
 
   def _cluster_episode_evidence(self, start: float, end: float,
                                 tx_status_by_id: dict[int, str]) -> dict[str, Any]:
@@ -1188,32 +1421,84 @@ class ProbeAnalyzer:
     rejected_cluster_requests = [request for request in cluster_request_samples
                                  if tx_status_by_id.get(id(request)) == "rejected"]
 
+    coverage_through = min(end, start + MIN_EXACT_PROOF_DURATION)
+    host_adrv_requests = [sample for sample in adrv_requests if sample.bus == host_bus]
+    host_hda_requests = [sample for sample in hda_requests if sample.bus == host_bus]
+    host_returned_adrv = [sample for sample in returned_adrv if sample.bus == host_bus]
+    host_returned_hda = [sample for sample in returned_hda if sample.bus == host_bus]
+    raw_adrv_coverage = self._continuous_coverage(raw_adrv, start, coverage_through)
+    raw_hda_coverage = self._continuous_coverage(raw_hda, start, coverage_through)
+    host_stream_coverage = {
+      "adrvRequests": self._continuous_coverage(host_adrv_requests, start, coverage_through),
+      "adrvReturned": self._continuous_coverage(host_returned_adrv, start, coverage_through),
+      "lfaHdaRequests": self._continuous_coverage(host_hda_requests, start, coverage_through),
+      "lfaHdaReturned": self._continuous_coverage(host_returned_hda, start, coverage_through),
+    }
+    _, adrv_request_pairing = self._pair_cluster_frames_by_counter(
+      raw_adrv, host_adrv_requests, start, coverage_through,
+    )
+    _, adrv_return_pairing = self._pair_cluster_frames_by_counter(
+      raw_adrv, host_returned_adrv, start, coverage_through,
+    )
+    _, hda_request_pairing = self._pair_cluster_frames_by_counter(
+      raw_hda, host_hda_requests, start, coverage_through,
+    )
+    hda_return_pairs, hda_return_pairing = self._pair_cluster_frames_by_counter(
+      raw_hda, host_returned_hda, start, coverage_through,
+    )
+    exact_adrv_replacement_pairing = (
+      adrv_request_pairing["exactOneToOneByCounterAndTime"]
+      and adrv_return_pairing["exactOneToOneByCounterAndTime"]
+    )
+    exact_hda_replacement_pairing = (
+      hda_request_pairing["exactOneToOneByCounterAndTime"]
+      and hda_return_pairing["exactOneToOneByCounterAndTime"]
+    )
+
     raw_warning_periods = self._cluster_signal_periods(
       [sample for sample in raw_adrv if start <= sample.t <= end], start, "alert_5",
       USE_SWITCH_OR_PEDAL_TO_ACCELERATE,
     )
     first_raw_warning = raw_warning_periods[0]["startAfterStop"] if raw_warning_periods else None
     raw_warning_frames = [sample for sample in raw_adrv
-                          if sample.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE]
+                          if start <= sample.t <= end
+                          and sample.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE]
     warning_output_pairs = []
+    used_warning_outputs: set[int] = set()
     for raw in raw_warning_frames:
-      candidates = [sample for sample in returned_adrv if abs(sample.t - raw.t) <= TX_MATCH_WINDOW]
+      candidates = [
+        (abs(sample.t - raw.t), index, sample)
+        for index, sample in enumerate(returned_adrv)
+        if index not in used_warning_outputs
+        and sample.bus == host_bus
+        and sample.counter == raw.counter
+        and abs(sample.t - raw.t) <= TX_MATCH_WINDOW
+      ]
       if candidates:
-        output = min(candidates, key=lambda sample: abs(sample.t - raw.t))
+        _, index, output = min(candidates, key=lambda candidate: candidate[0])
+        used_warning_outputs.add(index)
         warning_output_pairs.append((raw, output))
     masked_warning_frames = sum(output.alert_5 != USE_SWITCH_OR_PEDAL_TO_ACCELERATE
                                 for _, output in warning_output_pairs)
     forwarded_warning_frames = sum(output.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
                                    for _, output in warning_output_pairs)
+    unpaired_warning_frames = len(raw_warning_frames) - len(warning_output_pairs)
+    if canfd_hda2:
+      warning_preservation_ok = not adrv_requests and not returned_adrv
+      warning_preservation_topology = "hda2_raw_no_host_replacement"
+    elif not raw_warning_frames:
+      warning_preservation_ok = True
+      warning_preservation_topology = "hda1_no_raw_warning_to_preserve"
+    else:
+      warning_preservation_ok = (
+        unpaired_warning_frames == 0
+        and masked_warning_frames == 0
+        and forwarded_warning_frames == len(raw_warning_frames)
+      )
+      warning_preservation_topology = "hda1_host_replacement"
 
-    hda_state_pairs = []
-    for raw in raw_hda:
-      candidates = [sample for sample in returned_hda if abs(sample.t - raw.t) <= TX_MATCH_WINDOW]
-      if candidates:
-        output = min(candidates, key=lambda sample: abs(sample.t - raw.t))
-        hda_state_pairs.append((raw, output))
     hda_state_mismatches = sum(raw.hda_control_state != output.hda_control_state
-                               for raw, output in hda_state_pairs)
+                               for raw, output in hda_return_pairs)
 
     if raw_warning_frames and masked_warning_frames:
       warning_path = "hostReplacementMaskedRawWarning"
@@ -1231,14 +1516,28 @@ class ProbeAnalyzer:
     all_hda_returned = bool(hda_requests) and all(
       tx_status_by_id.get(id(request)) == "returned" for request in hda_requests)
     if canfd_hda2:
-      hda_path_consistent = bool(raw_adrv and raw_hda) and not adrv_requests and not hda_requests
+      hda_path_consistent = (
+        raw_adrv_coverage["continuous"]
+        and raw_hda_coverage["continuous"]
+        and not adrv_requests
+        and not hda_requests
+        and not returned_adrv
+        and not returned_hda
+        and warning_preservation_ok
+      )
     else:
       hda_path_consistent = (
-        bool(raw_adrv and raw_hda and hda_state_pairs)
+        raw_adrv_coverage["continuous"]
+        and raw_hda_coverage["continuous"]
+        and all(coverage["continuous"] for coverage in host_stream_coverage.values())
+        and exact_adrv_replacement_pairing
+        and exact_hda_replacement_pairing
         and all_adrv_returned
         and all_hda_returned
         and hda_state_mismatches == 0
         and all(request.bus == host_bus for request in (*adrv_requests, *hda_requests))
+        and all(sample.bus == host_bus for sample in (*returned_adrv, *returned_hda))
+        and warning_preservation_ok
       )
 
     raw_hda_transitions = []
@@ -1262,14 +1561,25 @@ class ProbeAnalyzer:
       round(first_raw_warning - last_res_after_stop, 3)
       if first_raw_warning is not None and last_res_after_stop is not None else None
     )
-    coverage_through = min(end, start + MIN_EXACT_PROOF_DURATION)
     return {
       "rawCameraBus": raw_camera_bus,
       "hostReplacementBus": None if canfd_hda2 else host_bus,
       "canFdHda2": canfd_hda2,
       "rawAdrvSamples": len(raw_adrv),
       "rawLfaHdaSamples": len(raw_hda),
-      "rawAdrvContinuousThrough30_25s": self._continuous_cluster_coverage(raw_adrv, start, coverage_through),
+      "rawAdrvContinuousThrough30_25s": raw_adrv_coverage["continuous"],
+      "rawLfaHdaContinuousThrough30_25s": raw_hda_coverage["continuous"],
+      "rawAdrvCoverage": raw_adrv_coverage,
+      "rawLfaHdaCoverage": raw_hda_coverage,
+      "hostReplacementCoverage": host_stream_coverage,
+      "hostReplacementPairing": {
+        "adrvRawToRequest": adrv_request_pairing,
+        "adrvRawToReturned": adrv_return_pairing,
+        "lfaHdaRawToRequest": hda_request_pairing,
+        "lfaHdaRawToReturned": hda_return_pairing,
+        "exactAdrvRawRequestReturnedPairing": exact_adrv_replacement_pairing,
+        "exactLfaHdaRawRequestReturnedPairing": exact_hda_replacement_pairing,
+      },
       "integrity": {
         "rawAdrvAllCrcValid": bool(raw_adrv) and all(sample.checksum_valid is True for sample in raw_adrv),
         "rawLfaHdaAllCrcValid": bool(raw_hda) and all(sample.checksum_valid is True for sample in raw_hda),
@@ -1287,14 +1597,22 @@ class ProbeAnalyzer:
       "warningOutputPairCounts": {
         "rawWarningFrames": len(raw_warning_frames),
         "pairedWithTxReturn": len(warning_output_pairs),
+        "unpairedRawWarningFrames": unpaired_warning_frames,
         "maskedByReturnedFrame": masked_warning_frames,
         "forwardedByReturnedFrame": forwarded_warning_frames,
+      },
+      "warningPreservation": {
+        "topology": warning_preservation_topology,
+        "requiredForObservedRawWarning": bool(raw_warning_frames),
+        "allRawWarningFramesPairedByCounterAndTime": unpaired_warning_frames == 0,
+        "allPairedReturnedFramesPreserveAlert5": masked_warning_frames == 0,
+        "pathPreservesRawWarning": warning_preservation_ok,
       },
       "hdaControlStateCounts": {str(value): count for value, count in sorted(Counter(
         sample.hda_control_state for sample in raw_hda).items(), key=lambda item: str(item[0]))},
       "hdaControlStateTransitions": raw_hda_transitions[:100],
       "hdaReplacementComparison": {
-        "pairedFrames": len(hda_state_pairs),
+        "pairedFrames": len(hda_return_pairs),
         "stateMismatches": hda_state_mismatches,
         "allAdrvRequestsReturned": all_adrv_returned,
         "allLfaHdaRequestsReturned": all_hda_returned,
@@ -1342,44 +1660,61 @@ class ProbeAnalyzer:
       and sample.lfa_button == 0
       for sample in raw_alt_stock_bus
     )
-    warning_periods = self._warning_periods(scc, start)
-    first_warning = warning_periods[0]["startAfterStop"] if warning_periods else None
+    schedule_mode, info_display_4_periods = self._schedule_mode(scc, start)
     cluster_evidence = self._cluster_episode_evidence(start, end, cluster_tx_status_by_id)
     first_raw_warning = cluster_evidence["firstRawAccelerateWarningAfterStop"]
 
     group_times = [group["start"] - start_rel for group in episode_groups]
-    returned_schedule_ok = False
-    schedule = {}
-    if group_times:
-      gaps = [curr - prev for prev, curr in zip(group_times, group_times[1:], strict=False)]
-      exact_group_times = (
-        len(group_times) == len(EXPECTED_REARM_GROUP_STARTS)
-        and all(abs(actual - expected) <= REARM_TIMING_TOLERANCE
-                for actual, expected in zip(group_times, EXPECTED_REARM_GROUP_STARTS, strict=True))
-      )
-      exact_three_frame_groups = all(
-        group["frameCount"] == 3
-        and len(group["frameSpacingMs"]) == 2
-        and all(abs(spacing - 10.0) <= 6.0 for spacing in group["frameSpacingMs"])
-        for group in episode_groups
-      )
-      no_late_rearm = not any(request.t - start > FINAL_REARM_FRAME_TIME + 0.005 for request in rearm_requests)
-      schedule = {
-        "firstGroupAfterStop": round(group_times[0], 3),
-        "lastGroupAfterStop": round(group_times[-1], 3),
-        "maxGroupGap": round(max(gaps), 3) if gaps else None,
-        "expectedGroupStarts": list(EXPECTED_REARM_GROUP_STARTS),
-        "actualGroupStarts": [round(group_time, 3) for group_time in group_times],
-        "exactExpectedGroupTimes": exact_group_times,
-        "exactThreeFrameGroups": exact_three_frame_groups,
-        "noResAfter27_00s": no_late_rearm,
-      }
-      returned_schedule_ok = (
-        exact_group_times
-        and exact_three_frame_groups
-        and no_late_rearm
-      )
+    gaps = [curr - prev for prev, curr in zip(group_times, group_times[1:], strict=False)]
+    expected_schedules = self._expected_rearm_schedules(schedule_mode)
+    matching_source_phases = [
+      phase for phase, expected in enumerate(expected_schedules)
+      if len(group_times) == len(expected)
+      and abs(group_times[0] - expected[0]) <= REARM_START_TIMING_TOLERANCE
+      and all(abs(actual_gap - expected_gap) <= REARM_CADENCE_TOLERANCE
+              for actual_gap, expected_gap in zip(
+                gaps,
+                (curr - prev for prev, curr in zip(expected, expected[1:], strict=False)),
+                strict=True,
+              ))
+    ]
+    matched_source_phase = matching_source_phases[0] if len(matching_source_phases) == 1 else None
+    exact_group_times = matched_source_phase is not None
+    exact_three_frame_groups = bool(episode_groups) and all(
+      group["frameCount"] == 3
+      and len(group["frameSpacingMs"]) == 2
+      and all(abs(spacing - 20.0) <= 6.0 for spacing in group["frameSpacingMs"])
+      for group in episode_groups
+    )
+    no_late_rearm = not any(request.t - start > FINAL_REARM_FRAME_TIME + 0.005 for request in rearm_requests)
+    returned_schedule_ok = exact_group_times and exact_three_frame_groups and no_late_rearm
+    schedule = {
+      "scheduleMode": schedule_mode,
+      "firstGroupAfterStop": round(group_times[0], 3) if group_times else None,
+      "lastGroupAfterStop": round(group_times[-1], 3) if group_times else None,
+      "maxGroupGap": round(max(gaps), 3) if gaps else None,
+      "expectedGroupStartVariants": [
+        {"buttonSourcePhaseFrames": phase, "groupStarts": list(expected)}
+        for phase, expected in enumerate(expected_schedules)
+      ],
+      "matchingButtonSourcePhaseFrames": matching_source_phases,
+      "matchedButtonSourcePhaseFrames": matched_source_phase,
+      "startTimingToleranceMs": REARM_START_TIMING_TOLERANCE * 1000.0,
+      "cadenceToleranceMs": REARM_CADENCE_TOLERANCE * 1000.0,
+      "actualGroupStarts": [round(group_time, 3) for group_time in group_times],
+      "exactExpectedGroupTimes": exact_group_times,
+      "exactThreeFrameGroups": exact_three_frame_groups,
+      "noResAfter27_00s": no_late_rearm,
+      "exactSupportedRearmSchedule": returned_schedule_ok,
+    }
 
+    coverage_through = min(end, start + MIN_EXACT_PROOF_DURATION)
+    stream_coverage = {
+      "carState": self._continuous_coverage(states, start, coverage_through),
+      "carControl": self._continuous_coverage(controls, start, coverage_through),
+      "rawScc0x1a0": self._continuous_coverage(scc, start, coverage_through),
+      "rawStockButtons0x1aa": self._continuous_coverage(raw_alt_stock_bus, start, coverage_through),
+    }
     gate_passed = bool(self.car_params and self.car_params.get("ka4StockSccGatePassed"))
     state_coverage_ok = bool(states) and len(valid_state) == len(states)
     no_interlocks = (
@@ -1390,7 +1725,12 @@ class ProbeAnalyzer:
     )
     control_coverage_ok = bool(controls) and len(enabled_controls) == len(controls)
     raw_scc_coverage_ok = bool(scc) and len(safe_scc) == len(scc)
-    stopped_motion_ok = bool(states) and all(sample.standstill and abs(sample.v_ego) <= 0.05 for sample in states)
+    stopped_motion_ok = bool(states) and all(
+      sample.standstill
+      and abs(sample.v_ego) <= 0.05
+      and abs(sample.v_ego_raw) <= 0.03
+      for sample in states
+    )
     exact_duration = duration >= MIN_EXACT_PROOF_DURATION
     all_tx_returned = bool(episode_groups) and all(group["allReturned"] for group in episode_groups)
     any_rejected = any(group["statuses"].get("rejected", 0) for group in episode_groups)
@@ -1400,6 +1740,14 @@ class ProbeAnalyzer:
     )
     all_rearm_crc_valid = bool(episode_groups) and all(group["allRequestChecksumsValid"] for group in episode_groups)
     source_plus_one = bool(episode_groups) and all(group["sourcePlusOneAllFrames"] for group in episode_groups)
+    source_counters_fresh = bool(episode_groups) and all(
+      group["sourceCountersFreshSequential"] for group in episode_groups)
+    source_timestamps_fresh = bool(episode_groups) and all(
+      group["sourceTimestampsFreshSequential"] for group in episode_groups)
+    emitted_counters_fresh = bool(episode_groups) and all(
+      group["emittedCountersFreshSequential"] for group in episode_groups)
+    post_burst_release_candidates_observed = bool(episode_groups) and all(
+      group["postBurstSameCounterThenNextCounterObserved"] for group in episode_groups)
     stock_fields_preserved = bool(episode_groups) and all(
       group["latestStockNonButtonFieldsPreserved"] for group in episode_groups)
     panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
@@ -1430,12 +1778,19 @@ class ProbeAnalyzer:
     next_states = [sample for sample in self.states if end < sample.t <= end + 0.250]
     last_safe_scc = scc[-1].raw_lead_safe if scc else False
     potential_false_start = any(
-      not sample.standstill and sample.cruise_enabled and abs(sample.v_ego) > 0.05 and not sample.interlock_active
+      not sample.standstill
+      and sample.cruise_enabled
+      and max(abs(sample.v_ego), abs(sample.v_ego_raw)) > 0.05
+      and not sample.interlock_active
       for sample in next_states
     ) and last_safe_scc
+    supported_group_limit = (
+      len(expected_schedules[0]) if expected_schedules else
+      max(len(schedule) for schedule in (*REGULAR_REARM_GROUP_STARTS, *RECOVERY_REARM_GROUP_STARTS))
+    )
     direct_schedule_violation = (
-      len(episode_groups) > len(EXPECTED_REARM_GROUP_STARTS)
-      or len(rearm_requests) > len(EXPECTED_REARM_GROUP_STARTS) * 3
+      len(episode_groups) > supported_group_limit
+      or len(rearm_requests) > supported_group_limit * 3
       or any(request.t - start > FINAL_REARM_FRAME_TIME + 0.005 for request in rearm_requests)
       or any(group["frameCount"] > 3 for group in episode_groups)
     )
@@ -1446,9 +1801,18 @@ class ProbeAnalyzer:
       or cluster_evidence["integrity"]["invalidSampleCount"] > 0
     )
     any_cluster_rejected = cluster_evidence["integrity"]["rejectedRequestCount"] > 0
+    direct_warning_masking = (
+      not canfd_hda2
+      and cluster_evidence["warningOutputPairCounts"]["maskedByReturnedFrame"] > 0
+    )
     direct_source_policy_failure = bool(episode_groups) and any(
-      group["sourceAvailableAllFrames"]
-      and (not group["sourcePlusOneAllFrames"] or not group["latestStockNonButtonFieldsPreserved"])
+      group["sourceSequenceFullyObserved"]
+      and (
+        not group["sourcePlusOneAllFrames"]
+        or not group["sourceCountersFreshSequential"]
+        or not group["emittedCountersFreshSequential"]
+        or not group["latestStockNonButtonFieldsPreserved"]
+      )
       for group in episode_groups
     )
 
@@ -1456,10 +1820,14 @@ class ProbeAnalyzer:
       "ka4StockSccCarParamsGate": gate_passed,
       "physicalStopStartObserved": start_observed,
       "durationAtLeast30_25s": exact_duration,
+      "carStateContinuousCoverage": stream_coverage["carState"]["continuous"],
+      "carControlContinuousCoverage": stream_coverage["carControl"]["continuous"],
+      "rawScc0x1a0ContinuousCoverage": stream_coverage["rawScc0x1a0"]["continuous"],
+      "rawStockButtons0x1aaContinuousCoverage": stream_coverage["rawStockButtons0x1aa"]["continuous"],
       "carStateCanValidAllSamples": state_coverage_ok,
       "driverInterlocksClearAllSamples": no_interlocks,
       "carControlEnabledAllSamples": control_coverage_ok,
-      "wheelStandstillAndVEgoZeroAllSamples": stopped_motion_ok,
+      "wheelStandstillAndRawSpeedNearZeroAllSamples": stopped_motion_ok,
       "noPotentialFalseStart": not potential_false_start,
       "rawSccLeadGateValidAllSamples": raw_scc_coverage_ok,
       "raw0x1aaStockBusPresentAnd0x1cfAbsent": bool(raw_alt_stock_bus) and not raw_standard_stock_bus,
@@ -1470,14 +1838,36 @@ class ProbeAnalyzer:
       "allRearm0x1aaCrcValid": all_rearm_crc_valid,
       "latestStockNonButtonFieldsPreserved": stock_fields_preserved,
       "sourcePlusOneCounterAllFrames": source_plus_one,
+      "sourceTimestampsFreshSequentialAllGroups": source_timestamps_fresh,
+      "sourceCountersFreshSequentialAllGroups": source_counters_fresh,
+      "emittedCountersFreshSequentialAllGroups": emitted_counters_fresh,
+      "rawPostBurstSameCounterAndNextReleaseCandidatesObservedAllGroups": (
+        post_burst_release_candidates_observed
+      ),
       "exactAltBusAndAddressLayout": exact_alt_layout,
-      "exact11GroupRearmSchedule": returned_schedule_ok,
+      "exactSupportedRearmSchedule": returned_schedule_ok,
       "allObservedRearmRequestsReturned": all_tx_returned,
       "rawAdrv0x161ContinuousThrough30_25s": cluster_evidence["rawAdrvContinuousThrough30_25s"],
+      "rawLfaHda0x1e0ContinuousThrough30_25s": cluster_evidence["rawLfaHdaContinuousThrough30_25s"],
       "rawAdrv0x161CrcValidAllSamples": cluster_evidence["integrity"]["rawAdrvAllCrcValid"],
       "rawLfaHda0x1e0Observed": cluster_evidence["rawLfaHdaSamples"] > 0,
       "rawLfaHda0x1e0CrcValidAllSamples": cluster_evidence["integrity"]["rawLfaHdaAllCrcValid"],
       "hostClusterReplacementCrcValidAllSamples": cluster_evidence["integrity"]["hostReplacementAllCrcValid"],
+      "hda1HostReplacementStreamsContinuousOrHda2NoReplacement": (
+        canfd_hda2
+        or all(coverage["continuous"]
+               for coverage in cluster_evidence["hostReplacementCoverage"].values())
+      ),
+      "hda1RawAdrvExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement": (
+        canfd_hda2
+        or cluster_evidence["hostReplacementPairing"]["exactAdrvRawRequestReturnedPairing"]
+      ),
+      "hda1RawLfaHdaExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement": (
+        canfd_hda2
+        or cluster_evidence["hostReplacementPairing"]["exactLfaHdaRawRequestReturnedPairing"]
+      ),
+      "rawAdrvWarningPreservedAcrossActiveTopology": cluster_evidence[
+        "warningPreservation"]["pathPreservesRawWarning"],
       "hdaPathConsistentWithCurrentStockLongTopology": cluster_evidence[
         "hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"],
     }
@@ -1487,61 +1877,62 @@ class ProbeAnalyzer:
     if any_rejected or any_cluster_rejected:
       verdict = "FAIL"
       reasons.append("Panda safety rejected one or more 0x1AA RES or cluster replacement requests")
+    elif direct_warning_masking:
+      verdict = "FAIL"
+      reasons.append("HDA1 returned host replacement masked raw ADRV_0x161 ALERTS_5=5")
     elif direct_schedule_violation:
       verdict = "FAIL"
-      reasons.append("0x1AA RES traffic exceeded the exact 11x3 schedule or continued after 27.00s")
+      reasons.append("0x1AA RES traffic exceeded the supported schedule or continued after 27.00s")
     elif direct_crc_failure:
       verdict = "FAIL"
       reasons.append("an SCC, button, ADRV, or LFAHDA frame failed the Hyundai CAN-FD CRC")
     elif direct_source_policy_failure:
       verdict = "FAIL"
-      reasons.append("a RES frame violated source+1 counter or changed a non-button field from the latest stock 0x1AA")
+      reasons.append(
+        "a RES group violated fresh sequential source/emitted counters, source+1, or stock non-button fields"
+      )
     elif potential_false_start:
       verdict = "FAIL"
       reasons.append("vehicle moved while the stationary-lead gate was still valid; potential false start")
     elif states and not stopped_motion_ok:
       verdict = "FAIL"
-      reasons.append("standstill evidence contained nonzero vEgo or a false standstill sample")
+      reasons.append("standstill evidence contained motion above the vEgo/vEgoRaw gate or a false standstill sample")
     elif first_raw_warning is not None and first_raw_warning < EARLIEST_EXPECTED_FINAL_WARNING:
       verdict = "FAIL"
       reasons.append(
         f"raw ADRV_0x161 ALERTS_5=5 appeared early at {first_raw_warning:.3f}s after stop"
       )
-    elif first_warning is not None and first_warning < EARLIEST_EXPECTED_FINAL_WARNING:
+    elif first_raw_warning is not None and first_raw_warning > LATEST_EXPECTED_FINAL_WARNING:
       verdict = "FAIL"
-      reasons.append(f"stock InfoDisplay=4 appeared early at {first_warning:.3f}s after stop")
-    elif all(prerequisites.values()):
-      scc_boundary_observed = (
-        first_warning is not None
-        and EARLIEST_EXPECTED_FINAL_WARNING <= first_warning <= LATEST_EXPECTED_FINAL_WARNING
+      reasons.append(
+        f"raw ADRV_0x161 ALERTS_5=5 appeared late at {first_raw_warning:.3f}s after stop"
       )
+    elif schedule_mode == SCHEDULE_MODE_MIXED:
+      reasons.append(
+        "InfoDisplay=4 changed during the pre-warning stop window, so neither supported schedule can be proven"
+      )
+    elif schedule_mode == SCHEDULE_MODE_UNKNOWN:
+      reasons.append("authoritative SCC status did not cover the physical stop boundary")
+    elif all(prerequisites.values()):
       raw_boundary_observed = (
         first_raw_warning is not None
         and EARLIEST_EXPECTED_FINAL_WARNING <= first_raw_warning <= LATEST_EXPECTED_FINAL_WARNING
       )
-      if scc_boundary_observed and raw_boundary_observed:
+      if raw_boundary_observed:
         verdict = "PASS"
         reasons.append(
           " ".join((
-            "the returned 0x1AA schedule, SCC InfoDisplay=4, raw ADRV ALERTS_5=5, and HDA path all aligned",
-            "at the 30s boundary; no individual RES timer-reset acknowledgement exists",
+            f"the returned {schedule_mode} 0x1AA schedule and raw ADRV ALERTS_5=5 source aligned",
+            "at the 30s boundary; TX return does not prove arbitration, ECU acceptance, or an individual timer reset",
           ))
         )
-      elif first_warning is None and first_raw_warning is None:
+      elif first_raw_warning is None:
         verdict = "PASS_AT_LEAST_30S"
         reasons.append(
-          "both continuously observed OEM warning streams stayed clear for at least 30s; the final timeout and individual RES timer resets remain unproven"
-        )
-      elif ((first_warning is not None and first_warning > LATEST_EXPECTED_FINAL_WARNING)
-            or (first_raw_warning is not None and first_raw_warning > LATEST_EXPECTED_FINAL_WARNING)):
-        verdict = "FAIL"
-        reasons.append(
-          "an OEM warning boundary appeared after 31.5s; the requested approximately-30s maximum was not observed"
+          "the continuously observed raw ADRV warning source stayed clear for at least 30s; the final timeout and individual RES timer resets remain unproven"
         )
       else:
-        reasons.append(
-          "SCC InfoDisplay and raw ADRV ALERTS_5 did not both establish the same 30s OEM warning boundary"
-        )
+        reasons.append("raw ADRV ALERTS_5 did not establish the approximately-30s warning boundary")
     else:
       failed = [name for name, passed in prerequisites.items() if not passed]
       reasons.append("missing proof prerequisites: " + ", ".join(failed))
@@ -1554,8 +1945,10 @@ class ProbeAnalyzer:
       "stateSamples": len(states),
       "sccSamples": len(scc),
       "rawSccSafeSamples": len(safe_scc),
+      "scheduleMode": schedule_mode,
       "resGroups": episode_groups,
       "returnedSchedule": schedule,
+      "streamCoverage": stream_coverage,
       "busLayout": {
         "stockBus": stock_bus,
         "pandaBusOffset": panda_bus_offset,
@@ -1564,7 +1957,7 @@ class ProbeAnalyzer:
         "observedSendBuses": sorted({request.bus for request in rearm_requests}),
       },
       "potentialFalseStart": potential_false_start,
-      "warningPeriods": warning_periods,
+      "infoDisplay4Periods": info_display_4_periods,
       "clusterEvidence": cluster_evidence,
       "alerts": [{**asdict(alert), "t": self._rel(alert.t)} for alert in alerts[:20]],
       "prerequisites": prerequisites,
@@ -1588,7 +1981,7 @@ class ProbeAnalyzer:
       overall = "INCONCLUSIVE"
 
     return {
-      "schemaVersion": 2,
+      "schemaVersion": 3,
       "mode": self.mode,
       "source": self.source,
       "capture": {
@@ -1613,20 +2006,27 @@ class ProbeAnalyzer:
       "interpretation": {
         "PASS": (
           " ".join((
-            "A qualified capture observed the intended TX-return schedule plus matching SCC, raw ADRV warning,",
-            "and HDA evidence at approximately 30s. This does not acknowledge which RES frame, if any, reset the SCC timer.",
+            "A qualified capture observed a supported TX-return schedule plus the raw ADRV warning source",
+            "at approximately 30s. This does not prove arbitration, ECU acceptance, or which RES frame reset an SCC timer.",
           ))
         ),
         "PASS_AT_LEAST_30S": (
-          "Continuously observed SCC and raw ADRV warning paths stayed clear for 30s, but the final timeout and individual SCC timer resets remain unproven."
+          "The continuously observed raw ADRV warning source stayed clear for 30s, but the final timeout and individual SCC timer resets remain unproven."
         ),
         "FAIL": "Direct on-wire or stock-SCC status evidence contradicts the requested behavior.",
         "INCONCLUSIVE": "The capture lacks one or more prerequisites; do not treat absence of an error as success.",
       },
       "limitations": [
-        "A sendcan row is only a request; can.src +0x80 is required to prove Panda transmission.",
+        "A sendcan row is only a request; can.src +0x80 shows that Panda returned the queued transmit attempt.",
+        "A Panda TX-return does not prove that the frame won CAN arbitration or that the SCC ECU accepted or acted on it.",
+        (
+          "TX-return does not expose Panda's camera-side forwarding decision for intervening raw 0x1AA frames; " +
+          "even when the raw same-counter and next-counter release candidates are observed, only a separate " +
+          "camera-bus capture can prove release timing and counter continuity seen by the receiving ECU."
+        ),
         "Neither +0x80 TX-return nor stock 0x1A0 InfoDisplay acknowledges SCC acceptance or a timer reset.",
-        "Raw ADRV_0x161 ALERTS_5=5 proves the OEM warning source value, not that the cluster displayed it; HDA1 can replace and mask it.",
+        "SCC_CONTROL InfoDisplay=4 selects the regular/recovery state schedule only; it is not used as visible-warning success or failure evidence.",
+        "Raw ADRV_0x161 ALERTS_5=5 is source evidence, not display proof; HDA1 PASS requires its returned replacement to preserve value 5.",
         "HDA2 raw-path visibility is inferred from current-branch topology and absence of a host replacement, not a cluster display acknowledgement.",
         "Start the capture before the physical stop and keep recording past 31 seconds.",
         "Use a full rlog when possible; qlogs can omit or downsample CAN/sendcan/state evidence.",
@@ -1697,17 +2097,36 @@ def _demo_car_params(bus_offset: int = 0, hda2: bool = False) -> Any:
   )
 
 
-def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False) -> ProbeAnalyzer:
+def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
+             schedule_mode: str = SCHEDULE_MODE_REGULAR, button_source_phase_frames: int = 0,
+             raw_warning_time: float | None = None, mask_hda1_warning: bool = False,
+             button_counter_offset: int = 0) -> ProbeAnalyzer:
   """Generate deterministic, real-DBC frames for an offline dry run."""
   from opendbc.can import CANPacker
 
-  analyzer = ProbeAnalyzer("demo", outcome)
+  if schedule_mode not in (SCHEDULE_MODE_REGULAR, SCHEDULE_MODE_INITIAL_RECOVERY, SCHEDULE_MODE_MIXED):
+    raise ValueError(f"unsupported demo schedule mode: {schedule_mode}")
+  if button_source_phase_frames not in (0, 1):
+    raise ValueError("button_source_phase_frames must be 0 or 1")
+
+  analyzer = ProbeAnalyzer("demo", f"{outcome}:{schedule_mode}:phase-{button_source_phase_frames}")
   analyzer.set_car_params(_demo_car_params(bus_offset, hda2), "demo")
   packer = CANPacker(DBC_NAME)
   base = 1_000.0
+  if raw_warning_time is None:
+    raw_warning_time = 30.0 if outcome == "pass" else 3.0
+
+  def demo_info_display(elapsed: float) -> int:
+    final_state = elapsed >= 30.0
+    initial_recovery_state = (
+      schedule_mode == SCHEDULE_MODE_INITIAL_RECOVERY
+      and elapsed <= INITIAL_RECOVERY_REQUIRED_DURATION
+    )
+    mixed_recovery_state = schedule_mode == SCHEDULE_MODE_MIXED and 1.0 <= elapsed <= 1.30
+    return 4 if final_state or initial_recovery_state or mixed_recovery_state else 0
 
   moving_state = SimpleNamespace(
-    standstill=False, vEgo=1.0, canValid=True, brakePressed=False, gasPressed=False,
+    standstill=False, vEgo=1.0, vEgoRaw=1.0, canValid=True, brakePressed=False, gasPressed=False,
     brakeHoldActive=False, parkingBrake=False, accFaulted=False,
     cruiseState=SimpleNamespace(enabled=True, standstill=False),
   )
@@ -1715,32 +2134,35 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False) -> ProbeAnal
   analyzer.feed_control(base - 0.05, SimpleNamespace(enabled=True))
 
   stop_duration = 35.0
-  for frame in range(round(stop_duration * 50) + 1):
-    elapsed = frame / 50.0
+  for frame in range(round(stop_duration * 100) + 1):
+    elapsed = frame / 100.0
     t = base + elapsed
-    info_display = 4 if (elapsed >= (30.0 if outcome == "pass" else 3.0)) else 0
-    scc = packer.make_can_msg("SCC_CONTROL", 0, {
-      "COUNTER": frame & 0xFF,
-      "ACCMode": 1,
-      "ACC_ObjDist": 5.0,
-      "ACC_ObjRelSpd": 0.0,
-      "HUD_LEAD_INFO": 2,
-      "InfoDisplay": info_display,
-      "SysFailState": 0,
-      "TakeOverReq": 0,
-    })
-    analyzer.feed_can("can", t, bus_offset, scc[0], scc[1])
-    stock_button = packer.make_can_msg("CRUISE_BUTTONS_ALT", 0, {
-      "COUNTER": frame & 0xFF,
-      "CRUISE_BUTTONS": BUTTON_NONE,
-      "DISTANCE_UNIT": 1,
-      "SET_ME_2": 3,
-    })
-    analyzer.feed_can("can", t, bus_offset, stock_button[0], stock_button[1])
-
+    info_display = demo_info_display(elapsed)
     if frame % 2 == 0:
+      scc = packer.make_can_msg("SCC_CONTROL", 0, {
+        "COUNTER": (frame // 2) & 0xFF,
+        "ACCMode": 1,
+        "ACC_ObjDist": 5.0,
+        "ACC_ObjRelSpd": 0.0,
+        "HUD_LEAD_INFO": 2,
+        "InfoDisplay": info_display,
+        "SysFailState": 0,
+        "TakeOverReq": 0,
+      })
+      analyzer.feed_can("can", t, bus_offset, scc[0], scc[1])
+
+    if frame >= button_source_phase_frames and (frame - button_source_phase_frames) % 2 == 0:
+      stock_button = packer.make_can_msg("CRUISE_BUTTONS_ALT", 0, {
+        "COUNTER": (((frame - button_source_phase_frames) // 2) + button_counter_offset) & 0xFF,
+        "CRUISE_BUTTONS": BUTTON_NONE,
+        "DISTANCE_UNIT": 1,
+        "SET_ME_2": 3,
+      })
+      analyzer.feed_can("can", t, bus_offset, stock_button[0], stock_button[1])
+
+    if frame % 4 == 0:
       stopped_state = SimpleNamespace(
-        standstill=True, vEgo=0.0, canValid=True, brakePressed=False, gasPressed=False,
+        standstill=True, vEgo=0.0, vEgoRaw=0.0, canValid=True, brakePressed=False, gasPressed=False,
         brakeHoldActive=False, parkingBrake=False, accFaulted=False,
         cruiseState=SimpleNamespace(enabled=True, standstill=info_display >= 4),
       )
@@ -1748,14 +2170,14 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False) -> ProbeAnal
       analyzer.feed_control(t, SimpleNamespace(enabled=True))
 
   # Real-DBC camera source and host replacement evidence. HDA1 stock-long
-  # replaces both messages on ECAN and masks ALERTS_5=5. HDA2 stock-long does
-  # not synthesize these frames, leaving the raw camera path unmodified.
-  warning_time = 30.0 if outcome == "pass" else 3.0
+  # replaces both messages on ECAN while preserving stock-owned warnings.
+  # HDA2 stock-long does not synthesize these frames, leaving the raw camera
+  # path unmodified. mask_hda1_warning generates the explicit regression case.
   raw_camera_bus = bus_offset + 2
   for frame in range(round(stop_duration * 20) + 1):
     elapsed = frame / 20.0
     t = base + elapsed
-    raw_alert = USE_SWITCH_OR_PEDAL_TO_ACCELERATE if elapsed >= warning_time else 0
+    raw_alert = USE_SWITCH_OR_PEDAL_TO_ACCELERATE if elapsed >= raw_warning_time else 0
     raw_adrv = packer.make_can_msg("ADRV_0x161", raw_camera_bus, {
       "COUNTER": frame & 0xFF,
       "ALERTS_5": raw_alert,
@@ -1770,7 +2192,7 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False) -> ProbeAnal
     if not hda2:
       host_adrv = packer.make_can_msg("ADRV_0x161", bus_offset, {
         "COUNTER": frame & 0xFF,
-        "ALERTS_5": 0,
+        "ALERTS_5": 0 if mask_hda1_warning else raw_alert,
       })
       host_hda = packer.make_can_msg("LFAHDA_CLUSTER", bus_offset, {
         "COUNTER": frame & 0xFF,
@@ -1782,10 +2204,18 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False) -> ProbeAnal
         analyzer.feed_can("can", t + 0.003, bus_offset + PANDA_RETURNED_BUS_OFFSET, message[0], message[1])
 
   if outcome != "missing-tx":
-    group_starts = list(EXPECTED_REARM_GROUP_STARTS)
+    schedule_variants = (
+      RECOVERY_REARM_GROUP_STARTS
+      if schedule_mode == SCHEDULE_MODE_INITIAL_RECOVERY else
+      REGULAR_REARM_GROUP_STARTS
+    )
+    group_starts = schedule_variants[button_source_phase_frames]
     for group_start in group_starts:
-      for offset in (0.0, 0.01, 0.02):
-        source_counter = math.floor((group_start + offset) * 50.0 + 1e-6) & 0xFF
+      for offset in (0.0, 0.02, 0.04):
+        source_frame = round((group_start + offset) * 100.0)
+        source_counter = (
+          ((source_frame - button_source_phase_frames) // 2) + button_counter_offset
+        ) & 0xFF
         counter = (source_counter + 1) & 0xFF
         send_bus = bus_offset if hda2 else bus_offset + 2
         tx = packer.make_can_msg("CRUISE_BUTTONS_ALT", send_bus, {
@@ -1870,21 +2300,25 @@ def print_human(report: dict[str, Any]) -> None:
   for index, episode in enumerate(report["stopEpisodes"], 1):
     print(
       f"  #{index}: {episode['duration']:.3f}s verdict={episode['verdict']} ",
-      f"0x1A0={episode['sccSamples']} RES-groups={len(episode['resGroups'])}",
+      f"mode={episode['scheduleMode']} 0x1A0={episode['sccSamples']} RES-groups={len(episode['resGroups'])}",
       sep="",
     )
     for reason in episode["reasons"]:
       print(f"    - {reason}")
-    if episode["warningPeriods"]:
-      print(f"    InfoDisplay=4 periods: {episode['warningPeriods']}")
+    if episode["infoDisplay4Periods"]:
+      print(f"    InfoDisplay=4 state periods: {episode['infoDisplay4Periods']}")
     print(f"    raw cluster evidence: {episode['clusterEvidence']}")
     if episode["returnedSchedule"]:
       print(f"    schedule: {episode['returnedSchedule']}")
+    print(f"    proof stream coverage: {episode['streamCoverage']}")
     for group in episode["resGroups"]:
       print(
         f"    RES @{group['start'] - episode['start']:.3f}s counters={group['counters']} ",
-        f"source={group['sourceCountersPerFrame']} tx={group['statuses']} ",
+        f"source={group['sourceCountersPerFrame']} source-age-ms={group['sourceAgeMsPerFrame']} tx={group['statuses']} ",
         f"crc={group['allRequestChecksumsValid']} source+1={group['sourcePlusOneAllFrames']} ",
+        f"source-time-sequential={group['sourceTimestampsFreshSequential']} ",
+        f"source-sequential={group['sourceCountersFreshSequential']} ",
+        f"emitted-sequential={group['emittedCountersFreshSequential']} ",
         f"stock-fields={group['latestStockNonButtonFieldsPreserved']}",
         sep="",
       )

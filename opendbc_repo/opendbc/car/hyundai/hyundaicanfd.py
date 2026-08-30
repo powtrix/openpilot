@@ -324,7 +324,7 @@ def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active, *, openpilot
   values["HDA_LFA_SymSta"] = 2 if lat_active else 0
   return [packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values, rx_counter=rx_counter)]
 
-def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
+def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudinal):
   ret = []
   if CS.adrv_0x161 is not None:
     values = copy.copy(CS.adrv_0x161)
@@ -336,21 +336,27 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
     values["LFA_ICON"] = 2 if lat_active else 1 if lat_enabled else 0
     values["LKA_ICON"] = 4 if lat_active else 3 if lat_enabled else 0
 
-    if values["ALERTS_2"] in [1, 2, 5, 6, 10, 21, 22]:
-      values["ALERTS_2"] = 0
-      values["DAW_ICON"] = 0
+    # With stock longitudinal, the camera/SCC still owns every OEM warning.
+    # Replacing ADRV_0x161 only to draw openpilot's lateral icons must not hide
+    # messages such as ALERTS_5=5 (use switch or pedal to accelerate), nor mute
+    # their associated sounds. Warning suppression is only appropriate when
+    # openpilot owns longitudinal control.
+    if openpilot_longitudinal:
+      if values["ALERTS_2"] in [1, 2, 5, 6, 10, 21, 22]:
+        values["ALERTS_2"] = 0
+        values["DAW_ICON"] = 0
 
-    if values["ALERTS_1"] == 0:
-      values["SOUNDS_1"] = 0
-      values["SOUNDS_2"] = 0
-      values["SOUNDS_4"] = 0
+      if values["ALERTS_1"] == 0:
+        values["SOUNDS_1"] = 0
+        values["SOUNDS_2"] = 0
+        values["SOUNDS_4"] = 0
 
-    if values["ALERTS_3"] in [3, 4, 11, 12, 13, 14, 17, 19, 26, 7, 8, 9, 10]:
-      values["ALERTS_3"] = 0
-      values["SOUNDS_3"] = 0
+      if values["ALERTS_3"] in [3, 4, 11, 12, 13, 14, 17, 19, 26, 7, 8, 9, 10]:
+        values["ALERTS_3"] = 0
+        values["SOUNDS_3"] = 0
 
-    if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
-      values["ALERTS_5"] = 0
+      if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
+        values["ALERTS_5"] = 0
 
     ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter=rx_counter))
   return ret

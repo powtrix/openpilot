@@ -1,8 +1,19 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from tools.car_porting.ka4_stock_scc_probe import (  # noqa: TID251
+  ADRV_0X161_ADDRESS,
+  BUTTON_RES_ACCEL,
+  CRUISE_BUTTONS_ALT_ADDRESS,
+  LFAHDA_CLUSTER_ADDRESS,
   ProbeAnalyzer,
+  RECOVERY_REARM_GROUP_STARTS,
+  REGULAR_REARM_GROUP_STARTS,
+  SCHEDULE_MODE_INITIAL_RECOVERY,
+  SCHEDULE_MODE_MIXED,
+  SCHEDULE_MODE_REGULAR,
   classify_can_source,
   run_demo,
 )
@@ -17,13 +28,41 @@ def test_classify_panda_tx_echo_sources() -> None:
   assert classify_can_source("sendcan", 0x02) == ("send_request", 2)
 
 
-def test_demo_pass_proves_exact_30_second_behavior() -> None:
-  report = run_demo("pass").report()
+@pytest.mark.parametrize(
+  "schedule_mode,button_source_phase_frames,expected_schedules",
+  [
+    pytest.param(SCHEDULE_MODE_REGULAR, 0, REGULAR_REARM_GROUP_STARTS, id="regular-phase-0"),
+    pytest.param(SCHEDULE_MODE_REGULAR, 1, REGULAR_REARM_GROUP_STARTS, id="regular-phase-1"),
+    pytest.param(SCHEDULE_MODE_INITIAL_RECOVERY, 0, RECOVERY_REARM_GROUP_STARTS, id="recovery-phase-0"),
+    pytest.param(SCHEDULE_MODE_INITIAL_RECOVERY, 1, RECOVERY_REARM_GROUP_STARTS, id="recovery-phase-1"),
+  ],
+)
+def test_demo_pass_proves_exact_supported_30_second_behavior(
+    schedule_mode: str,
+    button_source_phase_frames: int,
+    expected_schedules: tuple[tuple[float, ...], ...],
+) -> None:
+  report = run_demo(
+    "pass",
+    schedule_mode=schedule_mode,
+    button_source_phase_frames=button_source_phase_frames,
+  ).report()
 
   assert report["overallVerdict"] == "PASS"
   episode = report["stopEpisodes"][0]
-  assert 29.9 <= episode["warningPeriods"][0]["startAfterStop"] <= 30.1
-  assert episode["prerequisites"]["exact11GroupRearmSchedule"]
+  assert episode["scheduleMode"] == schedule_mode
+  assert episode["clusterEvidence"]["firstRawAccelerateWarningAfterStop"] == 30.0
+  first_info_display_4 = episode["infoDisplay4Periods"][0]["startAfterStop"]
+  if schedule_mode == SCHEDULE_MODE_INITIAL_RECOVERY:
+    assert first_info_display_4 == 0.0
+  else:
+    assert first_info_display_4 == 30.0
+  schedule = episode["returnedSchedule"]
+  assert schedule["actualGroupStarts"] == list(expected_schedules[button_source_phase_frames])
+  assert schedule["matchingButtonSourcePhaseFrames"] == [button_source_phase_frames]
+  assert schedule["matchedButtonSourcePhaseFrames"] == button_source_phase_frames
+  assert schedule["exactSupportedRearmSchedule"]
+  assert episode["prerequisites"]["exactSupportedRearmSchedule"]
   assert episode["prerequisites"]["raw0x1aaStockBusPresentAnd0x1cfAbsent"]
   assert episode["prerequisites"]["send0x1aaUsesExpectedBus"]
   assert episode["prerequisites"]["stockAndSendBusesUseSafetyPanda"]
@@ -32,13 +71,51 @@ def test_demo_pass_proves_exact_30_second_behavior() -> None:
   assert episode["prerequisites"]["allRearm0x1aaCrcValid"]
   assert episode["prerequisites"]["latestStockNonButtonFieldsPreserved"]
   assert episode["prerequisites"]["sourcePlusOneCounterAllFrames"]
-  assert episode["prerequisites"]["wheelStandstillAndVEgoZeroAllSamples"]
+  assert episode["prerequisites"]["sourceTimestampsFreshSequentialAllGroups"]
+  assert episode["prerequisites"]["sourceCountersFreshSequentialAllGroups"]
+  assert episode["prerequisites"]["emittedCountersFreshSequentialAllGroups"]
+  assert episode["prerequisites"][
+    "rawPostBurstSameCounterAndNextReleaseCandidatesObservedAllGroups"
+  ]
+  assert all(group["postBurstSameCounterThenNextCounterObserved"] for group in episode["resGroups"])
+  assert episode["prerequisites"]["wheelStandstillAndRawSpeedNearZeroAllSamples"]
+  assert all(coverage["continuous"] for coverage in episode["streamCoverage"].values())
   assert report["carParams"]["ka4StockSccGate"]["canFdAltButtons"]
   assert report["carParams"]["ka4StockSccGate"]["hyundaiCanfdSafetyAltButtons"]
   assert all(group["allReturned"] for group in episode["resGroups"])
   assert all(group["counterPatternMatchesCurrentController"] for group in episode["resGroups"])
-  assert sum(match["status"] == "returned" for match in report["txMatches"]) == 33
+  assert all(group["frameSpacingMs"] == [20.0, 20.0] for group in episode["resGroups"])
+  expected_request_count = len(expected_schedules[button_source_phase_frames]) * 3
+  assert sum(match["status"] == "returned" for match in report["txMatches"]) == expected_request_count
   assert sum(match["status"] == "rejected" for match in report["txMatches"]) == 0
+
+
+@pytest.mark.parametrize(
+  "schedule_mode,button_source_phase_frames,expected_schedules",
+  [
+    pytest.param(SCHEDULE_MODE_REGULAR, 0, REGULAR_REARM_GROUP_STARTS, id="regular-phase-0"),
+    pytest.param(SCHEDULE_MODE_REGULAR, 1, REGULAR_REARM_GROUP_STARTS, id="regular-phase-1"),
+    pytest.param(SCHEDULE_MODE_INITIAL_RECOVERY, 0, RECOVERY_REARM_GROUP_STARTS, id="recovery-phase-0"),
+    pytest.param(SCHEDULE_MODE_INITIAL_RECOVERY, 1, RECOVERY_REARM_GROUP_STARTS, id="recovery-phase-1"),
+  ],
+)
+def test_probe_schedule_constants_track_real_controller_replay(
+    schedule_mode: str,
+    button_source_phase_frames: int,
+    expected_schedules: tuple[tuple[float, ...], ...],
+) -> None:
+  from opendbc.car.hyundai.tests.test_stock_scc_can_replay import Ka4StockSccReplay, pulse_groups
+
+  replay = Ka4StockSccReplay(alt_buttons=True, button_phase_frames=button_source_phase_frames)
+  if schedule_mode == SCHEDULE_MODE_INITIAL_RECOVERY:
+    replay.warning_deadline = 0
+
+  for frame in range(2701):
+    replay.step(frame)
+
+  groups = pulse_groups([message.frame for message in replay.injected])
+  assert tuple(group[0] / 100.0 for group in groups) == expected_schedules[button_source_phase_frames]
+  assert all(group == [group[0], group[0] + 2, group[0] + 4] for group in groups)
 
 
 def test_demo_pass_accepts_second_panda_global_bus_offset() -> None:
@@ -59,7 +136,7 @@ def test_demo_pass_accepts_second_panda_global_bus_offset() -> None:
   assert episode["prerequisites"]["stockAndSendBusesUseSafetyPanda"]
 
 
-def test_hda1_reports_raw_warning_and_masked_return_as_distinct_dbc_frames() -> None:
+def test_hda1_host_replacement_preserves_raw_warning_in_returned_dbc_frames() -> None:
   report = run_demo("pass").report()
   cluster = report["clusterCanEvidence"]
   streams = cluster["streams"]
@@ -72,15 +149,20 @@ def test_hda1_reports_raw_warning_and_masked_return_as_distinct_dbc_frames() -> 
                        if stream["addressHex"] == "0x161" and stream["origin"] == "tx_returned")
   assert (raw_adrv["bus"], sent_adrv["bus"], returned_adrv["bus"]) == (2, 0, 0)
   assert raw_adrv["valueCounts"]["5"] > 0
-  assert sent_adrv["valueCounts"] == {"0": sent_adrv["count"]}
-  assert returned_adrv["valueCounts"] == {"0": returned_adrv["count"]}
+  assert sent_adrv["valueCounts"]["5"] == raw_adrv["valueCounts"]["5"]
+  assert returned_adrv["valueCounts"]["5"] == raw_adrv["valueCounts"]["5"]
   assert raw_adrv["transitions"][-1]["value"] == 5
-  assert raw_adrv["transitions"][-1]["dataHex"] != sent_adrv["transitions"][0]["dataHex"]
+  assert sent_adrv["transitions"][-1]["value"] == 5
+  assert returned_adrv["transitions"][-1]["value"] == 5
 
   episode = report["stopEpisodes"][0]
   evidence = episode["clusterEvidence"]
-  assert evidence["warningPathObservation"] == "hostReplacementMaskedRawWarning"
-  assert evidence["warningOutputPairCounts"]["maskedByReturnedFrame"] > 0
+  assert evidence["warningPathObservation"] == "hostReplacementForwardedRawWarning"
+  assert evidence["warningOutputPairCounts"]["maskedByReturnedFrame"] == 0
+  assert evidence["warningOutputPairCounts"]["unpairedRawWarningFrames"] == 0
+  assert evidence["warningOutputPairCounts"]["forwardedByReturnedFrame"] > 0
+  assert evidence["warningPreservation"]["pathPreservesRawWarning"]
+  assert episode["prerequisites"]["rawAdrvWarningPreservedAcrossActiveTopology"]
   assert evidence["hdaReplacementComparison"]["stateMismatches"] == 0
   assert evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
   res_times = [event["t"] for event in report["correlatedTimeline"] if event["event"] == "resHostRequest"]
@@ -89,6 +171,94 @@ def test_hda1_reports_raw_warning_and_masked_return_as_distinct_dbc_frames() -> 
                      and event["origin"] == "vehicle_rx" and event["signal"] == "ALERTS_5"
                      and event["value"] == 5)
   assert max(res_times) < raw_warning["t"]
+
+
+def test_sparse_hda1_host_replacement_streams_cannot_produce_pass() -> None:
+  analyzer = run_demo("pass")
+  stop_start = min(sample.t for sample in analyzer.states if sample.standstill)
+
+  # Keep one LFAHDA host request/return pair near the stop boundary and only
+  # the warning-era ADRV replacements. The raw camera streams remain complete,
+  # so a presence-only check would incorrectly certify this capture.
+  analyzer.cluster_can = [
+    sample for sample in analyzer.cluster_can
+    if not (
+      sample.origin in ("send_request", "tx_returned")
+      and (
+        (sample.address == LFAHDA_CLUSTER_ADDRESS and sample.t > stop_start + 0.01)
+        or (sample.address == ADRV_0X161_ADDRESS and sample.t < stop_start + 29.99)
+      )
+    )
+  ]
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
+  assert not evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
+  assert not all(coverage["continuous"] for coverage in evidence["hostReplacementCoverage"].values())
+  assert not evidence["hostReplacementPairing"]["exactAdrvRawRequestReturnedPairing"]
+  assert not evidence["hostReplacementPairing"]["exactLfaHdaRawRequestReturnedPairing"]
+  assert not episode["prerequisites"]["hda1HostReplacementStreamsContinuousOrHda2NoReplacement"]
+  assert not episode["prerequisites"][
+    "hda1RawAdrvExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement"
+  ]
+  assert not episode["prerequisites"][
+    "hda1RawLfaHdaExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement"
+  ]
+
+
+def test_extra_duplicate_hda1_host_request_and_return_cannot_produce_pass() -> None:
+  analyzer = run_demo("pass")
+  stop_start = min(sample.t for sample in analyzer.states if sample.standstill)
+  request = min(
+    (sample for sample in analyzer.cluster_can
+     if sample.origin == "send_request" and sample.address == ADRV_0X161_ADDRESS),
+    key=lambda sample: abs(sample.t - (stop_start + 10.0)),
+  )
+  returned = min(
+    (sample for sample in analyzer.cluster_can
+     if sample.origin == "tx_returned" and sample.address == ADRV_0X161_ADDRESS
+     and sample.data_hex == request.data_hex),
+    key=lambda sample: abs(sample.t - request.t),
+  )
+  analyzer.cluster_can.extend((
+    replace(request, t=request.t + 0.0004),
+    replace(returned, t=returned.t + 0.0004),
+  ))
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
+  request_pairing = evidence["hostReplacementPairing"]["adrvRawToRequest"]
+  returned_pairing = evidence["hostReplacementPairing"]["adrvRawToReturned"]
+  assert evidence["hdaReplacementComparison"]["allAdrvRequestsReturned"]
+  assert request_pairing["allSourceFramesPairedByCounterAndTime"]
+  assert returned_pairing["allSourceFramesPairedByCounterAndTime"]
+  assert request_pairing["unusedOutputFrames"] == 1
+  assert returned_pairing["unusedOutputFrames"] == 1
+  assert not request_pairing["exactOneToOneByCounterAndTime"]
+  assert not returned_pairing["exactOneToOneByCounterAndTime"]
+  assert not episode["prerequisites"][
+    "hda1RawAdrvExactlyPairedWithHostRequestAndReturnOrHda2NoReplacement"
+  ]
+
+
+def test_hda1_returned_host_replacement_masking_raw_warning_is_direct_failure() -> None:
+  report = run_demo("pass", mask_hda1_warning=True).report()
+
+  assert report["overallVerdict"] == "FAIL"
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
+  assert evidence["warningPathObservation"] == "hostReplacementMaskedRawWarning"
+  assert evidence["warningOutputPairCounts"]["maskedByReturnedFrame"] > 0
+  assert not evidence["warningPreservation"]["pathPreservesRawWarning"]
+  assert not episode["prerequisites"]["rawAdrvWarningPreservedAcrossActiveTopology"]
+  assert not episode["prerequisites"]["hdaPathConsistentWithCurrentStockLongTopology"]
+  assert "returned host replacement masked raw ADRV_0x161 ALERTS_5=5" in episode["reasons"][0]
 
 
 def test_hda2_second_panda_reports_unmodified_raw_warning_topology() -> None:
@@ -108,6 +278,8 @@ def test_hda2_second_panda_reports_unmodified_raw_warning_topology() -> None:
                  for stream in streams)
   evidence = report["stopEpisodes"][0]["clusterEvidence"]
   assert evidence["warningPathObservation"] == "hda2RawUnmodifiedForwardingTopology"
+  assert evidence["warningPreservation"]["topology"] == "hda2_raw_no_host_replacement"
+  assert evidence["warningPreservation"]["pathPreservesRawWarning"]
   assert evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
 
 
@@ -160,7 +332,8 @@ def test_demo_rejected_tx_and_early_warning_fails() -> None:
 
   assert report["overallVerdict"] == "FAIL"
   episode = report["stopEpisodes"][0]
-  assert episode["warningPeriods"][0]["startAfterStop"] < 3.1
+  assert episode["infoDisplay4Periods"][0]["startAfterStop"] == 30.0
+  assert episode["clusterEvidence"]["firstRawAccelerateWarningAfterStop"] < 3.1
   assert any("rejected" in reason for reason in episode["reasons"])
   assert sum(match["status"] == "rejected" for match in report["txMatches"]) == 33
 
@@ -171,7 +344,36 @@ def test_demo_missing_tx_is_inconclusive() -> None:
   assert report["overallVerdict"] == "FAIL"
   # The synthetic missing-TX trace also exposes the OEM warning at 3 seconds,
   # so it is direct negative evidence, not merely an absent request.
-  assert not report["stopEpisodes"][0]["prerequisites"]["exact11GroupRearmSchedule"]
+  assert not report["stopEpisodes"][0]["prerequisites"]["exactSupportedRearmSchedule"]
+
+
+def test_mid_stop_info_display_4_is_inconclusive_even_with_raw_warning_at_30_seconds() -> None:
+  report = run_demo("pass", schedule_mode=SCHEDULE_MODE_MIXED).report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  assert episode["scheduleMode"] == SCHEDULE_MODE_MIXED
+  assert episode["infoDisplay4Periods"][0]["startAfterStop"] == 1.0
+  assert episode["clusterEvidence"]["firstRawAccelerateWarningAfterStop"] == 30.0
+  assert not episode["returnedSchedule"]["exactSupportedRearmSchedule"]
+  assert not episode["prerequisites"]["exactSupportedRearmSchedule"]
+  assert "neither supported schedule can be proven" in episode["reasons"][0]
+
+
+def test_initial_info_display_4_does_not_hide_an_early_raw_adrv_warning() -> None:
+  report = run_demo(
+    "pass",
+    schedule_mode=SCHEDULE_MODE_INITIAL_RECOVERY,
+    raw_warning_time=3.0,
+  ).report()
+
+  assert report["overallVerdict"] == "FAIL"
+  episode = report["stopEpisodes"][0]
+  assert episode["scheduleMode"] == SCHEDULE_MODE_INITIAL_RECOVERY
+  assert episode["infoDisplay4Periods"][0]["startAfterStop"] == 0.0
+  assert episode["returnedSchedule"]["exactSupportedRearmSchedule"]
+  assert episode["clusterEvidence"]["firstRawAccelerateWarningAfterStop"] == 3.0
+  assert "raw ADRV_0x161 ALERTS_5=5 appeared early" in episode["reasons"][0]
 
 
 def test_empty_analyzer_is_inconclusive() -> None:
@@ -212,7 +414,7 @@ def test_nonzero_vego_during_reported_standstill_is_direct_failure() -> None:
 
   report = analyzer.report()
   assert report["overallVerdict"] == "FAIL"
-  assert "nonzero vEgo" in report["stopEpisodes"][0]["reasons"][0]
+  assert "vEgo/vEgoRaw gate" in report["stopEpisodes"][0]["reasons"][0]
 
 
 def test_vehicle_motion_after_long_stop_with_stationary_lead_is_direct_failure() -> None:
@@ -251,3 +453,207 @@ def test_changed_non_button_field_cannot_pass() -> None:
   report = analyzer.report()
   assert report["overallVerdict"] == "FAIL"
   assert "non-button field" in report["stopEpisodes"][0]["reasons"][0]
+
+
+def test_single_car_control_sample_cannot_produce_pass() -> None:
+  analyzer = run_demo("pass")
+  analyzer.controls = [next(sample for sample in analyzer.controls if sample.t >= 1_000.0)]
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  coverage = episode["streamCoverage"]["carControl"]
+  assert coverage["startEdgeCovered"]
+  assert not coverage["endEdgeCovered"]
+  assert not coverage["continuous"]
+  assert episode["prerequisites"]["carControlEnabledAllSamples"]
+  assert not episode["prerequisites"]["carControlContinuousCoverage"]
+
+
+def test_two_sparse_scc_samples_cannot_produce_pass() -> None:
+  analyzer = run_demo("pass")
+  analyzer.scc = [
+    analyzer.scc[0],
+    next(sample for sample in analyzer.scc if sample.info_display == 4),
+  ]
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  coverage = episode["streamCoverage"]["rawScc0x1a0"]
+  assert coverage["startEdgeCovered"]
+  assert coverage["gapsOverLimit"] == 1
+  assert not coverage["continuous"]
+  assert episode["prerequisites"]["rawSccLeadGateValidAllSamples"]
+  assert not episode["prerequisites"]["rawScc0x1a0ContinuousCoverage"]
+
+
+def test_sparse_raw_buttons_with_every_res_source_still_cannot_produce_pass() -> None:
+  analyzer = run_demo("pass")
+  requests = [sample for sample in analyzer.buttons
+              if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL]
+  stock = [sample for sample in analyzer.buttons
+           if sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS]
+  required_stock_ids = {
+    id(min(stock, key=lambda sample: abs(sample.t - request.t)))
+    for request in requests
+  }
+  required_stock_ids.update((id(stock[0]), id(min(stock, key=lambda sample: abs(sample.t - 1_030.25)))))
+  analyzer.buttons = [
+    sample for sample in analyzer.buttons
+    if sample.origin != "vehicle_rx"
+    or sample.address != CRUISE_BUTTONS_ALT_ADDRESS
+    or id(sample) in required_stock_ids
+  ]
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  coverage = episode["streamCoverage"]["rawStockButtons0x1aa"]
+  assert coverage["startEdgeCovered"]
+  assert coverage["endEdgeCovered"]
+  assert coverage["gapsOverLimit"] > 0
+  assert not coverage["continuous"]
+  assert episode["prerequisites"]["sourcePlusOneCounterAllFrames"]
+  assert episode["prerequisites"]["sourceTimestampsFreshSequentialAllGroups"]
+  assert episode["prerequisites"]["sourceCountersFreshSequentialAllGroups"]
+  assert episode["prerequisites"]["emittedCountersFreshSequentialAllGroups"]
+  assert not episode["prerequisites"]["rawStockButtons0x1aaContinuousCoverage"]
+
+
+def test_missing_post_burst_release_candidate_cannot_produce_pass() -> None:
+  analyzer = run_demo("pass")
+  requests = sorted(
+    (sample for sample in analyzer.buttons
+     if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL),
+    key=lambda sample: sample.t,
+  )
+  first_group = [request for request in requests if request.t - requests[0].t <= 0.100]
+  final_request = first_group[-1]
+  stock = sorted(
+    (sample for sample in analyzer.buttons
+     if sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS),
+    key=lambda sample: sample.t,
+  )
+  final_source = min(
+    (sample for sample in stock
+     if -0.002 <= final_request.t - sample.t <= 0.025
+     and sample.counter == ((final_request.counter - 1) & 0xFF)),
+    key=lambda sample: abs(final_request.t - sample.t),
+  )
+  release_candidate = min(
+    (sample for sample in stock
+     if sample.t > final_source.t and sample.counter == ((final_request.counter + 1) & 0xFF)),
+    key=lambda sample: sample.t,
+  )
+  analyzer.buttons.remove(release_candidate)
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  assert episode["streamCoverage"]["rawStockButtons0x1aa"]["continuous"]
+  assert not episode["resGroups"][0]["postBurstSameCounterThenNextCounterObserved"]
+  assert not episode["prerequisites"][
+    "rawPostBurstSameCounterAndNextReleaseCandidatesObservedAllGroups"
+  ]
+
+
+@pytest.mark.parametrize("missing_source_index", (0, 1, 2))
+def test_missing_one_raw_source_is_inconclusive_instead_of_stale_source_failure(
+    missing_source_index: int,
+) -> None:
+  analyzer = run_demo("pass")
+  first_requests = [sample for sample in analyzer.buttons
+                    if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL][:3]
+  missing_time = first_requests[missing_source_index].t
+  analyzer.buttons = [
+    sample for sample in analyzer.buttons
+    if not (
+      sample.origin == "vehicle_rx"
+      and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+      and sample.t == missing_time
+    )
+  ]
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  group = report["stopEpisodes"][0]["resGroups"][0]
+  assert not group["sourceSequenceFullyObserved"]
+  assert not group["sourceTimestampsFreshSequential"]
+  assert group["emittedCountersFreshSequential"]
+  assert "fresh sequential source/emitted counters" not in report["stopEpisodes"][0]["reasons"][0]
+
+
+def test_stale_sources_and_duplicate_res_counters_are_direct_failure() -> None:
+  analyzer = run_demo("pass")
+  request_indices = [index for index, sample in enumerate(analyzer.buttons)
+                     if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL][:3]
+  request_times = [analyzer.buttons[index].t for index in request_indices]
+  source_indices = [next(
+    index for index, sample in enumerate(analyzer.buttons)
+    if sample.origin == "vehicle_rx"
+    and sample.address == CRUISE_BUTTONS_ALT_ADDRESS
+    and sample.t == request_time
+  ) for request_time in request_times]
+  source_counter = analyzer.buttons[source_indices[0]].counter
+  emitted_counter = analyzer.buttons[request_indices[0]].counter
+  for index in source_indices[1:]:
+    analyzer.buttons[index] = replace(analyzer.buttons[index], counter=source_counter)
+  for index in request_indices[1:]:
+    analyzer.buttons[index] = replace(analyzer.buttons[index], counter=emitted_counter)
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "FAIL"
+  group = report["stopEpisodes"][0]["resGroups"][0]
+  assert group["sourceSequenceFullyObserved"]
+  assert group["sourceTimestampsFreshSequential"]
+  assert group["sourcePlusOneAllFrames"]
+  assert group["sourceCounterDeltasMod256"] == [0, 0]
+  assert group["emittedCounterDeltasMod256"] == [0, 0]
+  assert not group["sourceCountersFreshSequential"]
+  assert not group["emittedCountersFreshSequential"]
+  assert "fresh sequential source/emitted counters" in report["stopEpisodes"][0]["reasons"][0]
+
+
+def test_duplicate_res_counter_with_fresh_sources_is_direct_failure() -> None:
+  analyzer = run_demo("pass")
+  request_indices = [index for index, sample in enumerate(analyzer.buttons)
+                     if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL][:3]
+  analyzer.buttons[request_indices[1]] = replace(
+    analyzer.buttons[request_indices[1]],
+    counter=analyzer.buttons[request_indices[0]].counter,
+  )
+
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "FAIL"
+  group = report["stopEpisodes"][0]["resGroups"][0]
+  assert group["sourceSequenceFullyObserved"]
+  assert group["sourceTimestampsFreshSequential"]
+  assert group["sourceCountersFreshSequential"]
+  assert group["emittedCounterDeltasMod256"][0] == 0
+  assert not group["emittedCountersFreshSequential"]
+  assert not group["sourcePlusOneAllFrames"]
+  assert "fresh sequential source/emitted counters" in report["stopEpisodes"][0]["reasons"][0]
+
+
+def test_fresh_source_and_emitted_counter_sequences_accept_mod256_wraparound() -> None:
+  report = run_demo("pass", button_counter_offset=129).report()
+
+  assert report["overallVerdict"] == "PASS"
+  group = report["stopEpisodes"][0]["resGroups"][0]
+  assert group["sourceCountersPerFrame"] == [254, 255, 0]
+  assert group["sourceCounterDeltasMod256"] == [1, 1]
+  assert group["sourceTimestampDeltasMs"] == [20.0, 20.0]
+  assert group["counters"] == [255, 0, 1]
+  assert group["emittedCounterDeltasMod256"] == [1, 1]
+  assert group["sourceCountersFreshSequential"]
+  assert group["sourceTimestampsFreshSequential"]
+  assert group["sourceSequenceFullyObserved"]
+  assert group["emittedCountersFreshSequential"]

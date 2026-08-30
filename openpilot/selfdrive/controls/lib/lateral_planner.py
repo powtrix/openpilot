@@ -12,7 +12,6 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 #from openpilot.selfdrive.controls.lib.lane_planner import LanePlanner
 from openpilot.selfdrive.controls.lib.lane_planner_2 import LanePlanner
-from collections import deque
 
 TRAJECTORY_SIZE = 33
 CAMERA_OFFSET = 0.04
@@ -42,6 +41,39 @@ def publish_offset_evidence(lateral_plan, static_path_offset, dynamic_lane_offse
   lateral_plan.pathBeforeStaticOffset = path_before_static_offset.tolist()
 
 
+def model_epoch_valid(md):
+  trajectory_values = (
+    md.position.x,
+    md.position.y,
+    md.position.z,
+    md.position.t,
+    md.orientation.x,
+    md.orientation.z,
+    md.orientationRate.z,
+    md.velocity.x,
+    md.velocity.y,
+    md.velocity.z,
+    md.acceleration.x,
+  )
+  lane_lines = list(md.laneLines)
+  road_edges = list(md.roadEdges)
+  if len(lane_lines) < 4 or len(road_edges) < 2 or \
+     len(md.laneLineProbs) < 4 or len(md.laneLineStds) < 4 or len(md.roadEdgeStds) < 2:
+    return False
+
+  lane_values = tuple(
+    values
+    for lane_line in lane_lines[:4]
+    for values in (lane_line.t, lane_line.x, lane_line.y)
+  )
+  edge_values = tuple(
+    values
+    for road_edge in road_edges[:2]
+    for values in (road_edge.t, road_edge.x, road_edge.y)
+  )
+  return all(len(values) == TRAJECTORY_SIZE for values in trajectory_values + lane_values + edge_values)
+
+
 class LateralPlanner:
   def __init__(self, CP, debug=False):
     #self.DH = DesireHelper()
@@ -52,7 +84,22 @@ class LateralPlanner:
     self.last_cloudlog_t = 0
     self.solution_invalid_cnt = 0
 
-    self.path_xyz = np.zeros((TRAJECTORY_SIZE, 3))
+    # LanePlanner and the static PathOffset both mutate their input in place.
+    # Keep both the raw model path and the complete pre-static result from the
+    # last valid model epoch. Invalid packets reuse the latter without parsing
+    # current lane/meta fields or advancing lane filters against stale geometry.
+    self.raw_model_path_xyz = np.zeros((TRAJECTORY_SIZE, 3))
+    self.path_xyz = self.raw_model_path_xyz.copy()
+    self.last_valid_pre_static_path_xyz = self.raw_model_path_xyz.copy()
+    self.last_valid_plan_yaw = np.zeros((TRAJECTORY_SIZE,))
+    self.last_valid_plan_yaw_rate = np.zeros((TRAJECTORY_SIZE,))
+    self.last_valid_lanelines_active = False
+    self.model_mono_time = 0
+    self.model_epoch_available = False
+    self.model_epoch_current_valid = False
+    self.model_desire = log.Desire.none
+    self.model_lane_change_state = log.LaneChangeState.off
+    self.model_lane_change_direction = log.LaneChangeDirection.none
     self.velocity_xyz = np.zeros((TRAJECTORY_SIZE, 3))
     self.v_plan = np.zeros((TRAJECTORY_SIZE,))
     self.x_sol = np.zeros((TRAJECTORY_SIZE, 4), dtype=np.float32)
@@ -73,6 +120,7 @@ class LateralPlanner:
 
     self.useLaneLineSpeedApply = self.params.get_int("UseLaneLineSpeed")
     self.pathOffset = float(self.params.get_int("PathOffset")) * 0.01
+    self.appliedPathOffset = 0.0
     self.useLaneLineMode = False
     self.plan_a = np.zeros((TRAJECTORY_SIZE, ))
     self.plan_yaw = np.zeros((TRAJECTORY_SIZE,))
@@ -114,12 +162,14 @@ class LateralPlanner:
     self.v_ego = v_ego_car
     self.curve_speed = sm['carrotMan'].vTurnSpeed
 
-    # Parse model predictions
+    # Parse one complete model epoch. If any trajectory/lane input is
+    # incomplete, freeze the last pre-static plan instead of combining current
+    # lane/meta values with stale trajectory state.
     md = sm['modelV2']
-    model_active = False
-    if len(md.position.x) == TRAJECTORY_SIZE and len(md.orientation.x) == TRAJECTORY_SIZE:
-      model_active = True
-      self.path_xyz = np.column_stack([md.position.x, md.position.y, md.position.z])
+    model_active = model_epoch_valid(md)
+    self.model_epoch_current_valid = model_active
+    if model_active:
+      self.raw_model_path_xyz = np.column_stack([md.position.x, md.position.y, md.position.z])
       self.t_idxs = np.array(md.position.t)
       self.plan_yaw = np.array(md.orientation.z)
       self.plan_yaw_rate = np.array(md.orientationRate.z)
@@ -136,45 +186,64 @@ class LateralPlanner:
         if self.lanemode_possible_count > int(1/DT_MDL):
           self.laneless_only = False
 
-    # Parse model predictions
-    self.LP.parse_model(md)
-    #lane_change_prob = self.LP.l_lane_change_prob + self.LP.r_lane_change_prob
-    #self.DH.update(sm['carState'], md, sm['carControl'].latActive, lane_change_prob, sm)
+      self.model_mono_time = int(sm.logMonoTime['modelV2'])
+      self.model_desire = md.meta.desire
+      self.model_lane_change_state = md.meta.laneChangeState
+      self.model_lane_change_direction = md.meta.laneChangeDirection
 
-    if self.useLaneLineSpeedApply == 0 or self.laneless_only:
-      self.useLaneLineMode = False
-    elif speed_kph >= self.useLaneLineSpeedApply + 2:
-      self.useLaneLineMode = True
-    elif speed_kph < self.useLaneLineSpeedApply - 2:
-      self.useLaneLineMode = False
+      self.path_xyz = self.raw_model_path_xyz.copy()
+      self.LP.parse_model(md)
+      #lane_change_prob = self.LP.l_lane_change_prob + self.LP.r_lane_change_prob
+      #self.DH.update(sm['carState'], md, sm['carControl'].latActive, lane_change_prob, sm)
 
-    # Turn off lanes during lane change
-    #if self.DH.desire == log.Desire.laneChangeRight or self.DH.desire == log.Desire.laneChangeLeft:
-      
-    if md.meta.desire != log.Desire.none or carrot.atc_active:
-      self.LP.lane_change_multiplier = 0.0 #md.meta.laneChangeProb
-    else:
-      self.LP.lane_change_multiplier = 1.0
+      if self.useLaneLineSpeedApply == 0 or self.laneless_only:
+        self.useLaneLineMode = False
+      elif speed_kph >= self.useLaneLineSpeedApply + 2:
+        self.useLaneLineMode = True
+      elif speed_kph < self.useLaneLineSpeedApply - 2:
+        self.useLaneLineMode = False
 
-    # lanelines calculation?
-    self.LP.lanefull_mode = self.useLaneLineMode
-    self.LP.lane_width_left = md.meta.laneWidthLeft
-    self.LP.lane_width_right = md.meta.laneWidthRight
-    self.LP.curvature = measured_curvature
-    self.path_xyz, self.lanelines_active = self.LP.get_d_path(sm['carState'], v_ego_car, self.t_idxs, self.path_xyz, self.curve_speed)
+      # Turn off lanes during lane change
+      #if self.DH.desire == log.Desire.laneChangeRight or self.DH.desire == log.Desire.laneChangeLeft:
 
-    if self.lanelines_active:
-      self.plan_yaw, self.plan_yaw_rate = yaw_from_path_no_scipy(
-        self.path_xyz, self.v_plan,
-        smooth_window=5,
-        clip_rate=2.0,
-        align_first_yaw=None #md.orientation.z[0]  # 초기 정렬
+      if self.model_desire != log.Desire.none or carrot.atc_active:
+        self.LP.lane_change_multiplier = 0.0 #md.meta.laneChangeProb
+      else:
+        self.LP.lane_change_multiplier = 1.0
+
+      # lanelines calculation?
+      self.LP.lanefull_mode = self.useLaneLineMode
+      self.LP.lane_width_left = md.meta.laneWidthLeft
+      self.LP.lane_width_right = md.meta.laneWidthRight
+      self.LP.curvature = measured_curvature
+      self.path_xyz, self.lanelines_active = self.LP.get_d_path(
+        sm['carState'], v_ego_car, self.t_idxs, self.path_xyz, self.curve_speed,
       )
-      
+
+      if self.lanelines_active:
+        self.plan_yaw, self.plan_yaw_rate = yaw_from_path_no_scipy(
+          self.path_xyz, self.v_plan,
+          smooth_window=5,
+          clip_rate=2.0,
+          align_first_yaw=None #md.orientation.z[0]  # 초기 정렬
+        )
+
+      self.last_valid_pre_static_path_xyz = self.path_xyz.copy()
+      self.last_valid_plan_yaw = self.plan_yaw.copy()
+      self.last_valid_plan_yaw_rate = self.plan_yaw_rate.copy()
+      self.last_valid_lanelines_active = self.lanelines_active
+      self.model_epoch_available = True
+    else:
+      self.path_xyz = self.last_valid_pre_static_path_xyz.copy()
+      self.plan_yaw = self.last_valid_plan_yaw.copy()
+      self.plan_yaw_rate = self.last_valid_plan_yaw_rate.copy()
+      self.lanelines_active = self.last_valid_lanelines_active
+
     self.latDebugText = self.LP.debugText
     #self.lanelines_active = True if self.LP.d_prob > 0.3 and self.LP.lanefull_mode else False
 
-    self.path_before_static_offset = apply_static_path_offset(self.path_xyz, self.pathOffset)
+    self.appliedPathOffset = self.pathOffset if self.lanelines_active else 0.0
+    self.path_before_static_offset = apply_static_path_offset(self.path_xyz, self.appliedPathOffset)
 
     self.lat_mpc.set_weights(self.lateralPathCost, self.lateralMotionCost,
                              LATERAL_ACCEL_COST, LATERAL_JERK_COST,
@@ -215,13 +284,15 @@ class LateralPlanner:
       self.solution_invalid_cnt += 1
     else:
       self.solution_invalid_cnt = 0
-  
+
     self.x_sol = self.lat_mpc.x_sol
 
   def publish(self, sm, pm, carrot):
     plan_solution_valid = self.solution_invalid_cnt < 2
     plan_send = messaging.new_message('lateralPlan')
-    plan_send.valid = sm.all_checks(service_list=['carState', 'controlsState', 'modelV2'])
+    plan_valid = (self.model_epoch_current_valid and self.model_epoch_available and
+                  sm.all_checks(service_list=['carState', 'controlsState', 'modelV2']))
+    plan_send.valid = plan_valid
     if not plan_send.valid:
       #print("lateralPlan_valid=", sm.valid)
       #print("lateralPlan_alive=", sm.alive)
@@ -230,12 +301,12 @@ class LateralPlanner:
       pass
 
     lateralPlan = plan_send.lateralPlan
-    lateralPlan.modelMonoTime = sm.logMonoTime['modelV2']
+    lateralPlan.modelMonoTime = self.model_mono_time
     lateralPlan.dPathPoints = self.y_pts.tolist()
     publish_offset_evidence(
       lateralPlan,
-      self.pathOffset,
-      self.LP.offset_total,
+      self.appliedPathOffset if plan_valid else 0.0,
+      self.LP.offset_total if plan_valid else 0.0,
       self.path_before_static_offset[:LAT_MPC_N + 1],
     )
     lateralPlan.psis = self.lat_mpc.x_sol[0:CONTROL_N, 2].tolist()
@@ -259,12 +330,12 @@ class LateralPlanner:
       lateralPlan.solverState.u = self.lat_mpc.u_sol.flatten().tolist()
 
     #lateralPlan.desire = self.DH.desire
-    lateralPlan.useLaneLines = self.lanelines_active
+    lateralPlan.useLaneLines = plan_valid and self.lanelines_active
     # DesireHelper runs in modeld in this branch. Mirror its published model
     # metadata into lateralPlan so compact HUD clients receive the same manual
     # and automatic lane-change state used by the on-road UI.
-    lateralPlan.laneChangeState = sm['modelV2'].meta.laneChangeState
-    lateralPlan.laneChangeDirection = sm['modelV2'].meta.laneChangeDirection
+    lateralPlan.laneChangeState = self.model_lane_change_state
+    lateralPlan.laneChangeDirection = self.model_lane_change_direction
     lateralPlan.laneWidth = float(self.LP.lane_width)
 
     #plan_send.lateralPlan.dPathWLinesX = [float(x) for x in self.d_path_w_lines_xyz[:, 0]]
@@ -314,7 +385,7 @@ def yaw_from_path_no_scipy(path_xyz, v_plan, smooth_window=5,
   # 저속(≤6 m/s)에서는 창을 크게
   if v0 <= 6.0:
     smooth_window = max(smooth_window, 9)   # 9~11 권장
-    
+
   N = path_xyz.shape[0]
   x = path_xyz[:, 0].astype(float)
   y = path_xyz[:, 1].astype(float)

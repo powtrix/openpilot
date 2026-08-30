@@ -25,6 +25,7 @@
 // CAN-FD only safety modes
 #ifdef CANFD
 #include "safety/safety_hyundai_canfd.h"
+#include "safety/safety_hyundai_canfd_buttons.h"
 #include "safety/safety_volkswagen_meb.h"  // MEB is CAN-FD only (ESC_51 48B, Motor_51 32B)
 #endif
 
@@ -262,7 +263,28 @@ bool safety_tx_hook(CANPacket_t *to_send) {
     allowed = true;
   }
 
-  const bool safety_allowed = current_hooks->tx(to_send);
+  // Hyundai CAN-FD has two cruise-button payloads. Enforce the same
+  // engagement-aware, valid-button-only policy before the platform hook runs;
+  // this also prevents a rejected 0x1AA from entering its buffered-forward
+  // queue as a side effect.
+  bool mode_allowed = true;
+#ifdef CANFD
+  if ((current_safety_mode == SAFETY_HYUNDAI_CANFD) && !hyundai_camera_scc) {
+    // Use the latched *_prev states, matching Panda's existing TX safety
+    // convention. This prevents a later SCC cruise-state RX from reopening
+    // RES/SET while a gas, brake, or regen input remains held.
+    // Camera-SCC paths continuously clone the full physical switch payload,
+    // including NONE and standalone MAIN/LFA controls. Their existing broad
+    // passthrough contract cannot use this synthesized-command-only gate.
+    mode_allowed = hyundai_canfd_button_tx_allowed(to_send, controls_allowed, cruise_engaged_prev,
+                                                   gas_pressed_prev, brake_pressed_prev, regen_braking_prev);
+  }
+#endif
+  // Never run a platform TX hook for a packet rejected by the active
+  // topology allowlist. Some hooks intentionally update replacement/queue
+  // state after accepting a packet, so executing them before this gate can
+  // let a packet that never reached the bus affect later forwarding.
+  const bool safety_allowed = allowed && mode_allowed && current_hooks->tx(to_send);
 
   /*
   int addr = GET_ADDR(to_send);
