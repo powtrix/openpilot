@@ -35,6 +35,7 @@ def build_controller():
   controller.stock_scc_last_keepalive_frame = None
   controller.activateCruise = 0
   controller.last_button_frame = 0
+  controller.last_cancel_frame = -1_000_000
   controller.button_wait = 12
   controller.button_spam1 = 8
   controller.button_spam2 = 30
@@ -66,12 +67,14 @@ def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd
     buttons_counter=0,
     cruise_buttons_msg=None,
     cruise_buttons=deque([Buttons.NONE]),
+    main_buttons=deque([Buttons.NONE]),
     out=SimpleNamespace(
       standstill=True,
       brakePressed=brake_pressed,
       gasPressed=gas_pressed,
       brakeHoldActive=brake_hold_active,
       parkingBrake=parking_brake,
+      accFaulted=False,
       activateCruise=False,
       vEgo=0.0,
       cruiseState=SimpleNamespace(enabled=True, speed=80 / 3.6),
@@ -171,7 +174,7 @@ def test_ka4_stock_scc_rearm_requires_safe_stationary_lead(state_kwargs):
   assert not controller.stock_scc_keepalive_pending
 
 
-@pytest.mark.parametrize("relative_speed", [-2.0, 0.3, 0.5])
+@pytest.mark.parametrize("relative_speed", [-0.5, 0.3, 0.5])
 def test_ka4_stock_scc_rearm_allows_non_departing_relative_speed(relative_speed):
   controller = build_controller()
   CC = build_control()
@@ -182,6 +185,17 @@ def test_ka4_stock_scc_rearm_allows_non_departing_relative_speed(relative_speed)
   assert controller.stock_scc_keepalive_pending
 
 
+@pytest.mark.parametrize("relative_speed", [-2.0, -0.6, 0.6, 2.0])
+def test_ka4_stock_scc_rearm_rejects_moving_lead_in_either_direction(relative_speed):
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(acc_obj_rel_spd=relative_speed)
+
+  enter_standstill_warning(controller, CC, CS)
+
+  assert not controller.stock_scc_keepalive_pending
+
+
 def test_ka4_stock_scc_rearm_cancels_on_driver_button():
   controller = build_controller()
   CC = build_control()
@@ -190,6 +204,54 @@ def test_ka4_stock_scc_rearm_cancels_on_driver_button():
 
   enter_standstill_warning(controller, CC, CS)
 
+  assert not controller.stock_scc_keepalive_pending
+
+
+def test_ka4_stock_scc_rearm_cancels_on_main_button():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state()
+  CS.main_buttons[-1] = 1
+
+  enter_standstill_warning(controller, CC, CS)
+
+  assert not controller.stock_scc_keepalive_pending
+
+
+def test_ka4_stock_scc_rearm_cancels_on_acc_fault():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state()
+  CS.out.accFaulted = True
+
+  enter_standstill_warning(controller, CC, CS)
+
+  assert not controller.stock_scc_keepalive_pending
+
+
+@pytest.mark.parametrize(("signal", "value"), [
+  ("CRUISE_BUTTONS", Buttons.SET_DECEL),
+  ("ADAPTIVE_CRUISE_MAIN_BTN", 1),
+  ("NORMAL_CRUISE_MAIN_BTN", 1),
+  ("LFA_BTN", 1),
+])
+def test_ka4_alt_rearm_vetoes_raw_source_button_even_if_deque_is_stale(signal, value):
+  controller = build_controller()
+  controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
+  CC = build_control()
+  CS = build_state()
+  CS.cruise_buttons_msg = {
+    "COUNTER": 17,
+    "CRUISE_BUTTONS": Buttons.NONE,
+    "ADAPTIVE_CRUISE_MAIN_BTN": 0,
+    "NORMAL_CRUISE_MAIN_BTN": 0,
+    "LFA_BTN": 0,
+    signal: value,
+  }
+
+  enter_standstill_warning(controller, CC, CS)
+
+  assert CS.cruise_buttons[-1] == Buttons.NONE
   assert not controller.stock_scc_keepalive_pending
 
 
@@ -408,6 +470,84 @@ def test_keepalive_button_is_not_duplicated_by_button_spam_setting():
   assert messages[0][0] == "CRUISE_BUTTONS"
   assert messages[0][2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
   assert not controller.stock_scc_keepalive_sent
+
+
+@pytest.mark.parametrize("alt_buttons", [False, True])
+def test_software_cancel_preempts_keepalive_quiet_period(alt_buttons):
+  controller = build_controller()
+  if alt_buttons:
+    controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
+  CC = build_control()
+  CS = build_state()
+  if alt_buttons:
+    CS.cruise_buttons_msg = {
+      "COUNTER": 17,
+      "CRUISE_BUTTONS": Buttons.NONE,
+      "ADAPTIVE_CRUISE_MAIN_BTN": 0,
+      "NORMAL_CRUISE_MAIN_BTN": 0,
+      "LFA_BTN": 0,
+    }
+  enter_standstill_warning(controller, CC, CS)
+
+  assert resume_message_sent(controller.create_button_messages(CC, CS, use_clu11=False))
+  controller.frame += 1
+  CC.cruiseControl.cancel = True
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  messages = controller.create_button_messages(CC, CS, use_clu11=False)
+
+  cancel_messages = [message for message in messages if message[2]["CRUISE_BUTTONS"] == Buttons.CANCEL]
+  assert not resume_message_sent(messages)
+  assert len(cancel_messages) == (1 if alt_buttons else 20)
+  assert controller.last_button_frame == controller.frame
+
+
+@pytest.mark.parametrize("alt_buttons", [False, True])
+def test_software_cancel_preempts_keepalive_after_movement_reset(alt_buttons):
+  controller = build_controller()
+  if alt_buttons:
+    controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
+  CC = build_control()
+  CS = build_state()
+  if alt_buttons:
+    CS.cruise_buttons_msg = {
+      "COUNTER": 17,
+      "CRUISE_BUTTONS": Buttons.NONE,
+      "ADAPTIVE_CRUISE_MAIN_BTN": 0,
+      "NORMAL_CRUISE_MAIN_BTN": 0,
+      "LFA_BTN": 0,
+    }
+  enter_standstill_warning(controller, CC, CS)
+
+  assert resume_message_sent(controller.create_button_messages(CC, CS, use_clu11=False))
+  controller.frame += 1
+  CS.out.standstill = False
+  CS.out.vEgo = 0.2
+  CC.cruiseControl.cancel = True
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  messages = controller.create_button_messages(CC, CS, use_clu11=False)
+
+  cancel_messages = [message for message in messages if message[2]["CRUISE_BUTTONS"] == Buttons.CANCEL]
+  assert not resume_message_sent(messages)
+  assert len(cancel_messages) == (1 if alt_buttons else 20)
+  assert controller.last_cancel_frame == controller.frame
+
+
+def test_software_cancel_repeat_rate_is_independent_of_keepalive_state():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state()
+  CC.cruiseControl.cancel = True
+
+  controller.frame = 1
+  first_messages = controller.create_button_messages(CC, CS, use_clu11=False)
+  assert len(first_messages) == 20
+
+  for frame in range(2, 12):
+    controller.frame = frame
+    assert controller.create_button_messages(CC, CS, use_clu11=False) == []
+
+  controller.frame = 12
+  assert len(controller.create_button_messages(CC, CS, use_clu11=False)) == 20
 
 
 @pytest.mark.parametrize("list_values", [False, True])

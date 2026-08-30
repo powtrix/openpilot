@@ -55,7 +55,7 @@ KA4_STOCK_SCC_KEEPALIVE_REQUEST_TIMEOUT = 0.5
 KA4_STOCK_SCC_POST_KEEPALIVE_BUTTON_QUIET = 0.25
 KA4_STOCK_SCC_KEEPALIVE_PRESS_FRAMES = 3
 KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE = 20.0
-KA4_STOCK_SCC_MAX_DEPARTURE_SPEED = 0.5
+KA4_STOCK_SCC_MAX_ABS_REL_SPEED = 0.5
 KA4_STOCK_SCC_VALID_LEAD_STATE = 2
 # Some CAN-FD SCC implementations need a higher lower-jerk limit to follow sustained
 # deceleration requests. Keep the historical MPC-jerk limit as the default and blend
@@ -211,6 +211,7 @@ class CarController(CarControllerBase):
 
     self.activateCruise = 0
     self.button_wait = 12
+    self.last_cancel_frame = -1_000_000
     self.cruise_buttons_msg_values = None
     self.cruise_buttons_msg_cnt = 0
     self.button_spamming_count = 0
@@ -679,23 +680,29 @@ class CarController(CarControllerBase):
           self.cruise_buttons_msg_values = cruise_buttons_msg_values
           self.cruise_buttons_msg_cnt = 0
 
-      if (self.frame - self.last_button_frame) * DT_CTRL > 0.25:
-        # cruise cancel
-        if CC.cruiseControl.cancel:
-          if (self.frame - self.last_button_frame) * DT_CTRL > 0.1:
-            print("cruiseControl.cancel222222")
-            if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
-              #can_sends.append(hyundaicanfd.create_acc_cancel(self.packer, self.CP, self.CAN, CS.scc_control))
-              if self.cruise_buttons_msg_values is not None:
-                can_sends.append(hyundaicanfd.alt_cruise_buttons(self.packer, self.CP, self.CAN, Buttons.CANCEL, self.cruise_buttons_msg_values, self.cruise_buttons_msg_cnt))
+      button_elapsed = (self.frame - self.last_button_frame) * DT_CTRL
+      # CANCEL has its own repeat limiter so a preceding RES or a standstill
+      # state reset can never delay the first safety-critical cancel frame.
+      cancel_allowed = (self.frame - self.last_cancel_frame) * DT_CTRL > 0.1
+      if CC.cruiseControl.cancel and cancel_allowed:
+        print("cruiseControl.cancel222222")
+        if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
+          #can_sends.append(hyundaicanfd.create_acc_cancel(self.packer, self.CP, self.CAN, CS.scc_control))
+          if self.cruise_buttons_msg_values is not None:
+            can_sends.append(hyundaicanfd.alt_cruise_buttons(
+              self.packer, self.CP, self.CAN, Buttons.CANCEL,
+              self.cruise_buttons_msg_values, self.cruise_buttons_msg_cnt,
+            ))
+        else:
+          for _ in range(20):
+            can_sends.append(hyundaicanfd.create_buttons(self.packer, self.CP, self.CAN, CS.buttons_counter+1, Buttons.CANCEL))
+        if can_sends:
+          self.last_cancel_frame = self.frame
+          self.last_button_frame = self.frame
 
-            else:
-              for _ in range(20):
-                can_sends.append(hyundaicanfd.create_buttons(self.packer, self.CP, self.CAN, CS.buttons_counter+1, Buttons.CANCEL))
-            self.last_button_frame = self.frame
-
+      elif button_elapsed > 0.25:
         # cruise standstill resume
-        elif False: #CC.cruiseControl.resume:
+        if False: #CC.cruiseControl.resume:
           if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
             # TODO: resume for alt button cars
             pass
@@ -876,9 +883,18 @@ class CarController(CarControllerBase):
     info_display_active = info_display == 4
     cruise_session_active = CC.enabled and CS.out.cruiseState.enabled
     driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
+    driver_main_button_pressed = bool(getattr(CS, "main_buttons", ()) and CS.main_buttons[-1] != Buttons.NONE)
+    raw_button_input = False
+    if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and CS.cruise_buttons_msg is not None:
+      for signal in ("CRUISE_BUTTONS", "ADAPTIVE_CRUISE_MAIN_BTN", "NORMAL_CRUISE_MAIN_BTN", "LFA_BTN"):
+        value = CS.cruise_buttons_msg.get(signal, 0)
+        if isinstance(value, (list, tuple, deque)):
+          value = value[0] if value else 0
+        raw_button_input |= int(value) != 0
     interlock_active = (
       CS.out.brakePressed or CS.out.gasPressed or CS.out.brakeHoldActive or CS.out.parkingBrake or
-      driver_button_pressed or CC.cruiseControl.cancel
+      getattr(CS.out, "accFaulted", False) or driver_button_pressed or driver_main_button_pressed or raw_button_input or
+      CC.cruiseControl.cancel
     )
     if not info_display_active:
       self.stock_scc_warning_recovery_sent = False
@@ -895,7 +911,7 @@ class CarController(CarControllerBase):
       scc_control.get("TakeOverReq", 0) == 0 and
       scc_control.get("HUD_LEAD_INFO", 0) == KA4_STOCK_SCC_VALID_LEAD_STATE and
       0.0 < scc_control.get("ACC_ObjDist", 0.0) <= KA4_STOCK_SCC_MAX_STOPPED_LEAD_DISTANCE and
-      scc_control.get("ACC_ObjRelSpd", 0.0) <= KA4_STOCK_SCC_MAX_DEPARTURE_SPEED
+      abs(scc_control.get("ACC_ObjRelSpd", 0.0)) <= KA4_STOCK_SCC_MAX_ABS_REL_SPEED
     )
 
     # Do not consume the 30-second window while the car is parked or stopped
