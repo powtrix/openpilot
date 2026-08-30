@@ -243,6 +243,7 @@ class CarController(CarControllerBase):
     self.camera_scc_params = Params().get_int("HyundaiCameraSCC")
     self.is_ldws_car = Params().get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
+    self.ka4_stock_scc_standstill_rearm = Params().get_int("Ka4StockSccStandstillRearm") > 0
 
     self.stock_scc_stop_start_frame = None
     self.stock_scc_stopped_lead_frames = 0
@@ -300,6 +301,7 @@ class CarController(CarControllerBase):
       self.canfd_debug = params.get_int("CanfdDebug")
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
+      self.ka4_stock_scc_standstill_rearm = params.get_int("Ka4StockSccStandstillRearm") > 0
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -861,6 +863,7 @@ class CarController(CarControllerBase):
     takeover interlocks.
     """
     supported = (
+      self.ka4_stock_scc_standstill_rearm and
       self.CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN and
       self.CP.pcmCruise and
       not self.CP.openpilotLongitudinalControl and

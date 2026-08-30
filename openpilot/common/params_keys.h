@@ -313,6 +313,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"IsLdwsCar", {PERSISTENT, INT, "0"}},
     {"CanfdHDA2", {PERSISTENT, INT, "0"}},
     {"CanfdDebug", {PERSISTENT, INT, "0"}},
+    // Hidden A/B switch for validating the KA4 stock-SCC 30-second re-arm.
+    // Default-on preserves the requested behavior; 0 isolates the OEM/HDA
+    // state-preservation path without installing a different build.
+    {"Ka4StockSccStandstillRearm", {PERSISTENT | DEVELOPMENT_ONLY, INT, "1"}},
 
     {"SoundVolumeAdjust", {PERSISTENT, INT, "100"}},
     {"SoundVolumeAdjustEngage", {PERSISTENT, INT, "10"}},

@@ -33,6 +33,7 @@ def build_controller():
   controller.stock_scc_warning_recovery_sent = False
   controller.stock_scc_keepalive_sent = False
   controller.stock_scc_last_keepalive_frame = None
+  controller.ka4_stock_scc_standstill_rearm = True
   controller.activateCruise = 0
   controller.last_button_frame = 0
   controller.last_cancel_frame = -1_000_000
@@ -136,6 +137,19 @@ def test_ka4_stock_scc_warning_requests_short_resume_press():
 
   assert not controller.stock_scc_keepalive_pending
   assert controller.make_spam_button(CC, CS) == Buttons.NONE
+
+
+def test_ka4_stock_scc_validation_switch_isolates_oem_behavior():
+  controller = build_controller()
+  controller.ka4_stock_scc_standstill_rearm = False
+  CC = build_control()
+  CS = build_state()
+
+  enter_standstill_warning(controller, CC, CS)
+
+  assert controller.stock_scc_stop_start_frame is None
+  assert not controller.stock_scc_keepalive_pending
+  assert controller.create_button_messages(CC, CS, use_clu11=False) == []
 
 
 @pytest.mark.parametrize("warning_frame, expected", [(2698, True), (2699, False), (2700, False), (3000, False)])
