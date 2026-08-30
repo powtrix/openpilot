@@ -133,7 +133,7 @@ class CarrotPlanner:
     self.jerk_factor = 1.0
     self.jerk_factor_apply = 1.0
 
-    self.j_lead_factor = 0.0
+    self.lead_response_mode = 0
 
     self.activeCarrot = 0
     self.xDistToTurn = 0
@@ -180,7 +180,9 @@ class CarrotPlanner:
       self.cruiseMaxVals6 = self.params.get_float("CruiseMaxVals6") / 100.
     elif self.params_count == 40:
       self.stop_distance = self.params.get_float("StopDistanceCarrot") / 100.
-      self.j_lead_factor = self.params.get_float("JLeadFactor3") / 100.
+      self.lead_response_mode = int(np.clip(
+        self.params.get_int("LeadResponseMode"), 0, 2,
+      ))
       self.eco_over_speed = self.params.get_int("CruiseEcoControl")
       self.autoNaviSpeedDecelRate = float(self.params.get_int("AutoNaviSpeedDecelRate")) * 0.01
       self.aChangeCostStarting = self.params.get_float("AChangeCostStarting")
@@ -291,8 +293,7 @@ class CarrotPlanner:
     tf_adjusted = self._apply_decel_hold_and_boost_t_follow(tf_target, a_ego)
     tf_safe = float(tf_adjusted * self.mySafeFactor)
     tf_final = self._clip_t_follow(tf_safe)
-    self._tf_applied = float(tf_final)
-    return self.apply_t_follow(tf_final)
+    return float(tf_final)
 
 
   def _update_model_desire(self, sm):
@@ -328,7 +329,7 @@ class CarrotPlanner:
 
       t_follow = np.clip(t_follow, 0.3, 2.0)
 
-    return self.apply_t_follow(t_follow, 0.0)
+    return float(t_follow)
 
 
   def apply_t_follow(self, t_follow, adjust_t_follow=0.0):
@@ -337,6 +338,7 @@ class CarrotPlanner:
     t_follow = ramp_t_follow(t_follow, self.t_follow_last, self._tf_decel_extra, DT_MDL)
 
     self.t_follow_last = float(t_follow)
+    self._tf_applied = float(t_follow)
     return float(t_follow + adjust_t_follow)
 
   def update_stop_dist(self, stop_x):
