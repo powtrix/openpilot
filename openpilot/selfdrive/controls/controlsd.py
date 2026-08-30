@@ -42,6 +42,12 @@ LAT_CURVATURE_SATURATION_ACCEL = 0.1  # infiniteCable2 LatControlCurvature: ъ│бы
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
 
+def lane_mode_control_enabled(use_lane_lines: bool, v_turn_speed: int, curve_speed_threshold: int) -> bool:
+  curve_speed_abs = abs(v_turn_speed)
+  # Zero means no curve, not a curve-speed estimate below the configured threshold.
+  return use_lane_lines and (curve_speed_abs == 0 or curve_speed_abs > curve_speed_threshold)
+
+
 class Controls:
   def __init__(self) -> None:
     self.params = Params()
@@ -167,8 +173,9 @@ class Controls:
 
     # Steering PID loop and lateral MPC
     lat_plan = self.sm['lateralPlan']
-    curve_speed_abs = abs(self.sm['carrotMan'].vTurnSpeed)
-    self.lanefull_mode_enabled = (lat_plan.useLaneLines and curve_speed_abs > self.params.get_int("UseLaneLineCurveSpeed"))
+    self.lanefull_mode_enabled = lane_mode_control_enabled(lat_plan.useLaneLines,
+                                                          self.sm['carrotMan'].vTurnSpeed,
+                                                          self.params.get_int("UseLaneLineCurveSpeed"))
     lat_smooth_seconds = self.params.get_float("LatSmoothSec") * 0.01
     steer_actuator_delay = self.params.get_float("SteerActuatorDelay") * 0.01
     if steer_actuator_delay == 0.0:
