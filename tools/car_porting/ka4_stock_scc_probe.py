@@ -284,6 +284,7 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
   fingerprint = str(_safe_get(cp, "carFingerprint", ""))
   pcm_cruise = bool(_safe_get(cp, "pcmCruise", False))
   openpilot_long = bool(_safe_get(cp, "openpilotLongitudinalControl", False))
+  canfd_hda2 = bool(flags & int(HyundaiFlags.CANFD_HDA2))
   safety_configs = []
   safety_canfd_alt_buttons = False
   for cfg in _safe_get(cp, "safetyConfigs", ()) or ():
@@ -311,6 +312,7 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
     "openpilotLongitudinalControl": openpilot_long,
     "alphaLongitudinalAvailable": bool(_safe_get(cp, "alphaLongitudinalAvailable", False)),
     "autoResumeSng": bool(_safe_get(cp, "autoResumeSng", False)),
+    "canFdHda2": canfd_hda2,
     "flags": flags,
     "flagsHex": f"0x{flags:X}",
     "flagNames": _flag_names(HyundaiFlags, flags),
@@ -318,6 +320,7 @@ def summarize_car_params(cp: Any) -> dict[str, Any]:
     "extFlagsHex": f"0x{ext_flags:X}",
     "extFlagNames": _flag_names(HyundaiExtFlags, ext_flags),
     "safetyConfigs": safety_configs,
+    "pandaBusOffset": 4 * max(0, len(safety_configs) - 1),
     "ka4StockSccGate": gate,
     "ka4StockSccGatePassed": all(gate.values()),
   }
@@ -870,10 +873,12 @@ class ProbeAnalyzer:
     episode_groups = [group for group in res_groups if start_rel <= group["start"] <= end_rel]
     duration = end - start
 
-    raw_alt_bus0 = [sample for sample in self.buttons if start <= sample.t <= end and
-                    sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS and sample.bus == 0]
-    raw_standard_bus0 = [sample for sample in self.buttons if start <= sample.t <= end and
-                         sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ADDRESS and sample.bus == 0]
+    raw_alt_stock_bus = [sample for sample in self.buttons if start <= sample.t <= end and
+                         sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ALT_ADDRESS and
+                         sample.bus == stock_bus]
+    raw_standard_stock_bus = [sample for sample in self.buttons if start <= sample.t <= end and
+                              sample.origin == "vehicle_rx" and sample.address == CRUISE_BUTTONS_ADDRESS and
+                              sample.bus == stock_bus]
     rearm_requests = [sample for sample in self.buttons if start <= sample.t <= end and
                       sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL]
 
@@ -882,12 +887,12 @@ class ProbeAnalyzer:
     no_interlock = [sample for sample in states if not sample.interlock_active]
     enabled_controls = [sample for sample in controls if sample.enabled]
     control_cancel_clear = bool(controls) and all(not sample.cancel for sample in controls)
-    raw_driver_buttons_clear = bool(raw_alt_bus0) and all(
+    raw_driver_buttons_clear = bool(raw_alt_stock_bus) and all(
       sample.button == BUTTON_NONE
       and sample.adaptive_main == 0
       and sample.normal_main == 0
       and sample.lfa_button == 0
-      for sample in raw_alt_bus0
+      for sample in raw_alt_stock_bus
     )
     warning_periods = self._warning_periods(scc, start)
     first_warning = warning_periods[0]["startAfterStop"] if warning_periods else None
@@ -940,16 +945,33 @@ class ProbeAnalyzer:
     all_tx_returned = bool(episode_groups) and all(group["allReturned"] for group in episode_groups)
     any_rejected = any(group["statuses"].get("rejected", 0) for group in episode_groups)
     all_scc_crc_valid = bool(scc) and all(sample.checksum_valid is True for sample in scc)
-    all_raw_button_crc_valid = bool(raw_alt_bus0) and all(sample.checksum_valid is True for sample in raw_alt_bus0)
+    all_raw_button_crc_valid = bool(raw_alt_stock_bus) and all(
+      sample.checksum_valid is True for sample in raw_alt_stock_bus
+    )
     all_rearm_crc_valid = bool(episode_groups) and all(group["allRequestChecksumsValid"] for group in episode_groups)
     source_plus_one = bool(episode_groups) and all(group["sourcePlusOneAllFrames"] for group in episode_groups)
     stock_fields_preserved = bool(episode_groups) and all(
       group["latestStockNonButtonFieldsPreserved"] for group in episode_groups)
-    exact_alt_layout = (
-      bool(raw_alt_bus0)
-      and not raw_standard_bus0
+    panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
+    canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
+    expected_send_bus = stock_bus if canfd_hda2 else panda_bus_offset + 2
+    send_bus_matches = (
+      expected_send_bus is not None
       and bool(rearm_requests)
-      and all(request.address == CRUISE_BUTTONS_ALT_ADDRESS and request.bus == 2 for request in rearm_requests)
+      and all(request.bus == expected_send_bus for request in rearm_requests)
+    )
+    same_safety_panda = (
+      stock_bus is not None
+      and stock_bus // 4 == panda_bus_offset // 4
+      and bool(rearm_requests)
+      and all(request.bus // 4 == panda_bus_offset // 4 for request in rearm_requests)
+    )
+    exact_alt_layout = (
+      bool(raw_alt_stock_bus)
+      and not raw_standard_stock_bus
+      and send_bus_matches
+      and same_safety_panda
+      and all(request.address == CRUISE_BUTTONS_ALT_ADDRESS for request in rearm_requests)
     )
 
     # Look just beyond the final standstill sample. Capping this window at
@@ -969,7 +991,7 @@ class ProbeAnalyzer:
     )
     direct_crc_failure = (
       any(sample.checksum_valid is False for sample in scc)
-      or any(sample.checksum_valid is False for sample in raw_alt_bus0)
+      or any(sample.checksum_valid is False for sample in raw_alt_stock_bus)
       or any(not group["allRequestChecksumsValid"] for group in episode_groups)
     )
     direct_source_policy_failure = bool(episode_groups) and any(
@@ -988,8 +1010,9 @@ class ProbeAnalyzer:
       "wheelStandstillAndVEgoZeroAllSamples": stopped_motion_ok,
       "noPotentialFalseStart": not potential_false_start,
       "rawSccLeadGateValidAllSamples": raw_scc_coverage_ok,
-      "raw0x1aaBus0PresentAnd0x1cfAbsent": bool(raw_alt_bus0) and not raw_standard_bus0,
-      "send0x1aaUsesBus2": bool(rearm_requests) and all(request.bus == 2 for request in rearm_requests),
+      "raw0x1aaStockBusPresentAnd0x1cfAbsent": bool(raw_alt_stock_bus) and not raw_standard_stock_bus,
+      "send0x1aaUsesExpectedBus": send_bus_matches,
+      "stockAndSendBusesUseSafetyPanda": same_safety_panda,
       "allScc0x1a0CrcValid": all_scc_crc_valid,
       "allRaw0x1aaCrcValid": all_raw_button_crc_valid,
       "allRearm0x1aaCrcValid": all_rearm_crc_valid,
@@ -1047,6 +1070,13 @@ class ProbeAnalyzer:
       "rawSccSafeSamples": len(safe_scc),
       "resGroups": episode_groups,
       "returnedSchedule": schedule,
+      "busLayout": {
+        "stockBus": stock_bus,
+        "pandaBusOffset": panda_bus_offset,
+        "canFdHda2": canfd_hda2,
+        "expectedSendBus": expected_send_bus,
+        "observedSendBuses": sorted({request.bus for request in rearm_requests}),
+      },
       "potentialFalseStart": potential_false_start,
       "warningPeriods": warning_periods,
       "alerts": [{**asdict(alert), "t": self._rel(alert.t)} for alert in alerts[:20]],
@@ -1144,7 +1174,7 @@ def run_live(duration: float, messaging_address: str) -> ProbeAnalyzer:
   return analyzer
 
 
-def _demo_car_params() -> Any:
+def _demo_car_params(bus_offset: int = 0) -> Any:
   from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags
 
   return SimpleNamespace(
@@ -1156,19 +1186,21 @@ def _demo_car_params() -> Any:
     autoResumeSng=False,
     flags=int(HyundaiFlags.CANFD | HyundaiFlags.RADAR_SCC | HyundaiFlags.CANFD_ALT_BUTTONS),
     extFlags=0,
-    safetyConfigs=[SimpleNamespace(
+    safetyConfigs=(
+      [SimpleNamespace(safetyModel="noOutput", safetyParam=0)] if bus_offset else []
+    ) + [SimpleNamespace(
       safetyModel="hyundaiCanfd",
       safetyParam=int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
     )],
   )
 
 
-def run_demo(outcome: str) -> ProbeAnalyzer:
+def run_demo(outcome: str, bus_offset: int = 0) -> ProbeAnalyzer:
   """Generate deterministic, real-DBC frames for an offline dry run."""
   from opendbc.can import CANPacker
 
   analyzer = ProbeAnalyzer("demo", outcome)
-  analyzer.set_car_params(_demo_car_params(), "demo")
+  analyzer.set_car_params(_demo_car_params(bus_offset), "demo")
   packer = CANPacker(DBC_NAME)
   base = 1_000.0
 
@@ -1195,14 +1227,14 @@ def run_demo(outcome: str) -> ProbeAnalyzer:
       "SysFailState": 0,
       "TakeOverReq": 0,
     })
-    analyzer.feed_can("can", t, 0, scc[0], scc[1])
+    analyzer.feed_can("can", t, bus_offset, scc[0], scc[1])
     stock_button = packer.make_can_msg("CRUISE_BUTTONS_ALT", 0, {
       "COUNTER": frame & 0xFF,
       "CRUISE_BUTTONS": BUTTON_NONE,
       "DISTANCE_UNIT": 1,
       "SET_ME_2": 3,
     })
-    analyzer.feed_can("can", t, 0, stock_button[0], stock_button[1])
+    analyzer.feed_can("can", t, bus_offset, stock_button[0], stock_button[1])
 
     if frame % 2 == 0:
       stopped_state = SimpleNamespace(
@@ -1219,15 +1251,16 @@ def run_demo(outcome: str) -> ProbeAnalyzer:
       for offset in (0.0, 0.01, 0.02):
         source_counter = math.floor((group_start + offset) * 50.0 + 1e-6) & 0xFF
         counter = (source_counter + 1) & 0xFF
-        tx = packer.make_can_msg("CRUISE_BUTTONS_ALT", 2, {
+        send_bus = bus_offset + 2
+        tx = packer.make_can_msg("CRUISE_BUTTONS_ALT", send_bus, {
           "COUNTER": counter,
           "CRUISE_BUTTONS": BUTTON_RES_ACCEL,
           "DISTANCE_UNIT": 1,
           "SET_ME_2": 3,
         })
         request_t = base + group_start + offset
-        analyzer.feed_can("sendcan", request_t, 2, tx[0], tx[1])
-        echo_src = 0x82 if outcome == "pass" else 0xC2
+        analyzer.feed_can("sendcan", request_t, send_bus, tx[0], tx[1])
+        echo_src = send_bus + (PANDA_RETURNED_BUS_OFFSET if outcome == "pass" else PANDA_REJECTED_BUS_OFFSET)
         analyzer.feed_can("can", request_t + 0.002, echo_src, tx[0], tx[1])
   return analyzer
 

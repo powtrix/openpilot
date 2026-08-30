@@ -12,6 +12,8 @@ def test_classify_panda_tx_echo_sources() -> None:
   assert classify_can_source("can", 0x02) == ("vehicle_rx", 2)
   assert classify_can_source("can", 0x82) == ("tx_returned", 2)
   assert classify_can_source("can", 0xC2) == ("tx_rejected", 2)
+  assert classify_can_source("can", 0x86) == ("tx_returned", 6)
+  assert classify_can_source("can", 0xC6) == ("tx_rejected", 6)
   assert classify_can_source("sendcan", 0x02) == ("send_request", 2)
 
 
@@ -22,8 +24,9 @@ def test_demo_pass_proves_exact_30_second_behavior() -> None:
   episode = report["stopEpisodes"][0]
   assert 29.9 <= episode["warningPeriods"][0]["startAfterStop"] <= 30.1
   assert episode["prerequisites"]["exact11GroupRearmSchedule"]
-  assert episode["prerequisites"]["raw0x1aaBus0PresentAnd0x1cfAbsent"]
-  assert episode["prerequisites"]["send0x1aaUsesBus2"]
+  assert episode["prerequisites"]["raw0x1aaStockBusPresentAnd0x1cfAbsent"]
+  assert episode["prerequisites"]["send0x1aaUsesExpectedBus"]
+  assert episode["prerequisites"]["stockAndSendBusesUseSafetyPanda"]
   assert episode["prerequisites"]["allScc0x1a0CrcValid"]
   assert episode["prerequisites"]["allRaw0x1aaCrcValid"]
   assert episode["prerequisites"]["allRearm0x1aaCrcValid"]
@@ -36,6 +39,24 @@ def test_demo_pass_proves_exact_30_second_behavior() -> None:
   assert all(group["counterPatternMatchesCurrentController"] for group in episode["resGroups"])
   assert sum(match["status"] == "returned" for match in report["txMatches"]) == 33
   assert sum(match["status"] == "rejected" for match in report["txMatches"]) == 0
+
+
+def test_demo_pass_accepts_second_panda_global_bus_offset() -> None:
+  report = run_demo("pass", bus_offset=4).report()
+
+  assert report["overallVerdict"] == "PASS"
+  assert report["carParams"]["pandaBusOffset"] == 4
+  episode = report["stopEpisodes"][0]
+  assert episode["busLayout"] == {
+    "stockBus": 4,
+    "pandaBusOffset": 4,
+    "canFdHda2": False,
+    "expectedSendBus": 6,
+    "observedSendBuses": [6],
+  }
+  assert episode["prerequisites"]["raw0x1aaStockBusPresentAnd0x1cfAbsent"]
+  assert episode["prerequisites"]["send0x1aaUsesExpectedBus"]
+  assert episode["prerequisites"]["stockAndSendBusesUseSafetyPanda"]
 
 
 def test_demo_rejected_tx_and_early_warning_fails() -> None:
