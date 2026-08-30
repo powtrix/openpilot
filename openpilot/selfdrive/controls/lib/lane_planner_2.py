@@ -16,6 +16,16 @@ MAX_LANE_CENTERING_AWAY = 1.85
 KEEP_MIN_DISTANCE_FROM_LANE = 1.35
 KEEP_MIN_DISTANCE_FROM_EDGELANE = 1.15
 
+def lane_width_adjust_offset(lane_width, lane_width_left, lane_width_right, adjust_lane_offset):
+  if (lane_width_left > 2.2 and lane_width_right > 2.2) or \
+     (lane_width_left < 2.0 and lane_width_right < 2.0):
+    return 0.0
+  if lane_width_left > lane_width_right:
+    return np.interp(lane_width, [2.5, 2.9], [0.0, adjust_lane_offset])
+  if lane_width_right > lane_width_left:
+    return np.interp(lane_width, [2.5, 2.9], [0.0, -adjust_lane_offset])
+  return 0.0
+
 def clamp(num, min_value, max_value):
   # weird broken case, do something reasonable
   if min_value > num > max_value:
@@ -165,15 +175,12 @@ class LanePlanner:
     ## curve offset
     offset_curve = np.interp(abs(curve_speed), [50, 200], [self.adjustCurveOffset, 0.0]) * np.sign(curve_speed)
 
-    offset_lane = 0.0
-    if self.lane_width_left_filtered.x > 2.2 and self.lane_width_right_filtered.x > 2.2: #양쪽에 차로가 여유 있는경우
-      offset_lane = 0.0
-    elif self.lane_width_left_filtered.x < 2.0 and self.lane_width_right_filtered.x < 2.0: #양쪽에 차로가 여유 없는경우
-      offset_lane = 0.0
-    elif self.lane_width_left_filtered.x > self.lane_width_right_filtered.x:
-      offset_lane = np.interp(self.lane_width, [2.5, 2.9], [0.0, self.adjustLaneOffset]) # 차선이 좁으면 안함..
-    else:
-      offset_lane = np.interp(self.lane_width, [2.5, 2.9], [0.0, -self.adjustLaneOffset]) # 차선이 좁으면 안함..
+    offset_lane = lane_width_adjust_offset(
+      self.lane_width,
+      self.lane_width_left_filtered.x,
+      self.lane_width_right_filtered.x,
+      self.adjustLaneOffset,
+    )
 
     #select lane path
     # 차선이 좁아지면, 도로경계쪽에 있는 차선 위주로 따라가도록함.
