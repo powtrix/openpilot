@@ -21,14 +21,15 @@ Machine-readable output and an offline self-check are available with::
 
   python3 tools/car_porting/ka4_stock_scc_probe.py --json demo --outcome pass
 
-The report separates a 0x1AA sendcan request from Panda's actual TX-return
-echo (``can.src == physical_bus + 0x80``) and safety rejection echo
-(``can.src == physical_bus + 0xC0``). A sendcan request by itself is not proof
-that anything reached the vehicle bus. Likewise, a TX-return echo proves that
-Panda transmitted the frame, while the subsequent stock 0x1A0 InfoDisplay
-behavior is the evidence used to infer whether the SCC ECU accepted the re-arm.
-Exit status is 0 only for an exact PASS, 1 for direct FAIL evidence, and 2 for
-partial or inconclusive evidence.
+The report separates a sendcan request from Panda's actual TX-return echo
+(``can.src == physical_bus + 0x80``) and safety rejection echo
+(``can.src == physical_bus + 0xC0``). It also records the raw camera-side and
+host replacement paths for ADRV_0x161 (including ``ALERTS_5=5``) and
+LFAHDA_CLUSTER. A sendcan request by itself is not proof that anything reached
+the vehicle bus. A TX-return proves Panda transmission, but neither TX-return
+nor SCC_CONTROL InfoDisplay acknowledges that the SCC ECU reset its timer.
+Exit status is 0 only when the complete correlated observation matches the
+requested boundary, 1 for direct FAIL evidence, and 2 for partial evidence.
 """
 
 from __future__ import annotations
@@ -56,6 +57,8 @@ if str(OPENPILOT_ROOT) not in sys.path:
 
 DBC_NAME = "hyundai_canfd_generated"
 SCC_CONTROL_ADDRESS = 0x1A0
+ADRV_0X161_ADDRESS = 0x161
+LFAHDA_CLUSTER_ADDRESS = 0x1E0
 CRUISE_BUTTONS_ALT_ADDRESS = 0x1AA
 CRUISE_BUTTONS_ADDRESS = 0x1CF
 
@@ -83,6 +86,8 @@ STOP_STREAM_GAP = 0.500
 EXPECTED_REARM_GROUP_STARTS = (2.50, 5.02, 7.54, 10.06, 12.58, 15.10, 17.62, 20.14, 22.66, 25.18, 26.98)
 REARM_TIMING_TOLERANCE = 0.060
 FINAL_REARM_FRAME_TIME = 27.00
+USE_SWITCH_OR_PEDAL_TO_ACCELERATE = 5
+CLUSTER_STREAM_MAX_GAP = 0.250
 
 LIVE_PARAM_KEYS = (
   "CarName",
@@ -224,6 +229,22 @@ class ButtonSample:
   normal_main: int
   lfa_button: int
   non_button_values: tuple[tuple[str, float | int], ...]
+
+
+@dataclass(frozen=True)
+class ClusterCanSample:
+  t: float
+  service: str
+  origin: str
+  src: int
+  bus: int
+  address: int
+  message_name: str
+  data_hex: str
+  checksum_valid: bool | None
+  counter: int
+  alert_5: int | None
+  hda_control_state: int | None
 
 
 @dataclass
@@ -403,6 +424,7 @@ class ProbeAnalyzer:
     self.alerts: list[AlertSample] = []
     self.scc: list[SccSample] = []
     self.buttons: list[ButtonSample] = []
+    self.cluster_can: list[ClusterCanSample] = []
     self.decode_errors: Counter[str] = Counter()
     self.streams: dict[tuple[str, str, int, int, int], StreamStat] = {}
     self.first_t = math.inf
@@ -422,6 +444,10 @@ class ProbeAnalyzer:
     message_name = None
     if address == SCC_CONTROL_ADDRESS:
       message_name = "SCC_CONTROL"
+    elif address == ADRV_0X161_ADDRESS:
+      message_name = "ADRV_0x161"
+    elif address == LFAHDA_CLUSTER_ADDRESS:
+      message_name = "LFAHDA_CLUSTER"
     elif address == CRUISE_BUTTONS_ALT_ADDRESS:
       message_name = "CRUISE_BUTTONS_ALT"
     elif address == CRUISE_BUTTONS_ADDRESS:
@@ -442,6 +468,22 @@ class ProbeAnalyzer:
     self.streams[key].update(t, checksum_valid)
 
     if not values:
+      return
+    if address in (ADRV_0X161_ADDRESS, LFAHDA_CLUSTER_ADDRESS):
+      self.cluster_can.append(ClusterCanSample(
+        t=t,
+        service=service,
+        origin=origin,
+        src=src,
+        bus=bus,
+        address=address,
+        message_name=message_name,
+        data_hex=data.hex(),
+        checksum_valid=checksum_valid,
+        counter=int(values.get("COUNTER", 0)),
+        alert_5=int(values["ALERTS_5"]) if "ALERTS_5" in values else None,
+        hda_control_state=int(values["HDA_CntrlModSta"]) if "HDA_CntrlModSta" in values else None,
+      ))
       return
     if address == SCC_CONTROL_ADDRESS:
       # Only physical ingress is an authoritative stock SCC status. Keep TX
@@ -660,6 +702,133 @@ class ProbeAnalyzer:
       })
     return result
 
+  def _cluster_tx_matches(self) -> tuple[list[dict[str, Any]], dict[int, str]]:
+    requests = sorted(
+      (sample for sample in self.cluster_can if sample.origin == "send_request"),
+      key=lambda sample: sample.t,
+    )
+    echoes = sorted(
+      (sample for sample in self.cluster_can if sample.origin.startswith("tx_")),
+      key=lambda sample: sample.t,
+    )
+    echo_buckets: dict[tuple[int, int, str], list[tuple[int, ClusterCanSample]]] = defaultdict(list)
+    for index, echo in enumerate(echoes):
+      echo_buckets[(echo.address, echo.bus, echo.data_hex)].append((index, echo))
+
+    used_echoes: set[int] = set()
+    status_by_id: dict[int, str] = {}
+    matches: list[dict[str, Any]] = []
+    for request in requests:
+      candidates = []
+      for index, echo in echo_buckets[(request.address, request.bus, request.data_hex)]:
+        if index in used_echoes:
+          continue
+        delta = echo.t - request.t
+        if abs(delta) <= TX_MATCH_WINDOW:
+          candidates.append((abs(delta), index, echo, delta))
+      if not candidates:
+        status_by_id[id(request)] = "unobserved"
+        matches.append({
+          "requestTime": self._rel(request.t),
+          "message": request.message_name,
+          "addressHex": f"0x{request.address:X}",
+          "bus": request.bus,
+          "counter": request.counter,
+          "ALERTS_5": request.alert_5,
+          "HDA_CntrlModSta": request.hda_control_state,
+          "dataHex": request.data_hex,
+          "status": "unobserved",
+        })
+        continue
+
+      _, index, echo, delta = min(candidates, key=lambda item: item[0])
+      used_echoes.add(index)
+      status = "returned" if echo.origin == "tx_returned" else "rejected"
+      status_by_id[id(request)] = status
+      matches.append({
+        "requestTime": self._rel(request.t),
+        "echoTime": self._rel(echo.t),
+        "echoDeltaMs": round(delta * 1000.0, 3),
+        "message": request.message_name,
+        "addressHex": f"0x{request.address:X}",
+        "bus": request.bus,
+        "counter": request.counter,
+        "ALERTS_5": request.alert_5,
+        "HDA_CntrlModSta": request.hda_control_state,
+        "dataHex": request.data_hex,
+        "status": status,
+        "echoOrigin": echo.origin,
+        "echoSrcHex": f"0x{echo.src:X}",
+      })
+    return matches, status_by_id
+
+  def _cluster_report(self, tx_matches: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[tuple[str, str, int, int], list[ClusterCanSample]] = defaultdict(list)
+    for sample in self.cluster_can:
+      grouped[(sample.service, sample.origin, sample.bus, sample.address)].append(sample)
+
+    streams = []
+    for (service, origin, bus, address), samples in sorted(grouped.items()):
+      samples.sort(key=lambda sample: sample.t)
+      duration = samples[-1].t - samples[0].t if len(samples) > 1 else 0.0
+      attr = "alert_5" if address == ADRV_0X161_ADDRESS else "hda_control_state"
+      signal_name = "ALERTS_5" if address == ADRV_0X161_ADDRESS else "HDA_CntrlModSta"
+      transitions = []
+      previous: int | None | object = object()
+      for sample in samples:
+        value = getattr(sample, attr)
+        if value != previous:
+          transitions.append({
+            "t": self._rel(sample.t),
+            "value": value,
+            "counter": sample.counter,
+            "dataHex": sample.data_hex,
+          })
+          previous = value
+      checksum_counts = Counter(sample.checksum_valid for sample in samples)
+      streams.append({
+        "service": service,
+        "origin": origin,
+        "bus": bus,
+        "message": samples[0].message_name,
+        "addressHex": f"0x{address:X}",
+        "count": len(samples),
+        "first": self._rel(samples[0].t),
+        "last": self._rel(samples[-1].t),
+        "observedHz": len(samples) / duration if duration > 0 else None,
+        "checksumValid": checksum_counts[True],
+        "checksumInvalid": checksum_counts[False],
+        "checksumUnavailable": checksum_counts[None],
+        "signal": signal_name,
+        "valueCounts": {str(value): count for value, count in sorted(Counter(
+          getattr(sample, attr) for sample in samples).items(), key=lambda item: str(item[0]))},
+        "transitions": transitions[:100],
+      })
+
+    panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
+    canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
+    expected_raw_camera_bus = panda_bus_offset + 2
+    expected_host_bus = None if canfd_hda2 else panda_bus_offset
+    return {
+      "topology": {
+        "pandaBusOffset": panda_bus_offset,
+        "canFdHda2": canfd_hda2,
+        "expectedRawCameraBus": expected_raw_camera_bus,
+        "expectedHostReplacementBus": expected_host_bus,
+        "stockLongBehavior": (
+          "HDA2 stock-long leaves raw camera ADRV/LFAHDA traffic on the unmodified forwarding path"
+          if canfd_hda2 else
+          "HDA1 stock-long replaces ADRV/LFAHDA on ECAN; current ADRV code masks ALERTS_5 values 1..5"
+        ),
+        "inferenceWarning": (
+          "Bus topology describes the current branch; a vehicle_rx frame alone is not proof of cluster display."
+        ),
+      },
+      "streams": streams,
+      "txMatchCounts": dict(sorted(Counter(match["status"] for match in tx_matches).items())),
+      "txMatches": tx_matches,
+    }
+
   def _rel(self, t: float) -> float:
     return round(t - self.first_t, 6) if math.isfinite(self.first_t) else 0.0
 
@@ -827,6 +996,99 @@ class ProbeAnalyzer:
       episodes.append((current_start, current_last, start_observed))
     return episodes
 
+  def _correlated_timeline(self, button_tx_status_by_id: dict[int, str],
+                           cluster_tx_status_by_id: dict[int, str]) -> list[dict[str, Any]]:
+    events: list[tuple[float, str, dict[str, Any]]] = []
+
+    previous_stop: bool | None = None
+    for sample in sorted(self.states, key=lambda item: item.t):
+      if sample.stop_active != previous_stop:
+        events.append((sample.t, "physicalStop", {
+          "active": sample.stop_active,
+          "standstill": sample.standstill,
+          "cruiseEnabled": sample.cruise_enabled,
+          "vEgo": sample.v_ego,
+        }))
+        previous_stop = sample.stop_active
+
+    scc_by_bus: dict[int, list[SccSample]] = defaultdict(list)
+    for sample in self.scc:
+      scc_by_bus[sample.bus].append(sample)
+    for bus, samples in sorted(scc_by_bus.items()):
+      previous_info: int | None = None
+      for sample in sorted(samples, key=lambda item: item.t):
+        if sample.info_display != previous_info:
+          events.append((sample.t, "sccInfoDisplay", {
+            "bus": bus,
+            "value": sample.info_display,
+            "counter": sample.counter,
+            "dataHex": sample.data_hex,
+          }))
+          previous_info = sample.info_display
+
+    for sample in sorted(self.buttons, key=lambda item: item.t):
+      if sample.origin == "send_request" and sample.button == BUTTON_RES_ACCEL:
+        events.append((sample.t, "resHostRequest", {
+          "bus": sample.bus,
+          "addressHex": f"0x{sample.address:X}",
+          "counter": sample.counter,
+          "txStatus": button_tx_status_by_id.get(id(sample), "unobserved"),
+          "dataHex": sample.data_hex,
+        }))
+
+    cluster_groups: dict[tuple[str, str, int, int], list[ClusterCanSample]] = defaultdict(list)
+    for sample in self.cluster_can:
+      cluster_groups[(sample.service, sample.origin, sample.bus, sample.address)].append(sample)
+    for (service, origin, bus, address), samples in sorted(cluster_groups.items()):
+      attr = "alert_5" if address == ADRV_0X161_ADDRESS else "hda_control_state"
+      signal = "ALERTS_5" if address == ADRV_0X161_ADDRESS else "HDA_CntrlModSta"
+      previous: int | None | object = object()
+      for sample in sorted(samples, key=lambda item: item.t):
+        value = getattr(sample, attr)
+        if value != previous:
+          detail = {
+            "service": service,
+            "origin": origin,
+            "bus": bus,
+            "message": sample.message_name,
+            "addressHex": f"0x{address:X}",
+            "signal": signal,
+            "value": value,
+            "counter": sample.counter,
+            "dataHex": sample.data_hex,
+          }
+          if origin == "send_request":
+            detail["txStatus"] = cluster_tx_status_by_id.get(id(sample), "unobserved")
+          events.append((sample.t, "clusterCanTransition", detail))
+          previous = value
+        elif origin == "send_request" and cluster_tx_status_by_id.get(id(sample)) in ("rejected", "unobserved"):
+          events.append((sample.t, "clusterCanTxProblem", {
+            "service": service,
+            "origin": origin,
+            "bus": bus,
+            "message": sample.message_name,
+            "addressHex": f"0x{address:X}",
+            "signal": signal,
+            "value": value,
+            "counter": sample.counter,
+            "txStatus": cluster_tx_status_by_id.get(id(sample)),
+            "dataHex": sample.data_hex,
+          }))
+
+    previous_alert: tuple[str, str, str] | None = None
+    for sample in sorted(self.alerts, key=lambda item: item.t):
+      value = (sample.alert_type, sample.alert_text_1, sample.alert_text_2)
+      if value != previous_alert and any(value):
+        events.append((sample.t, "selfdriveAlert", {
+          "alertType": sample.alert_type,
+          "alertText1": sample.alert_text_1,
+          "alertText2": sample.alert_text_2,
+        }))
+      previous_alert = value
+
+    return [{"t": self._rel(t), "event": kind, **detail}
+            for t, kind, detail in sorted(events, key=lambda item: (item[0], item[1]))]
+
   @staticmethod
   def _nearest_bool(samples: list[Any], t: float, name: str, tolerance: float = 0.150) -> bool | None:
     if not samples:
@@ -859,8 +1121,176 @@ class ProbeAnalyzer:
       "duration": round(period_end - period_start, 3),
     } for period_start, period_end in periods]
 
+  @staticmethod
+  def _cluster_signal_periods(samples: list[ClusterCanSample], start: float, attr: str,
+                              active_value: int) -> list[dict[str, float]]:
+    periods: list[tuple[float, float]] = []
+    period_start: float | None = None
+    last_t: float | None = None
+    for sample in sorted(samples, key=lambda item: item.t):
+      active = getattr(sample, attr) == active_value
+      if period_start is not None and last_t is not None and sample.t - last_t > CLUSTER_STREAM_MAX_GAP:
+        periods.append((period_start, last_t))
+        period_start = None
+      if active and period_start is None:
+        period_start = sample.t
+      elif not active and period_start is not None:
+        periods.append((period_start, sample.t))
+        period_start = None
+      last_t = sample.t
+    if period_start is not None and last_t is not None:
+      periods.append((period_start, last_t))
+    return [{
+      "startAfterStop": round(period_start - start, 3),
+      "endAfterStop": round(period_end - start, 3),
+      "duration": round(period_end - period_start, 3),
+    } for period_start, period_end in periods]
+
+  @staticmethod
+  def _continuous_cluster_coverage(samples: list[ClusterCanSample], start: float, through: float) -> bool:
+    samples = sorted((sample for sample in samples if start - 0.150 <= sample.t <= through + 0.150),
+                     key=lambda sample: sample.t)
+    if not samples or samples[0].t > start + 0.150 or samples[-1].t < through - 0.150:
+      return False
+    return all(curr.t - prev.t <= CLUSTER_STREAM_MAX_GAP
+               for prev, curr in zip(samples, samples[1:], strict=False))
+
+  def _cluster_episode_evidence(self, start: float, end: float,
+                                tx_status_by_id: dict[int, str]) -> dict[str, Any]:
+    panda_bus_offset = int(self.car_params.get("pandaBusOffset", 0)) if self.car_params else 0
+    canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
+    raw_camera_bus = panda_bus_offset + 2
+    host_bus = panda_bus_offset
+    samples = [sample for sample in self.cluster_can if start - 0.150 <= sample.t <= end + 0.150]
+    raw_adrv = sorted((sample for sample in samples
+                       if sample.origin == "vehicle_rx" and sample.address == ADRV_0X161_ADDRESS
+                       and sample.bus == raw_camera_bus), key=lambda sample: sample.t)
+    raw_hda = sorted((sample for sample in samples
+                      if sample.origin == "vehicle_rx" and sample.address == LFAHDA_CLUSTER_ADDRESS
+                      and sample.bus == raw_camera_bus), key=lambda sample: sample.t)
+    adrv_requests = sorted((sample for sample in samples
+                            if sample.origin == "send_request" and sample.address == ADRV_0X161_ADDRESS),
+                           key=lambda sample: sample.t)
+    hda_requests = sorted((sample for sample in samples
+                           if sample.origin == "send_request" and sample.address == LFAHDA_CLUSTER_ADDRESS),
+                          key=lambda sample: sample.t)
+    returned_adrv = sorted((sample for sample in samples
+                            if sample.origin == "tx_returned" and sample.address == ADRV_0X161_ADDRESS),
+                           key=lambda sample: sample.t)
+    returned_hda = sorted((sample for sample in samples
+                           if sample.origin == "tx_returned" and sample.address == LFAHDA_CLUSTER_ADDRESS),
+                          key=lambda sample: sample.t)
+
+    raw_warning_periods = self._cluster_signal_periods(
+      [sample for sample in raw_adrv if start <= sample.t <= end], start, "alert_5",
+      USE_SWITCH_OR_PEDAL_TO_ACCELERATE,
+    )
+    first_raw_warning = raw_warning_periods[0]["startAfterStop"] if raw_warning_periods else None
+    raw_warning_frames = [sample for sample in raw_adrv
+                          if sample.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE]
+    warning_output_pairs = []
+    for raw in raw_warning_frames:
+      candidates = [sample for sample in returned_adrv if abs(sample.t - raw.t) <= TX_MATCH_WINDOW]
+      if candidates:
+        output = min(candidates, key=lambda sample: abs(sample.t - raw.t))
+        warning_output_pairs.append((raw, output))
+    masked_warning_frames = sum(output.alert_5 != USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+                                for _, output in warning_output_pairs)
+    forwarded_warning_frames = sum(output.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+                                   for _, output in warning_output_pairs)
+
+    hda_state_pairs = []
+    for raw in raw_hda:
+      candidates = [sample for sample in returned_hda if abs(sample.t - raw.t) <= TX_MATCH_WINDOW]
+      if candidates:
+        output = min(candidates, key=lambda sample: abs(sample.t - raw.t))
+        hda_state_pairs.append((raw, output))
+    hda_state_mismatches = sum(raw.hda_control_state != output.hda_control_state
+                               for raw, output in hda_state_pairs)
+
+    if raw_warning_frames and masked_warning_frames:
+      warning_path = "hostReplacementMaskedRawWarning"
+    elif raw_warning_frames and forwarded_warning_frames:
+      warning_path = "hostReplacementForwardedRawWarning"
+    elif raw_warning_frames and canfd_hda2 and not adrv_requests:
+      warning_path = "hda2RawUnmodifiedForwardingTopology"
+    elif raw_warning_frames:
+      warning_path = "rawWarningObservedButDeliveryUnproven"
+    else:
+      warning_path = "noRawWarningObserved"
+
+    all_adrv_returned = bool(adrv_requests) and all(
+      tx_status_by_id.get(id(request)) == "returned" for request in adrv_requests)
+    all_hda_returned = bool(hda_requests) and all(
+      tx_status_by_id.get(id(request)) == "returned" for request in hda_requests)
+    if canfd_hda2:
+      hda_path_consistent = bool(raw_adrv and raw_hda) and not adrv_requests and not hda_requests
+    else:
+      hda_path_consistent = (
+        bool(raw_adrv and raw_hda and hda_state_pairs)
+        and all_adrv_returned
+        and all_hda_returned
+        and hda_state_mismatches == 0
+        and all(request.bus == host_bus for request in (*adrv_requests, *hda_requests))
+      )
+
+    raw_hda_transitions = []
+    previous_hda_state: int | None | object = object()
+    for sample in raw_hda:
+      if sample.hda_control_state != previous_hda_state:
+        raw_hda_transitions.append({
+          "t": self._rel(sample.t),
+          "afterStop": round(sample.t - start, 3),
+          "value": sample.hda_control_state,
+          "counter": sample.counter,
+          "dataHex": sample.data_hex,
+        })
+        previous_hda_state = sample.hda_control_state
+
+    res_requests = [sample for sample in self.buttons
+                    if start <= sample.t <= end and sample.origin == "send_request"
+                    and sample.button == BUTTON_RES_ACCEL]
+    last_res_after_stop = round(max(sample.t for sample in res_requests) - start, 3) if res_requests else None
+    warning_after_last_res = (
+      round(first_raw_warning - last_res_after_stop, 3)
+      if first_raw_warning is not None and last_res_after_stop is not None else None
+    )
+    coverage_through = min(end, start + MIN_EXACT_PROOF_DURATION)
+    return {
+      "rawCameraBus": raw_camera_bus,
+      "hostReplacementBus": None if canfd_hda2 else host_bus,
+      "canFdHda2": canfd_hda2,
+      "rawAdrvSamples": len(raw_adrv),
+      "rawLfaHdaSamples": len(raw_hda),
+      "rawAdrvContinuousThrough30_25s": self._continuous_cluster_coverage(raw_adrv, start, coverage_through),
+      "rawAccelerateWarningPeriods": raw_warning_periods,
+      "firstRawAccelerateWarningAfterStop": first_raw_warning,
+      "warningPathObservation": warning_path,
+      "warningOutputPairCounts": {
+        "rawWarningFrames": len(raw_warning_frames),
+        "pairedWithTxReturn": len(warning_output_pairs),
+        "maskedByReturnedFrame": masked_warning_frames,
+        "forwardedByReturnedFrame": forwarded_warning_frames,
+      },
+      "hdaControlStateCounts": {str(value): count for value, count in sorted(Counter(
+        sample.hda_control_state for sample in raw_hda).items(), key=lambda item: str(item[0]))},
+      "hdaControlStateTransitions": raw_hda_transitions[:100],
+      "hdaReplacementComparison": {
+        "pairedFrames": len(hda_state_pairs),
+        "stateMismatches": hda_state_mismatches,
+        "allAdrvRequestsReturned": all_adrv_returned,
+        "allLfaHdaRequestsReturned": all_hda_returned,
+        "pathConsistentWithCurrentStockLongTopology": hda_path_consistent,
+      },
+      "postResObservation": {
+        "lastResAfterStop": last_res_after_stop,
+        "firstRawWarningAfterLastRes": warning_after_last_res,
+        "note": "Temporal ordering is observation only; it is not an SCC timer-reset acknowledgement.",
+      },
+    }
+
   def _episode_report(self, start: float, end: float, start_observed: bool,
-                      res_groups: list[dict[str, Any]]) -> dict[str, Any]:
+                      res_groups: list[dict[str, Any]], cluster_tx_status_by_id: dict[int, str]) -> dict[str, Any]:
     states = [sample for sample in self.states if start <= sample.t <= end]
     stock_bus = self._stock_rx_bus()
     scc = [sample for sample in self.scc if start <= sample.t <= end and
@@ -896,6 +1326,8 @@ class ProbeAnalyzer:
     )
     warning_periods = self._warning_periods(scc, start)
     first_warning = warning_periods[0]["startAfterStop"] if warning_periods else None
+    cluster_evidence = self._cluster_episode_evidence(start, end, cluster_tx_status_by_id)
+    first_raw_warning = cluster_evidence["firstRawAccelerateWarningAfterStop"]
 
     group_times = [group["start"] - start_rel for group in episode_groups]
     returned_schedule_ok = False
@@ -1021,6 +1453,10 @@ class ProbeAnalyzer:
       "exactAltBusAndAddressLayout": exact_alt_layout,
       "exact11GroupRearmSchedule": returned_schedule_ok,
       "allObservedRearmRequestsReturned": all_tx_returned,
+      "rawAdrv0x161ContinuousThrough30_25s": cluster_evidence["rawAdrvContinuousThrough30_25s"],
+      "rawLfaHda0x1e0Observed": cluster_evidence["rawLfaHdaSamples"] > 0,
+      "hdaPathConsistentWithCurrentStockLongTopology": cluster_evidence[
+        "hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"],
     }
 
     verdict = "INCONCLUSIVE"
@@ -1043,19 +1479,46 @@ class ProbeAnalyzer:
     elif states and not stopped_motion_ok:
       verdict = "FAIL"
       reasons.append("standstill evidence contained nonzero vEgo or a false standstill sample")
+    elif first_raw_warning is not None and first_raw_warning < EARLIEST_EXPECTED_FINAL_WARNING:
+      verdict = "FAIL"
+      reasons.append(
+        f"raw ADRV_0x161 ALERTS_5=5 appeared early at {first_raw_warning:.3f}s after stop"
+      )
     elif first_warning is not None and first_warning < EARLIEST_EXPECTED_FINAL_WARNING:
       verdict = "FAIL"
       reasons.append(f"stock InfoDisplay=4 appeared early at {first_warning:.3f}s after stop")
     elif all(prerequisites.values()):
-      if first_warning is not None and first_warning <= LATEST_EXPECTED_FINAL_WARNING:
+      scc_boundary_observed = (
+        first_warning is not None
+        and EARLIEST_EXPECTED_FINAL_WARNING <= first_warning <= LATEST_EXPECTED_FINAL_WARNING
+      )
+      raw_boundary_observed = (
+        first_raw_warning is not None
+        and EARLIEST_EXPECTED_FINAL_WARNING <= first_raw_warning <= LATEST_EXPECTED_FINAL_WARNING
+      )
+      if scc_boundary_observed and raw_boundary_observed:
         verdict = "PASS"
-        reasons.append("returned 0x1AA re-arms covered the stop and stock InfoDisplay=4 appeared at the 30s boundary")
-      elif first_warning is None:
+        reasons.append(
+          " ".join((
+            "the returned 0x1AA schedule, SCC InfoDisplay=4, raw ADRV ALERTS_5=5, and HDA path all aligned",
+            "at the 30s boundary; no individual RES timer-reset acknowledgement exists",
+          ))
+        )
+      elif first_warning is None and first_raw_warning is None:
         verdict = "PASS_AT_LEAST_30S"
-        reasons.append("returned 0x1AA re-arms kept stock InfoDisplay clear for at least 30s; the final OEM timeout was not observed")
-      else:
+        reasons.append(
+          "both continuously observed OEM warning streams stayed clear for at least 30s; the final timeout and individual RES timer resets remain unproven"
+        )
+      elif ((first_warning is not None and first_warning > LATEST_EXPECTED_FINAL_WARNING)
+            or (first_raw_warning is not None and first_raw_warning > LATEST_EXPECTED_FINAL_WARNING)):
         verdict = "FAIL"
-        reasons.append(f"stock InfoDisplay=4 appeared too late at {first_warning:.3f}s; the requested 30s maximum was not shown")
+        reasons.append(
+          "an OEM warning boundary appeared after 31.5s; the requested approximately-30s maximum was not observed"
+        )
+      else:
+        reasons.append(
+          "SCC InfoDisplay and raw ADRV ALERTS_5 did not both establish the same 30s OEM warning boundary"
+        )
     else:
       failed = [name for name, passed in prerequisites.items() if not passed]
       reasons.append("missing proof prerequisites: " + ", ".join(failed))
@@ -1079,6 +1542,7 @@ class ProbeAnalyzer:
       },
       "potentialFalseStart": potential_false_start,
       "warningPeriods": warning_periods,
+      "clusterEvidence": cluster_evidence,
       "alerts": [{**asdict(alert), "t": self._rel(alert.t)} for alert in alerts[:20]],
       "prerequisites": prerequisites,
       "verdict": verdict,
@@ -1089,8 +1553,9 @@ class ProbeAnalyzer:
     if not math.isfinite(self.first_t):
       self.first_t = self.last_t = 0.0
     tx_matches, status_by_id = self._match_button_tx()
+    cluster_tx_matches, cluster_status_by_id = self._cluster_tx_matches()
     res_groups = self._res_groups(status_by_id)
-    episodes = [self._episode_report(start, end, observed, res_groups)
+    episodes = [self._episode_report(start, end, observed, res_groups, cluster_status_by_id)
                 for start, end, observed in self._stop_episodes()]
 
     verdict_order = {"FAIL": 4, "PASS": 3, "PASS_AT_LEAST_30S": 2, "INCONCLUSIVE": 1}
@@ -1100,7 +1565,7 @@ class ProbeAnalyzer:
       overall = "INCONCLUSIVE"
 
     return {
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "mode": self.mode,
       "source": self.source,
       "capture": {
@@ -1116,19 +1581,30 @@ class ProbeAnalyzer:
       "rawButtonCounters": self._raw_button_counter_report(),
       "sccEvidence": self._scc_report(),
       "buttonEvidence": self._button_report(),
+      "clusterCanEvidence": self._cluster_report(cluster_tx_matches),
       "txMatches": tx_matches,
       "resGroups": res_groups,
+      "correlatedTimeline": self._correlated_timeline(status_by_id, cluster_status_by_id),
       "stopEpisodes": episodes,
       "overallVerdict": overall,
       "interpretation": {
-        "PASS": "Panda TX-return plus the stock SCC status proves the requested approximately-30s behavior in a qualified stop.",
-        "PASS_AT_LEAST_30S": "The warning stayed clear for 30s, but the final stock timeout was not observed, so the exact maximum is unproven.",
+        "PASS": (
+          " ".join((
+            "A qualified capture observed the intended TX-return schedule plus matching SCC, raw ADRV warning,",
+            "and HDA evidence at approximately 30s. This does not acknowledge which RES frame, if any, reset the SCC timer.",
+          ))
+        ),
+        "PASS_AT_LEAST_30S": (
+          "Continuously observed SCC and raw ADRV warning paths stayed clear for 30s, but the final timeout and individual SCC timer resets remain unproven."
+        ),
         "FAIL": "Direct on-wire or stock-SCC status evidence contradicts the requested behavior.",
         "INCONCLUSIVE": "The capture lacks one or more prerequisites; do not treat absence of an error as success.",
       },
       "limitations": [
         "A sendcan row is only a request; can.src +0x80 is required to prove Panda transmission.",
-        "A +0x80 TX-return does not by itself prove SCC ECU acceptance; stock 0x1A0 timing supplies that evidence.",
+        "Neither +0x80 TX-return nor stock 0x1A0 InfoDisplay acknowledges SCC acceptance or a timer reset.",
+        "Raw ADRV_0x161 ALERTS_5=5 proves the OEM warning source value, not that the cluster displayed it; HDA1 can replace and mask it.",
+        "HDA2 raw-path visibility is inferred from current-branch topology and absence of a host replacement, not a cluster display acknowledgement.",
         "Start the capture before the physical stop and keep recording past 31 seconds.",
         "Use a full rlog when possible; qlogs can omit or downsample CAN/sendcan/state evidence.",
       ],
@@ -1174,7 +1650,7 @@ def run_live(duration: float, messaging_address: str) -> ProbeAnalyzer:
   return analyzer
 
 
-def _demo_car_params(bus_offset: int = 0) -> Any:
+def _demo_car_params(bus_offset: int = 0, hda2: bool = False) -> Any:
   from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags
 
   return SimpleNamespace(
@@ -1184,7 +1660,10 @@ def _demo_car_params(bus_offset: int = 0) -> Any:
     openpilotLongitudinalControl=False,
     alphaLongitudinalAvailable=True,
     autoResumeSng=False,
-    flags=int(HyundaiFlags.CANFD | HyundaiFlags.RADAR_SCC | HyundaiFlags.CANFD_ALT_BUTTONS),
+    flags=int(
+      HyundaiFlags.CANFD | HyundaiFlags.RADAR_SCC | HyundaiFlags.CANFD_ALT_BUTTONS
+      | (HyundaiFlags.CANFD_HDA2 if hda2 else 0)
+    ),
     extFlags=0,
     safetyConfigs=(
       [SimpleNamespace(safetyModel="noOutput", safetyParam=0)] if bus_offset else []
@@ -1195,12 +1674,12 @@ def _demo_car_params(bus_offset: int = 0) -> Any:
   )
 
 
-def run_demo(outcome: str, bus_offset: int = 0) -> ProbeAnalyzer:
+def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False) -> ProbeAnalyzer:
   """Generate deterministic, real-DBC frames for an offline dry run."""
   from opendbc.can import CANPacker
 
   analyzer = ProbeAnalyzer("demo", outcome)
-  analyzer.set_car_params(_demo_car_params(bus_offset), "demo")
+  analyzer.set_car_params(_demo_car_params(bus_offset, hda2), "demo")
   packer = CANPacker(DBC_NAME)
   base = 1_000.0
 
@@ -1245,13 +1724,47 @@ def run_demo(outcome: str, bus_offset: int = 0) -> ProbeAnalyzer:
       analyzer.feed_state(t, stopped_state)
       analyzer.feed_control(t, SimpleNamespace(enabled=True))
 
+  # Real-DBC camera source and host replacement evidence. HDA1 stock-long
+  # replaces both messages on ECAN and masks ALERTS_5=5. HDA2 stock-long does
+  # not synthesize these frames, leaving the raw camera path unmodified.
+  warning_time = 30.0 if outcome == "pass" else 3.0
+  raw_camera_bus = bus_offset + 2
+  for frame in range(round(stop_duration * 20) + 1):
+    elapsed = frame / 20.0
+    t = base + elapsed
+    raw_alert = USE_SWITCH_OR_PEDAL_TO_ACCELERATE if elapsed >= warning_time else 0
+    raw_adrv = packer.make_can_msg("ADRV_0x161", raw_camera_bus, {
+      "COUNTER": frame & 0xFF,
+      "ALERTS_5": raw_alert,
+    })
+    raw_hda = packer.make_can_msg("LFAHDA_CLUSTER", raw_camera_bus, {
+      "COUNTER": frame & 0xFF,
+      "HDA_CntrlModSta": 2,
+      "HDA_LFA_SymSta": 2,
+    })
+    analyzer.feed_can("can", t, raw_camera_bus, raw_adrv[0], raw_adrv[1])
+    analyzer.feed_can("can", t, raw_camera_bus, raw_hda[0], raw_hda[1])
+    if not hda2:
+      host_adrv = packer.make_can_msg("ADRV_0x161", bus_offset, {
+        "COUNTER": frame & 0xFF,
+        "ALERTS_5": 0,
+      })
+      host_hda = packer.make_can_msg("LFAHDA_CLUSTER", bus_offset, {
+        "COUNTER": frame & 0xFF,
+        "HDA_CntrlModSta": 2,
+        "HDA_LFA_SymSta": 2,
+      })
+      for message in (host_adrv, host_hda):
+        analyzer.feed_can("sendcan", t + 0.001, bus_offset, message[0], message[1])
+        analyzer.feed_can("can", t + 0.003, bus_offset + PANDA_RETURNED_BUS_OFFSET, message[0], message[1])
+
   if outcome != "missing-tx":
     group_starts = list(EXPECTED_REARM_GROUP_STARTS)
     for group_start in group_starts:
       for offset in (0.0, 0.01, 0.02):
         source_counter = math.floor((group_start + offset) * 50.0 + 1e-6) & 0xFF
         counter = (source_counter + 1) & 0xFF
-        send_bus = bus_offset + 2
+        send_bus = bus_offset if hda2 else bus_offset + 2
         tx = packer.make_can_msg("CRUISE_BUTTONS_ALT", send_bus, {
           "COUNTER": counter,
           "CRUISE_BUTTONS": BUTTON_RES_ACCEL,
@@ -1318,6 +1831,16 @@ def print_human(report: dict[str, Any]) -> None:
       sep="",
     )
 
+  cluster = report["clusterCanEvidence"]
+  print(f"Cluster CAN topology: {cluster['topology']}")
+  for stream in cluster["streams"]:
+    print(
+      f"  {stream['message']} {stream['service']}/{stream['origin']} bus={stream['bus']} ",
+      f"values={stream['valueCounts']} transitions={stream['transitions']}",
+      sep="",
+    )
+  print(f"Cluster CAN TX matches: {cluster['txMatchCounts']}")
+
   print("Stop episodes:")
   if not report["stopEpisodes"]:
     print("  none (need carState.standstill && cruiseState.enabled)")
@@ -1331,6 +1854,7 @@ def print_human(report: dict[str, Any]) -> None:
       print(f"    - {reason}")
     if episode["warningPeriods"]:
       print(f"    InfoDisplay=4 periods: {episode['warningPeriods']}")
+    print(f"    raw cluster evidence: {episode['clusterEvidence']}")
     if episode["returnedSchedule"]:
       print(f"    schedule: {episode['returnedSchedule']}")
     for group in episode["resGroups"]:

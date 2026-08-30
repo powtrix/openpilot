@@ -59,6 +59,81 @@ def test_demo_pass_accepts_second_panda_global_bus_offset() -> None:
   assert episode["prerequisites"]["stockAndSendBusesUseSafetyPanda"]
 
 
+def test_hda1_reports_raw_warning_and_masked_return_as_distinct_dbc_frames() -> None:
+  report = run_demo("pass").report()
+  cluster = report["clusterCanEvidence"]
+  streams = cluster["streams"]
+
+  raw_adrv = next(stream for stream in streams
+                  if stream["addressHex"] == "0x161" and stream["origin"] == "vehicle_rx")
+  sent_adrv = next(stream for stream in streams
+                   if stream["addressHex"] == "0x161" and stream["origin"] == "send_request")
+  returned_adrv = next(stream for stream in streams
+                       if stream["addressHex"] == "0x161" and stream["origin"] == "tx_returned")
+  assert (raw_adrv["bus"], sent_adrv["bus"], returned_adrv["bus"]) == (2, 0, 0)
+  assert raw_adrv["valueCounts"]["5"] > 0
+  assert sent_adrv["valueCounts"] == {"0": sent_adrv["count"]}
+  assert returned_adrv["valueCounts"] == {"0": returned_adrv["count"]}
+  assert raw_adrv["transitions"][-1]["value"] == 5
+  assert raw_adrv["transitions"][-1]["dataHex"] != sent_adrv["transitions"][0]["dataHex"]
+
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
+  assert evidence["warningPathObservation"] == "hostReplacementMaskedRawWarning"
+  assert evidence["warningOutputPairCounts"]["maskedByReturnedFrame"] > 0
+  assert evidence["hdaReplacementComparison"]["stateMismatches"] == 0
+  assert evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
+  res_times = [event["t"] for event in report["correlatedTimeline"] if event["event"] == "resHostRequest"]
+  raw_warning = next(event for event in report["correlatedTimeline"]
+                     if event["event"] == "clusterCanTransition"
+                     and event["origin"] == "vehicle_rx" and event["signal"] == "ALERTS_5"
+                     and event["value"] == 5)
+  assert max(res_times) < raw_warning["t"]
+
+
+def test_hda2_second_panda_reports_unmodified_raw_warning_topology() -> None:
+  report = run_demo("pass", bus_offset=4, hda2=True).report()
+  assert report["overallVerdict"] == "PASS"
+  topology = report["clusterCanEvidence"]["topology"]
+  assert topology["canFdHda2"]
+  assert topology["expectedRawCameraBus"] == 6
+  assert topology["expectedHostReplacementBus"] is None
+
+  streams = report["clusterCanEvidence"]["streams"]
+  raw_addresses = {(stream["addressHex"], stream["bus"]) for stream in streams
+                   if stream["origin"] == "vehicle_rx"}
+  assert ("0x161", 6) in raw_addresses
+  assert ("0x1E0", 6) in raw_addresses
+  assert not any(stream["addressHex"] in ("0x161", "0x1E0") and stream["origin"] == "send_request"
+                 for stream in streams)
+  evidence = report["stopEpisodes"][0]["clusterEvidence"]
+  assert evidence["warningPathObservation"] == "hda2RawUnmodifiedForwardingTopology"
+  assert evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
+
+
+def test_cluster_rejection_preserves_raw_dbc_value_and_global_bus() -> None:
+  from opendbc.can import CANPacker
+
+  analyzer = ProbeAnalyzer("test", "cluster-reject")
+  message = CANPacker("hyundai_canfd_generated").make_can_msg("ADRV_0x161", 4, {
+    "COUNTER": 7,
+    "ALERTS_5": 5,
+  })
+  analyzer.feed_can("sendcan", 10.0, 4, message[0], message[1])
+  analyzer.feed_can("can", 10.002, 0xC4, message[0], message[1])
+  report = analyzer.report()
+
+  match = report["clusterCanEvidence"]["txMatches"][0]
+  assert match["status"] == "rejected"
+  assert match["bus"] == 4
+  assert match["ALERTS_5"] == 5
+  assert match["dataHex"] == message[1].hex()
+  rejected_stream = next(stream for stream in report["clusterCanEvidence"]["streams"]
+                         if stream["origin"] == "tx_rejected")
+  assert rejected_stream["bus"] == 4
+  assert rejected_stream["valueCounts"] == {"5": 1}
+
+
 def test_demo_rejected_tx_and_early_warning_fails() -> None:
   report = run_demo("fail").report()
 
