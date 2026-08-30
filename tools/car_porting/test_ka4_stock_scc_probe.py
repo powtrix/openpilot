@@ -385,6 +385,7 @@ def test_initial_info_display_4_does_not_hide_an_early_raw_adrv_warning() -> Non
 
 def test_empty_analyzer_is_inconclusive() -> None:
   report = ProbeAnalyzer("test", "empty").report()
+  assert report["schemaVersion"] == 4
   assert report["overallVerdict"] == "INCONCLUSIVE"
   assert report["stopEpisodes"] == []
   assert report["stateEvidence"]["sampleCount"] == 0

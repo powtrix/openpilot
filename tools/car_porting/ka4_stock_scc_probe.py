@@ -80,6 +80,7 @@ BUTTON_NAMES = {
   5: "LFA_BUTTON",
 }
 
+REPORT_SCHEMA_VERSION = 4
 TARGET_FINGERPRINT = "KIA_CARNIVAL_4TH_GEN"
 # Older cereal logs serialized the human-readable platform value.
 TARGET_FINGERPRINT_ALIASES = (TARGET_FINGERPRINT, "KIA CARNIVAL 4TH GEN")
@@ -2051,7 +2052,7 @@ class ProbeAnalyzer:
       overall = "INCONCLUSIVE"
 
     return {
-      "schemaVersion": 3,
+      "schemaVersion": REPORT_SCHEMA_VERSION,
       "mode": self.mode,
       "source": self.source,
       "capture": {
