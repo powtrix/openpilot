@@ -387,6 +387,51 @@ def test_empty_analyzer_is_inconclusive() -> None:
   report = ProbeAnalyzer("test", "empty").report()
   assert report["overallVerdict"] == "INCONCLUSIVE"
   assert report["stopEpisodes"] == []
+  assert report["stateEvidence"]["sampleCount"] == 0
+
+
+def test_state_evidence_explains_standstill_with_stock_cruise_disabled() -> None:
+  analyzer = ProbeAnalyzer("test", "disabled-cruise-stop")
+  for frame in range(101):
+    analyzer.feed_state(
+      10.0 + frame * 0.01,
+      SimpleNamespace(
+        standstill=True,
+        vEgo=0.0,
+        vEgoRaw=0.0,
+        canValid=True,
+        brakePressed=False,
+        gasPressed=False,
+        brakeHoldActive=False,
+        parkingBrake=False,
+        accFaulted=False,
+        cruiseState=SimpleNamespace(enabled=False, standstill=True),
+      ),
+    )
+
+  report = analyzer.report()
+  state = report["stateEvidence"]
+  assert report["stopEpisodes"] == []
+  assert state["standstillSamples"] == 101
+  assert state["cruiseEnabledSamples"] == 0
+  assert state["eligibleStopSamples"] == 0
+  assert state["maxContinuousStandstill"] == 1.0
+  assert state["maxContinuousEligibleStop"] == 0.0
+  assert state["gateTransitions"] == [{
+    "t": 0.0,
+    "standstill": True,
+    "cruiseEnabled": False,
+    "cruiseStandstill": True,
+    "vEgo": 0.0,
+    "vEgoRaw": 0.0,
+    "canValid": True,
+    "brakePressed": False,
+    "gasPressed": False,
+    "brakeHoldActive": False,
+    "parkingBrake": False,
+    "accFaulted": False,
+    "eligibleStop": False,
+  }]
 
 
 def test_extra_res_after_27_seconds_is_direct_failure() -> None:

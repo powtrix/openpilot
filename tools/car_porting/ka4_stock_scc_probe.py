@@ -46,7 +46,7 @@ import math
 import sys
 import time
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1109,6 +1109,74 @@ class ProbeAnalyzer:
       episodes.append((current_start, current_last, start_observed))
     return episodes
 
+  def _state_report(self) -> dict[str, Any]:
+    states = sorted(self.states, key=lambda sample: sample.t)
+
+    def max_continuous_duration(predicate: Callable[[StateSample], bool]) -> float:
+      current_start: float | None = None
+      current_last: float | None = None
+      maximum = 0.0
+      for sample in states:
+        if predicate(sample):
+          if current_start is None or (current_last is not None and sample.t - current_last > STOP_STREAM_GAP):
+            current_start = sample.t
+          current_last = sample.t
+          maximum = max(maximum, sample.t - current_start)
+        else:
+          current_start = current_last = None
+      return round(maximum, 3)
+
+    transitions = []
+    previous: tuple[bool, ...] | None = None
+    for sample in states:
+      gate_state = (
+        sample.standstill,
+        sample.cruise_enabled,
+        sample.can_valid,
+        sample.brake_pressed,
+        sample.gas_pressed,
+        sample.brake_hold_active,
+        sample.parking_brake,
+        sample.acc_faulted,
+      )
+      if gate_state != previous:
+        transitions.append({
+          "t": self._rel(sample.t),
+          "standstill": sample.standstill,
+          "cruiseEnabled": sample.cruise_enabled,
+          "cruiseStandstill": sample.cruise_standstill,
+          "vEgo": sample.v_ego,
+          "vEgoRaw": sample.v_ego_raw,
+          "canValid": sample.can_valid,
+          "brakePressed": sample.brake_pressed,
+          "gasPressed": sample.gas_pressed,
+          "brakeHoldActive": sample.brake_hold_active,
+          "parkingBrake": sample.parking_brake,
+          "accFaulted": sample.acc_faulted,
+          "eligibleStop": sample.stop_active,
+        })
+        previous = gate_state
+
+    return {
+      "sampleCount": len(states),
+      "standstillSamples": sum(sample.standstill for sample in states),
+      "cruiseEnabledSamples": sum(sample.cruise_enabled for sample in states),
+      "eligibleStopSamples": sum(sample.stop_active for sample in states),
+      "canInvalidSamples": sum(not sample.can_valid for sample in states),
+      "brakePressedSamples": sum(sample.brake_pressed for sample in states),
+      "gasPressedSamples": sum(sample.gas_pressed for sample in states),
+      "brakeHoldActiveSamples": sum(sample.brake_hold_active for sample in states),
+      "parkingBrakeSamples": sum(sample.parking_brake for sample in states),
+      "accFaultedSamples": sum(sample.acc_faulted for sample in states),
+      "minAbsVEgo": min((abs(sample.v_ego) for sample in states), default=None),
+      "minAbsVEgoRaw": min((abs(sample.v_ego_raw) for sample in states), default=None),
+      "maxContinuousStandstill": max_continuous_duration(lambda sample: sample.standstill),
+      "maxContinuousCruiseEnabled": max_continuous_duration(lambda sample: sample.cruise_enabled),
+      "maxContinuousEligibleStop": max_continuous_duration(lambda sample: sample.stop_active),
+      "gateTransitions": transitions[:100],
+      "gateTransitionCount": len(transitions),
+    }
+
   def _correlated_timeline(self, button_tx_status_by_id: dict[int, str],
                            cluster_tx_status_by_id: dict[int, str]) -> list[dict[str, Any]]:
     events: list[tuple[float, str, dict[str, Any]]] = []
@@ -1994,6 +2062,7 @@ class ProbeAnalyzer:
       "carParamsSource": self.car_params_source,
       "carParams": self.car_params,
       "params": self.params,
+      "stateEvidence": self._state_report(),
       "streams": self._stream_report(),
       "decodeErrors": dict(self.decode_errors),
       "rawButtonCounters": self._raw_button_counter_report(),
@@ -2295,6 +2364,17 @@ def print_human(report: dict[str, Any]) -> None:
       sep="",
     )
   print(f"Cluster CAN TX matches: {cluster['txMatchCounts']}")
+
+  state = report["stateEvidence"]
+  print(
+    f"carState gates: samples={state['sampleCount']} standstill={state['standstillSamples']} ",
+    f"cruise-enabled={state['cruiseEnabledSamples']} eligible-stop={state['eligibleStopSamples']} ",
+    f"max-continuous(s) standstill={state['maxContinuousStandstill']:.3f} ",
+    f"eligible-stop={state['maxContinuousEligibleStop']:.3f}",
+    sep="",
+  )
+  if state["gateTransitions"]:
+    print(f"  carState gate transitions: {state['gateTransitions']}")
 
   print("Stop episodes:")
   if not report["stopEpisodes"]:
