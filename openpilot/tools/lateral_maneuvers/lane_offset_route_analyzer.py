@@ -2,11 +2,11 @@
 """Evidence-oriented route analyzer for carrot lane-mode path offsets.
 
 The analyzer deliberately separates what an rlog proves from what can only be
-inferred.  In particular, ``PathOffset`` and ``AdjustLaneOffset`` are not
-published as separate numeric fields in ``lateralPlan``.  A static offset is
-therefore accepted as route-proven only on frames where the pre-static lane
-path can be reconstructed unambiguously and the dynamic offset can be parsed
-from ``latDebugText``.
+inferred.  Current validation builds publish ``staticPathOffset``,
+``dynamicLaneOffset``, and ``pathBeforeStaticOffset`` in ``lateralPlan`` so the
+static offset can be checked directly.  Older routes lack those fields; their
+legacy reconstruction is accepted only when the route code matches the local
+planner and the pre-static path can be recovered unambiguously.
 
 Coordinate/sign conventions used by the current carrot implementation:
 
