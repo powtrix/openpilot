@@ -1332,6 +1332,14 @@ struct LateralPlan @0xe1e9318e2ae8b51e {
   position @35 :XYZTData;
   distances @36 :List(Float32);
 
+  # Lane-mode offset evidence in meters. Positive values move the target
+  # path to the right in carrot's lateral-planner coordinate convention.
+  staticPathOffset @37 :Float32;
+  dynamicLaneOffset @38 :Float32;
+  # Target Y after lane/dynamic adjustment but before staticPathOffset. This
+  # has the same horizon and units as dPathPoints.
+  pathBeforeStaticOffset @39 :List(Float32);
+
   struct SolverState {
     x @0 :List(List(Float32));
     u @1 :List(Float32);

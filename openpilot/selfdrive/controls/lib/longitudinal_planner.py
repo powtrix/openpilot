@@ -40,6 +40,17 @@ TURN_CURVATURE_LOOKAHEAD = 1.0
 TURN_CURVATURE_MIN_SPEED = 3.0
 
 
+def sanitize_v_cruise_kph(raw_v_cruise_kph):
+  raw_v_cruise_kph = float(raw_v_cruise_kph)
+  initialized = bool(
+    np.isfinite(raw_v_cruise_kph)
+    and raw_v_cruise_kph >= 0.0
+    and raw_v_cruise_kph != V_CRUISE_UNSET
+  )
+  sanitized = float(np.clip(raw_v_cruise_kph, 0.0, V_CRUISE_MAX)) if np.isfinite(raw_v_cruise_kph) else 0.0
+  return sanitized, initialized
+
+
 def get_max_accel(v_ego):
   return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
 
@@ -170,7 +181,7 @@ class LongitudinalPlanner:
       accel_coast = ACCEL_MAX
 
     v_ego = sm['carState'].vEgo
-    v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
+    v_cruise_kph, v_cruise_initialized = sanitize_v_cruise_kph(sm['carState'].vCruise)
 
     self.v_cruise_kph = carrot.update(sm, v_cruise_kph, self.mpc.mode)
     self.mpc.mode = carrot.mode
@@ -180,8 +191,6 @@ class LongitudinalPlanner:
     if vCluRatio > 0.5:
       self.vCluRatio = vCluRatio
       v_cruise *= vCluRatio
-
-    v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
     force_slow_decel = sm['controlsState'].forceDecel

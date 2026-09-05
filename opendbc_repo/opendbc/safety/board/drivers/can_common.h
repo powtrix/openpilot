@@ -1,5 +1,9 @@
 #include "can_common_declarations.h"
 
+// The device CAN driver owns this flag in panda/board. The host safety-test
+// shim needs the same symbol so buffered-forwarding safety modes can link.
+bool safety_tx_buffered_for_fwd = false;
+
 uint8_t calculate_checksum(const uint8_t *dat, uint32_t len) {
   uint8_t checksum = 0U;
   for (uint32_t i = 0U; i < len; i++) {

@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+from collections.abc import Collection
 from typing import Any
 
 from aiohttp import web
@@ -246,7 +247,11 @@ def route_time_bounds(segments_asc: list[str]) -> tuple[int, int]:
   return route_start, route_end
 
 
-def segment_file_summary(segment_dir_path: str) -> list[dict[str, Any]]:
+def segment_file_summary(
+  segment_dir_path: str,
+  *,
+  artifact_kinds: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
   """Return the original files selected for a segment upload.
 
   Upload exactly one qcamera source and one rlog source. Prefer logger output
@@ -254,8 +259,17 @@ def segment_file_summary(segment_dir_path: str) -> list[dict[str, Any]]:
   artifacts. An rlog is required because the uploaded segment cannot be
   analyzed without it; qcamera is optional so log-only segments remain useful.
   """
+  selected_kinds = set(artifact_kinds) if artifact_kinds is not None else None
+  supported_kinds = {kind for kind, _names in UPLOAD_SOURCE_GROUPS}
+  if selected_kinds is not None and (
+    "rlog" not in selected_kinds or not selected_kinds <= supported_kinds
+  ):
+    raise ValueError("unsupported upload artifact selection")
+
   out: list[dict[str, Any]] = []
   for kind, names in UPLOAD_SOURCE_GROUPS:
+    if selected_kinds is not None and kind not in selected_kinds:
+      continue
     for name in names:
       path = os.path.join(segment_dir_path, name)
       try:

@@ -58,6 +58,11 @@ import {
 } from "./dom_renderer.js";
 import { createSettingsStore } from "./store.js";
 import { createSettingValueCache } from "./value_cache.js";
+import {
+  normalizeValidationUploadStatus,
+  VALIDATION_UPLOAD_STATUS_LABEL_KEYS,
+} from "./validation_upload_status.js";
+import { commitSettingToggle } from "./toggle_commit.js";
 
 const installedTargets = new WeakMap();
 
@@ -123,6 +128,11 @@ export function installSettingsRuntimeFacade(target = globalThis, options = {}) 
     search: Object.freeze({ highlight: highlightSearchText }),
     fingerprint: Object.freeze({ renderSummary: renderFingerprintSummary }),
     risk: Object.freeze({ level: getSettingRiskLevel, renderBadge: renderSettingRiskBadge }),
+    validationUpload: Object.freeze({
+      normalizeStatus: normalizeValidationUploadStatus,
+      statusLabelKeys: VALIDATION_UPLOAD_STATUS_LABEL_KEYS,
+    }),
+    toggle: Object.freeze({ commit: commitSettingToggle }),
     popular: Object.freeze({
       normalizeNumeric: normalizePopularNumericValue,
       isInRange: isPopularValueInRange,

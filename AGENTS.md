@@ -69,6 +69,17 @@
   when the full log is unavailable.
 - Treat Upload Time, Branch, and Commit as incident-analysis metadata, not as path components.
 
+# Automatic validation log lookup
+
+- Authenticated automatic KA4 validation captures are stored separately from manual route uploads at
+  `\\DS1821P\openpilot\.carrot-validation-v1\<dongle-id>\<capture-id>`. When the user asks about an
+  automatically collected validation event, search the exact dongle-ID directory there first, read
+  `manifest.json` to identify the condition, route segments, branch, commit, and route-start settings,
+  and then decode each listed segment's `rlog`, `rlog.bz2`, or `rlog.zst` with the full cereal schema.
+- A capture is usable only after its canonical `manifest.json` exists. An absent manifest means the
+  upload did not receive its authenticated completion receipt; leave that partial capture out of
+  incident conclusions and look for a later retry of the same capture ID.
+
 # Vehicle rlog decoding
 
 - For full rlog analysis, use the full OpenPilot cereal schema. Prefer

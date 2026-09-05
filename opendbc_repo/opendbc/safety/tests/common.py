@@ -722,7 +722,7 @@ class PandaSafetyTest(PandaSafetyTestBase):
         fwd_bus = self.FWD_BUS_LOOKUP.get(bus, -1)
         if bus in self.FWD_BLACKLISTED_ADDRS and addr in self.FWD_BLACKLISTED_ADDRS[bus]:
           fwd_bus = -1
-        self.assertEqual(fwd_bus, self.safety.safety_fwd_hook(bus, addr), f"{addr=:#x} from {bus=} to {fwd_bus=}")
+        self.assertEqual(fwd_bus, self.safety.safety_fwd_hook(make_msg(bus, addr, 8)), f"{addr=:#x} from {bus=} to {fwd_bus=}")
 
   def test_spam_can_buses(self):
     for bus in range(4):
@@ -869,7 +869,7 @@ class PandaCarSafetyTest(PandaSafetyTest):
     for bus in range(3):
       for addr in self.SCANNED_ADDRS:
         self.assertFalse(self._tx(make_msg(bus, addr, 8)))
-        self.assertEqual(-1, self.safety.safety_fwd_hook(bus, addr))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(make_msg(bus, addr, 8)))
 
   def test_prev_gas(self):
     self.assertFalse(self.safety.get_gas_pressed_prev())

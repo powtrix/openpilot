@@ -7,6 +7,29 @@ When you ask a Carrot support specialist to analyze abnormal behavior, use `Logs
 > [!WARNING]
 > Operate Carrot Web only after parking safely. While driving, do not search for or select logs; remember the occurrence time and symptom instead.
 
+<a id="automatic-validation-upload"></a>
+## Automatic KA4 validation upload (experimental)
+
+`System > Record & Power > KA4 Automatic Validation Log Upload (Experimental)` is a bounded collector that removes the need to find or send each log manually. It is off by default. Enabling it once while safely parked is explicit consent for a campaign of up to seven days, including every automatic post-drive upload during that campaign; there is no per-log confirmation. It never changes vehicle-control settings, `Ka4StockSccStandstillRearm`, or `PathOffset` by itself.
+
+The collector arms only when all of this vehicle topology is confirmed:
+
+- Fourth-generation Kia Carnival KA4 (the current vehicle-validation target is model year 2023)
+- CAN FD stock radar SCC and PCM cruise
+- No openpilot longitudinal control and no camera SCC
+
+During a drive it distinguishes the standstill-extension feature being off, a physical RES press while it is off, and an experimental RES frame request being queued while it is on. A stop with the feature on but no controller request is classified separately for failure analysis. It also distinguishes lane-mode `PathOffset=0` from `PathOffset=10` (10 cm right) while `AdjustLaneOffset=0`. The collector also selects sustained acceleration of at least `0.7 m/s²` for `0.5 s` while stock SCC is active, the driver is not pressing a pedal, and the car is closing on a nearby lead. `carState.ka4StockSccKeepaliveRequestCount` records only controller frames appended to the outgoing CAN list, together with the qualification epoch. It does not prove Panda transmission or stock-SCC ECU reception or acceptance, and the ON event therefore means “controller request observed,” not “vehicle behavior changed.”
+
+When a condition is detected, the triggering segment and up to two contiguous preceding segments receive a dedicated temporary retention marker. For acceleration while closing on a lead, one following segment is included when it finishes so the subsequent braking response is available; the total remains capped at three. That marker is separate from driver-created log bookmarks, so completion or consent withdrawal never clears a driver bookmark. Upload begins only after the drive has ended, the device is stopped and off-road, and Wi-Fi is connected. No file selection or upload button is required. An in-progress upload is canceled when consent is withdrawn, driving resumes, Wi-Fi is lost, or the campaign expires.
+
+Each event capture sends **at most three full rlogs only**. A campaign can collect each of seven conditions up to twice, for **at most 14 captures / 42 full rlogs**. At most 5 captures / 750 MiB can wait locally at once, but this is a concurrent pending-data cap, not a cap on cumulative campaign uploads or retry traffic. The collector does not separately send `qcamera`, driver-camera, tmux data, or a Discord notification. A full rlog can nevertheless contain precise location, vehicle CAN and control state, device identifiers, branch, commit and working-tree modification status, Params captured at route start, and low-resolution road thumbnails sampled at roughly one-minute intervals. It does not photograph the Kia cluster or its exact alert text, so the text itself cannot be proven from an rlog alone.
+
+For upload, the device signs a one-time challenge with its existing registration key, and the receiver verifies that device identity with the official comma device API. The user does not enter a token or password. Automatic validation uploads go only to the trusted HTTPS receiver built into the branch, or to an immutable receiver fixed by the system administrator at deployment time. The ordinary Carrot Web upload destination cannot redirect them. The receiver recomputes every file's size and SHA-256, and the device removes a local queue entry only after the capture ID, verified device ID, complete file list, and final manifest hash all match the completion receipt. If the receiver does not support this authenticated protocol or identity verification is temporarily unavailable, the logs remain retained locally and retry automatically.
+
+The queue survives a reboot. Failures retry after approximately 30 seconds, 2 minutes, 10 minutes, 1 hour, and 6 hours, with small timing jitter. Collection is limited to two captures per condition, five concurrently pending captures overall, and about 750 MiB pending. The receiver has a 1 GiB per-device daily limit, so retained local logs may retry automatically the next day after the limit is reached. The setting row shows only a sanitized state, pending count, expiry, and last-upload time; it never shows a route, receiver URL, device ID, capture ID, or raw error. The setting turns itself off after all five required conditions upload or after seven days. Turning it off manually discards pending entries and releases retention markers created by this feature. Consent is excluded from settings backups, restores, and QR transfer; if the saved campaign state is unavailable after a reinstall, explicitly toggle the setting off and on again while parked.
+
+Carrot Web has no user login and treats the local network as its trust boundary. Use it only on a private WPA2/WPA3 tether or hotspot with a strong unique password, not on public Wi-Fi. Automatic uploads over phone tethering can use mobile data; successive captures and retries can make total data use exceed the 750 MiB concurrent local queue limit. Disabling the setting does not delete data already stored on the server; ask the server administrator if deletion is required.
+
 ## Record these details first
 
 Note as much of the following as possible:

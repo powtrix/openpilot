@@ -21,6 +21,7 @@ from ..services.params import (
   build_params_qr_payload,
   clamp_numeric,
   ensure_qr_dependency,
+  filter_param_values_for_backup,
   get_param_values,
   get_qr_dependency_status,
   parse_params_qr_payload,
@@ -28,9 +29,59 @@ from ..services.params import (
   restore_param_values_validated,
   restore_param_values_from_backup,
   set_param_value,
+  VALIDATION_AUTO_UPLOAD_PARAM,
 )
 from ..services.settings import get_settings_cached
 from .system import is_drive_engaged
+
+
+# A few device settings intentionally live outside carrot_settings.json. Keep
+# that compatibility explicit; never let this network-facing endpoint become
+# an arbitrary writer for manager/runtime Params such as IsOnroad/IsOffroad.
+WEB_PARAM_SET_EXTRA_ALLOWED = frozenset({
+  "CarSelected3",
+  "LanguageSetting",
+  "LongitudinalPersonality",
+  "ScreenRecord",
+})
+
+
+def _binary_param_value(value) -> int | None:
+  try:
+    numeric = float(value)
+  except (TypeError, ValueError):
+    return None
+  if numeric == 0:
+    return 0
+  if numeric == 1:
+    return 1
+  return None
+
+
+def _request_is_explicitly_offroad(request: web.Request) -> bool:
+  params = request.app.get("params")
+  if params is None:
+    return False
+  try:
+    return bool(params.get_bool("IsOffroad")) and not bool(params.get_bool("IsOnroad"))
+  except Exception:
+    return False
+
+
+def _request_has_web_consent_proof(request: web.Request) -> bool:
+  """Reject form/redirect based cross-site consent attempts.
+
+  The custom header is deliberately supplied by Carrot Web's shared JSON
+  client. Browsers cannot add it from an ordinary cross-site form, and the
+  JSON media type keeps aiohttp from accepting a text/plain body as consent.
+  """
+  try:
+    return (
+      request.content_type == "application/json"
+      and request.headers.get("X-Carrot-Web-Request") == "1"
+    )
+  except Exception:
+    return False
 
 
 async def api_params_bulk(request: web.Request) -> web.Response:
@@ -79,8 +130,9 @@ async def api_param_set(request: web.Request) -> web.Response:
   value = body.get("value")
   source = body.get("source")
 
-  if not name:
+  if not isinstance(name, str) or not name.strip():
     return web.json_response({"ok": False, "error": "missing name"}, status=400)
+  name = name.strip()
 
   # clamp using settings if numeric
   p = None
@@ -88,7 +140,12 @@ async def api_param_set(request: web.Request) -> web.Response:
     _, _, by_name, _ = get_settings_cached()
     p = by_name.get(name)
   except Exception:
-    pass
+    by_name = {}
+  if p is None and name not in WEB_PARAM_SET_EXTRA_ALLOWED:
+    return web.json_response({
+      "ok": False,
+      "error": "parameter is not writable through the settings API",
+    }, status=403)
 
   # Read the old value before writing so the history can show what it replaced.
   previous = None
@@ -110,8 +167,30 @@ async def api_param_set(request: web.Request) -> web.Response:
   except Exception:
     pass
 
+  allow_validation_auto_upload_enable = False
+  if name == VALIDATION_AUTO_UPLOAD_PARAM and _binary_param_value(value) == 1:
+    if not _request_has_web_consent_proof(request):
+      return web.json_response({
+        "ok": False,
+        "error": "automatic validation log collection requires an explicit Carrot Web consent request",
+      }, status=403)
+    # Require the parked/offroad proof for every positive write, not only an
+    # apparent 0->1 transition. That keeps a stale read or concurrent disable
+    # from turning an onroad no-op request into a new consent edge.
+    if not _request_is_explicitly_offroad(request):
+      return web.json_response({
+        "ok": False,
+        "error": "automatic validation log collection can only be enabled while offroad",
+      }, status=409)
+    allow_validation_auto_upload_enable = True
+
   try:
-    set_param_value(name, value, p)
+    set_param_value(
+      name,
+      value,
+      p,
+      allow_validation_auto_upload_enable=allow_validation_auto_upload_enable,
+    )
   except Exception as e:
     return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -198,8 +277,18 @@ async def handle_download_params_backup(request: web.Request) -> web.Response:
   if not os.path.exists(path):
     return web.json_response({"ok": False, "error": "file not found"}, status=404)
 
-  return web.FileResponse(
-    path,
+  try:
+    with open(path, encoding="utf-8") as f:
+      values = json.load(f)
+    if not isinstance(values, dict):
+      raise ValueError("bad json format (must be object)")
+    values = filter_param_values_for_backup(values)
+  except Exception as e:
+    return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+  return web.Response(
+    text=json.dumps(values, ensure_ascii=False, indent=2),
+    content_type="application/json",
     headers={"Content-Disposition": "attachment; filename=params_backup.json"},
   )
 

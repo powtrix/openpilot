@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import time
@@ -9,10 +11,17 @@ from contextlib import ExitStack
 from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout
+from openpilot.common.api import Api
 
 
 DEFAULT_WEB_UPLOAD_URL = "https://upload.shind0.synology.me"
 DEFAULT_TMUX_WEB_UPLOAD_URL = "https://tmux.carrotpilot.app/upload"
+VALIDATION_IDENTITY_TOKEN_TTL_SECONDS = 120
+VALIDATION_COMPLETION_CONNECT_TIMEOUT_SECONDS = 20
+# Completion makes the receiver re-hash as many as three rlogs (up to 750 MiB).
+# Bound connection establishment, but allow the authenticated integrity check
+# enough read time on a slow NAS instead of imposing the generic 15 s timeout.
+VALIDATION_COMPLETION_READ_TIMEOUT_SECONDS = 30 * 60
 
 
 def normalize_base_url(value: Any, default: str = "") -> str:
@@ -85,6 +94,50 @@ def upload_device_id(metadata: Mapping[str, Any]) -> str:
   return "unknown"
 
 
+def validation_manifest_sha256(
+  device_id: str,
+  capture_id: str,
+  files: Sequence[Mapping[str, Any]],
+  validation_capture: Mapping[str, Any] | None = None,
+) -> str:
+  """Hash the exact canonical manifest persisted by receiver protocol v1."""
+  normalized_files = sorted(({
+    "segment": str(item.get("segment") or ""),
+    "name": str(item.get("name") or ""),
+    "size": int(item.get("size")),
+    "sha256": str(item.get("sha256") or "").lower(),
+  } for item in files), key=lambda item: (item["segment"], item["name"]))
+  manifest = {
+    "captureId": str(capture_id),
+    "deviceAuthVersion": 1,
+    "deviceId": str(device_id),
+    "files": normalized_files,
+    "receiptVersion": 1,
+    "validationCapture": dict(validation_capture or {}),
+  }
+  encoded = (json.dumps(
+    manifest,
+    ensure_ascii=False,
+    allow_nan=False,
+    separators=(",", ":"),
+    sort_keys=True,
+  ) + "\n").encode("utf-8")
+  return hashlib.sha256(encoded).hexdigest()
+
+
+def validation_receipt_id(manifest_sha256: Any) -> str:
+  """Derive the exact receiver v1 receipt from a canonical manifest hash."""
+  manifest = str(manifest_sha256 or "")
+  if (
+    len(manifest) != 64
+    or any(character not in "0123456789abcdef" for character in manifest)
+  ):
+    return ""
+  return hashlib.sha256(
+    b"carrot-validation-receipt-v1\0" + manifest.encode("ascii"),
+  ).hexdigest()
+
+
 def _session_payload(metadata: Mapping[str, Any], purpose: str) -> dict[str, str]:
   payload = {str(key): str(value or "")[:160] for key, value in metadata.items()}
   payload["deviceId"] = upload_device_id(metadata)
@@ -97,6 +150,17 @@ def _session_token(body: Any) -> str:
   if not token:
     raise RuntimeError("upload server did not issue a session")
   return token
+
+
+def _ensure_validation_request_safe(should_continue: Callable[[], bool] | None) -> None:
+  if should_continue is None:
+    return
+  try:
+    allowed = bool(should_continue())
+  except Exception:
+    allowed = False
+  if not allowed:
+    raise RuntimeError("validation upload safety policy changed")
 
 
 async def create_web_upload_session(
@@ -115,6 +179,87 @@ async def create_web_upload_session(
       if not 200 <= resp.status < 300 or not (body or {}).get("ok"):
         error = str((body or {}).get("error") or text or "")[:300]
         raise RuntimeError(f"upload session HTTP {resp.status}: {error}")
+      return _session_token(body)
+
+
+async def create_validation_upload_session(
+  base_url: str,
+  metadata: Mapping[str, Any],
+  should_continue: Callable[[], bool] | None = None,
+) -> str:
+  """Authenticate a validation upload with the device's registered comma key."""
+  device_id = upload_device_id(metadata)
+  if device_id == "unknown":
+    raise RuntimeError("registered device id is required for validation upload")
+  timeout = ClientTimeout(total=15)
+  async with ClientSession(timeout=timeout) as session:
+    _ensure_validation_request_safe(should_continue)
+    async with session.post(
+      api_url(base_url, "validation", "challenge"),
+      json={"deviceId": device_id},
+      allow_redirects=False,
+    ) as response:
+      text = await response.text()
+      try:
+        challenge = json.loads(text)
+      except Exception:
+        challenge = None
+      if (
+        not 200 <= response.status < 300
+        or not isinstance(challenge, dict)
+        or challenge.get("ok") is not True
+        or challenge.get("deviceAuthVersion") != 1
+        or challenge.get("receiptVersion") != 1
+      ):
+        error = str((challenge or {}).get("error") or text or "validation authentication unavailable")[:300]
+        raise RuntimeError(f"validation challenge HTTP {response.status}: {error}")
+
+    _ensure_validation_request_safe(should_continue)
+    challenge_id = str(challenge.get("challengeId") or "")
+    nonce = str(challenge.get("nonce") or "")
+    audience = str(challenge.get("audience") or "")
+    if not challenge_id or not nonce or not audience:
+      raise RuntimeError("validation challenge is incomplete")
+    claims = {
+      "carrotUploadChallenge": challenge_id,
+      "carrotUploadNonce": nonce,
+      "carrotUploadPurpose": "validation",
+      "carrotUploadAudience": audience,
+    }
+    identity_token = await asyncio.to_thread(
+      Api(device_id).get_token,
+      payload_extra=claims,
+      # This general comma device JWT is needed only for the one-time receiver
+      # verification exchange. Keep its replay window much shorter than the
+      # receiver session used for the actual rlog upload.
+      expiry_hours=VALIDATION_IDENTITY_TOKEN_TTL_SECONDS / 3600,
+    )
+    session_payload = _session_payload(metadata, "validation")
+    session_payload.update({
+      "challengeId": challenge_id,
+      "identityToken": identity_token,
+    })
+    _ensure_validation_request_safe(should_continue)
+    async with session.post(
+      api_url(base_url, "validation", "session"),
+      json=session_payload,
+      allow_redirects=False,
+    ) as response:
+      text = await response.text()
+      try:
+        body = json.loads(text)
+      except Exception:
+        body = None
+      if (
+        not 200 <= response.status < 300
+        or not isinstance(body, dict)
+        or body.get("ok") is not True
+        or body.get("deviceAuthVersion") != 1
+        or body.get("receiptVersion") != 1
+        or body.get("verifiedDeviceId") != device_id
+      ):
+        error = str((body or {}).get("error") or text or "validation authentication failed")[:300]
+        raise RuntimeError(f"validation session HTTP {response.status}: {error}")
       return _session_token(body)
 
 
@@ -283,6 +428,112 @@ async def upload_folder_to_web(
   return True
 
 
+async def upload_validation_folder_to_web(
+  local_folder: str,
+  segment: str,
+  capture_id: str,
+  base_url: str,
+  token: str,
+  expected_files: Sequence[Mapping[str, Any]],
+  should_cancel: Callable[[], bool] | None = None,
+  on_progress: Callable[[str, int, int, int], None] | None = None,
+) -> bool:
+  """Stream an immutable, hash-verified validation capture segment."""
+  def check_cancel() -> None:
+    if should_cancel and should_cancel():
+      raise RuntimeError("upload canceled")
+
+  expected_by_name = {
+    str(item.get("name") or ""): item
+    for item in expected_files
+    if str(item.get("segment") or "") == segment
+  }
+  if not expected_by_name:
+    raise RuntimeError(f"validation manifest has no files for {segment}")
+  if not token:
+    raise RuntimeError("authenticated validation upload session is not configured")
+
+  headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}
+  timeout = ClientTimeout(total=None, connect=20, sock_read=180)
+  async with ClientSession(timeout=timeout, headers=headers) as session:
+    for filename, expected in sorted(expected_by_name.items()):
+      if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
+        raise RuntimeError("invalid validation filename")
+      path = os.path.join(local_folder, filename)
+      expected_size = int(expected.get("size") or -1)
+      expected_sha256 = str(expected.get("sha256") or "").lower()
+      if expected_size < 0 or len(expected_sha256) != 64 or not os.path.isfile(path):
+        raise RuntimeError(f"invalid validation manifest for {filename}")
+      if os.path.getsize(path) != expected_size:
+        raise RuntimeError(f"local validation file size changed: {filename}")
+
+      url = api_url(base_url, "validation", "upload", capture_id, segment, filename)
+      last_error: Exception | None = None
+      for _attempt in range(2):
+        sent = 0
+        digest = hashlib.sha256()
+
+        async def send_file(
+          source_path: str = path,
+          upload_name: str = filename,
+          upload_size: int = expected_size,
+          upload_digest: Any = digest,
+        ):
+          nonlocal sent
+          if on_progress:
+            on_progress(upload_name, 0, upload_size, 0)
+          check_cancel()
+          with open(source_path, "rb") as source:
+            while True:
+              check_cancel()
+              chunk = source.read(1024 * 1024)
+              if not chunk:
+                break
+              upload_digest.update(chunk)
+              sent += len(chunk)
+              if on_progress:
+                on_progress(upload_name, sent, upload_size, len(chunk))
+              yield chunk
+
+        try:
+          check_cancel()
+          async with session.put(
+            url,
+            data=send_file(),
+            headers={
+              "X-File-Size": str(expected_size),
+              "X-Content-SHA256": expected_sha256,
+            },
+            allow_redirects=False,
+          ) as response:
+            text = await response.text()
+            try:
+              body = json.loads(text)
+            except Exception:
+              body = None
+            local_sha256 = digest.hexdigest()
+            if (
+              not 200 <= response.status < 300
+              or not isinstance(body, dict)
+              or body.get("ok") is not True
+              or int(body.get("size") or -1) != sent
+              or str(body.get("sha256") or "").lower() != local_sha256
+              or sent != expected_size
+              or local_sha256 != expected_sha256
+            ):
+              error = str((body or {}).get("error") or text or "validation receipt mismatch")[:300]
+              raise RuntimeError(f"validation upload HTTP {response.status}: {error}")
+          last_error = None
+          break
+        except Exception as exc:
+          check_cancel()
+          last_error = exc
+      if last_error is not None:
+        raise RuntimeError(f"{filename}: {last_error}") from last_error
+      check_cancel()
+  return True
+
+
 async def send_web_upload_complete(base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
   if not token:
     return {"ok": False, "error": "upload session is not configured"}
@@ -295,8 +546,90 @@ async def send_web_upload_complete(base_url: str, token: str, payload: dict[str,
         headers={"Authorization": f"Bearer {token}"},
       ) as resp:
         text = await resp.text()
-        if 200 <= resp.status < 300:
-          return {"ok": True, "status": resp.status}
-        return {"ok": False, "status": resp.status, "error": text[:300]}
+        try:
+          body = json.loads(text)
+        except Exception:
+          body = None
+
+        result = dict(body) if isinstance(body, dict) else {}
+        result["status"] = resp.status
+        result["ok"] = 200 <= resp.status < 300 and isinstance(body, dict) and body.get("ok") is True
+        if not result["ok"] and not result.get("error"):
+          result["error"] = text[:300] or "upload completion was not acknowledged"
+        return result
   except Exception as e:
     return {"ok": False, "error": str(e)}
+
+
+async def send_validation_upload_complete(
+  base_url: str,
+  token: str,
+  payload: dict[str, Any],
+  should_continue: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+  if not token:
+    return {"ok": False, "error": "authenticated validation upload session is not configured"}
+  try:
+    request_payload = {
+      "deviceId": str(payload.get("deviceId") or ""),
+      "captureId": str(payload.get("captureId") or ""),
+      "files": list(payload.get("files") or []),
+      "validationCapture": (
+        dict(payload.get("validationCapture"))
+        if isinstance(payload.get("validationCapture"), Mapping)
+        else {}
+      ),
+    }
+    timeout = ClientTimeout(
+      total=None,
+      connect=VALIDATION_COMPLETION_CONNECT_TIMEOUT_SECONDS,
+      sock_read=VALIDATION_COMPLETION_READ_TIMEOUT_SECONDS,
+    )
+    async with ClientSession(timeout=timeout) as session:
+      _ensure_validation_request_safe(should_continue)
+      async with session.post(
+        api_url(base_url, "validation", "complete"),
+        json=request_payload,
+        headers={"Authorization": f"Bearer {token}"},
+        allow_redirects=False,
+      ) as response:
+        text = await response.text()
+        try:
+          body = json.loads(text)
+        except Exception:
+          body = None
+        result = dict(body) if isinstance(body, dict) else {}
+        result["status"] = response.status
+        try:
+          expected_device_id = request_payload["deviceId"]
+          expected_capture_id = request_payload["captureId"]
+          expected_manifest_sha256 = validation_manifest_sha256(
+            expected_device_id,
+            expected_capture_id,
+            request_payload["files"],
+            request_payload["validationCapture"],
+          )
+          expected_receipt_id = validation_receipt_id(expected_manifest_sha256)
+        except Exception:
+          expected_device_id = ""
+          expected_capture_id = ""
+          expected_manifest_sha256 = ""
+          expected_receipt_id = ""
+        result["ok"] = (
+          200 <= response.status < 300
+          and isinstance(body, dict)
+          and body.get("ok") is True
+          and body.get("receiptVersion") == 1
+          and bool(expected_device_id)
+          and bool(expected_capture_id)
+          and body.get("deviceId") == expected_device_id
+          and body.get("verifiedDeviceId") == expected_device_id
+          and body.get("captureId") == expected_capture_id
+          and body.get("manifestSha256") == expected_manifest_sha256
+          and body.get("receiptId") == expected_receipt_id
+        )
+        if not result["ok"] and not result.get("error"):
+          result["error"] = text[:300] or "validation completion receipt was not verified"
+        return result
+  except Exception as exc:
+    return {"ok": False, "error": str(exc)}

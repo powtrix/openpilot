@@ -3,7 +3,7 @@ import unittest
 
 from opendbc.car.tesla.values import TeslaSafetyFlags
 from opendbc.car.structs import CarParams
-from opendbc.can.can_define import CANDefine
+from opendbc.can import CANDefine
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerPanda
@@ -139,12 +139,12 @@ class TestTeslaLongitudinalSafety(TestTeslaSafetyBase):
 
     # stock system sends no AEB -> no forwarding, and OP is allowed to TX
     self.assertEqual(1, self._rx(no_aeb_msg_cam))
-    self.assertEqual(-1, self.safety.safety_fwd_hook(2, no_aeb_msg_cam.addr))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(no_aeb_msg_cam))
     self.assertTrue(self._tx(no_aeb_msg))
 
     # stock system sends AEB -> forwarding, and OP is not allowed to TX
     self.assertEqual(1, self._rx(aeb_msg_cam))
-    self.assertEqual(0, self.safety.safety_fwd_hook(2, aeb_msg_cam.addr))
+    self.assertEqual(0, self.safety.safety_fwd_hook(aeb_msg_cam))
     self.assertFalse(self._tx(no_aeb_msg))
 
   def test_prevent_reverse(self):
