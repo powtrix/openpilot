@@ -29,6 +29,8 @@ carrotpilot의 세부 설정은 **Carrot Web에서 모두 확인하고 변경하
 
 접속 문제와 다른 화면의 설명은 [Carrot Web](https://github.com/ajouatom/openpilot/wiki/Guide-Carrot-Web)을 참고하세요.
 
+Carrot Web에는 사용자 로그인이 없으며 로컬 네트워크의 장치를 신뢰합니다. 강력하고 고유한 암호를 건 개인용 WPA2/WPA3 테더링·핫스팟에서만 사용하고, 7000·6999 포트를 인터넷에 공개하거나 공용 Wi-Fi에서 Carrot Web을 열지 마세요. 휴대폰 테더링은 자동 전송 시 모바일 데이터를 사용할 수 있습니다.
+
 ## 설정 화면 사용법
 
 Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
@@ -97,30 +99,32 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 ## 전체 설정 지도
 
-현재 `carrot-wip`의 `carrot_settings.json`에는 **171개 파라미터**가 있으며, 모든 항목이 아래 메뉴에 연결되어 있습니다.
+현재 `carrot-wip`의 `carrot_settings.json`에는 **176개 파라미터**가 있으며, 모든 항목이 아래 메뉴에 연결되어 있습니다.
 
 | 대분류 | 항목 수 | 중분류 |
 |---|---:|---|
-| 주행 제어 | 107 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
-| 차량·하드웨어 | 16 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
+| 주행 제어 | 112 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
+| 차량·하드웨어 | 14 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
 | 화면 표시 | 37 | 정보 표시, 경로 표시, 밝기·주행화면, 외부 HUD |
-| 시스템 | 11 | 녹화·전원, 네트워크·지도, 사운드, 소프트웨어 |
+| 시스템 | 13 | 녹화·전원, 카메라, 네트워크·지도, 사운드, 소프트웨어 |
 
 ## 주행 제어
 
-주행 제어는 차량 움직임에 영향을 줄 수 있는 107개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
+주행 제어는 차량 움직임에 영향을 줄 수 있는 112개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
 
 <a id="start-auto"></a>
-### 시작·오토 — 8개
+### 시작·오토 — 10개
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
 | 시작 동작 | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | 상시 조향, 주행 시작 시 자동 활성화, 저속 조향 제한 |
-| 오토크루즈 | `AutoCruiseControl`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | 크루즈 자동 활성화와 가속 페달 입력 시 동작 |
+| 오토크루즈 | `AutoCruiseControl`, `SoftHoldOnCancel`, `Ka4StockSccStandstillRearm`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | 크루즈 자동 활성화, 취소 후 소프트홀드와 KA4 순정 SCC 시험 동작 |
 
 - `AlwaysLateral`: 크루즈가 켜져 있지 않아도 조향 제어를 허용합니다.
 - `AutoEngage`: `0` 끄기, `1` 조향 ON, `2` 조향 ON과 크루즈 대기입니다.
 - `AutoCruiseControl`: 현대·기아 차량용 오토크루즈와 소프트홀드 관련 설정입니다.
+- `SoftHoldOnCancel`: 크루즈가 취소된 상태에서도 정차 후 소프트홀드를 허용할지 정합니다.
+- `Ka4StockSccStandstillRearm`: 정확한 적용 범위와 인터록은 [버튼·프리셋의 KA4 시험 설명](buttons-presets.md#ka4-stock-scc-standstill)을 확인하세요.
 - `DisableMinSteerSpeed`: SMDPS 장착 차량의 저속 조향 제한과 관련된 차량별 설정입니다.
 
 ### 버튼·프리셋 — 15개
@@ -174,7 +178,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 `TrafficLightDetectMode`는 `0` 미사용, `1` 정지만 감지, `2` 정지와 출발을 모두 감지합니다. 모델 판단에 의존하므로 운전자가 항상 직접 확인해야 합니다.
 
-### 크루즈·차간 — 전체 31개, 현대·기아·제네시스 28개
+### 크루즈·차간 — 전체 29개, 현대·기아·제네시스 26개
 
 아래 표의 **세부 구역 제목을 누르면** 실제 코드 기준의 계산 방식, 값의 방향과 주의사항을 설명한 페이지로 이동합니다.
 
@@ -185,7 +189,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 | [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입과 재출발 특성 |
 | [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차는 Kp/Ki/Kf `100/0/100` 고정·숨김, 다른 브랜드는 조정 가능 |
 | [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollow`, `DynamicTFollowLC`, `EnableSpeedTF`, `TFollowDecelBoost` | 차간 단계별 시간, 동적 차간과 감속 여유 |
-| [선행차 반응](cruise-gap.md#lead-response) | `LeadAccelResponse`, `JLeadFactor3`, `RadarReactionFactor` | TF1 앞차 가속과 선행차 변화에 대한 반응 특성 |
+| [선행차 반응](cruise-gap.md#lead-response) | `LeadAccelResponse` | TF1 앞차 출발·가속에 대한 MPC 반응 특성 |
 | [당근 크루즈](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | 연비 제어와 당근 크루즈 감속 특성 |
 
 `MyDrivingMode`는 `1` 연비, `2` 안전, `3` 일반, `4` 고속 모드입니다. 고속 모드는 신호 감지를 무시하고 가속 성향을 높이므로 모드 이름만 보고 선택하지 말고 설명을 확인하세요.
@@ -199,25 +203,23 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 <a id="vehicle-hardware"></a>
 ## 차량·하드웨어
 
-차량·하드웨어 16개 항목은 차종, 하네스와 기기 하드웨어 구성을 결정하는 설정입니다. 화면 표시 설정처럼 시험 삼아 켜면 안 됩니다.
+차량·하드웨어 14개 항목은 차종, 하네스와 기기 하드웨어 구성을 결정하는 설정입니다. 화면 표시 설정처럼 시험 삼아 켜면 안 됩니다.
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
 | 현대·기아 | `HyundaiCameraSCC`, `IsLdwsCar`, `HapticFeedbackWhenSpeedCamera` | SCC 연결 방식, LDWS 차량과 카메라 구간 햅틱 |
 | CANFD·HDA | `CanfdHDA2`, `CanfdDebug`, `HDPuse` | HDA2 차량과 CAN FD 디버그·HDP 기능 |
-| 레이더 | `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity` | SCC 레이더, 레이더 트랙, 코너 레이더와 당근레이더 처리·컷인 감도 |
+| 레이더 | `EnableRadarTracks`, `EnableCornerRadar` | SCC 레이더 트랙과 코너 레이더 사용 방식 |
 | 운전자 모니터링 | `DisableDM`, `MuteDoor`, `MuteSeatbelt` | 운전자 모니터링과 일부 차량 경고음 처리 |
 | 차량 보조 | `MaxAngleFrames`, `SpeedFromPCM` | 최대 조향각 관련 프레임과 순정 SCC 속도 제어 방식 |
 | 기기 하드웨어 | `HardwareC3xLite` | 스피커가 없는 C3X Lite의 알림음과 프로세스 구성 |
 
 > [!CAUTION]
-> `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity`, `SpeedFromPCM`은 잘못 설정하면 차량 인식, SCC, 레이더와 가감속 동작이 달라질 수 있습니다. 차종, 연식, HDA 구성, 하네스 연결 위치와 순정 ACC 사용 여부를 확인한 뒤 변경하세요.
+> `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `EnableCornerRadar`, `SpeedFromPCM`은 잘못 설정하면 차량 인식, SCC, 레이더와 가감속 동작이 달라질 수 있습니다. 차종, 연식, HDA 구성, 하네스 연결 위치와 순정 ACC 사용 여부를 확인한 뒤 변경하세요.
 
 - `HyundaiCameraSCC`: 현대·기아 차량의 롱컨, 크루즈 동기화와 CAN FD 배선 구성에 따라 모드가 달라집니다.
 - `CanfdHDA2`: HDA2 차량에서만 활성화합니다.
 - `EnableRadarTracks`: `-2`는 비전 전용 시험, `-1`은 비전 매칭 없이 SCC를 항상 사용, `0`은 SCC-비전 매칭, `1`은 SCC 없이 프런트 레이더-비전 매칭, `2`는 프런트 레이더와 저속 SCC-비전 매칭, `3`은 프런트 레이더-비전 매칭 실패 시 SCC 강제 사용입니다. 매칭 모드는 실패 시 확률 `0.40` 이상인 중앙 비전을 사용하고, `-1`·`3`은 SCC가 없을 때만 비전으로 전환합니다. 강제 SCC는 횡좌표를 무시합니다. 레거시 Mando 레이더의 32·64슬롯 차이는 자동 처리합니다. 새 정지 전방 리드는 비전 또는 동일 물체의 코너 검출로 확인해야 하며, 전방 레이더의 연속 관측만으로 승인하지 않습니다. 비전의 위치·속도와 일치하는 이동 레이더가 별도로 확인되면, 그 비전을 다른 정지 반사체의 승인·유지 근거로 사용하지 않습니다. 코너 근거도 선택한 정지 객체와 실제로 일치해야 인정합니다. 동일 객체의 코너 확인이 없는 미확정 프런트는 비전 근거가 허용된 짧은 공백을 넘겨 끊기면 객체와 확인 시간을 함께 초기화하고 다시 확인합니다. 이미 선택한 이동 프런트는 같은 실측 객체의 연속성이 유지되면 제한된 비전 거리 불확실도 안에서 L1을 유지하며, 고정 8m 차이만으로 버리지 않습니다. 더 가까운 새 매칭은 즉시 선택할 수 있고, 공백이나 물리적 급변이 생기면 이 유지 허용치를 초기화합니다.
-- `CarrotRadarMode`: 전방·코너 레이더로 차량의 움직임을 계속 추적해 끼어드는 차량을 감지하고, 카메라 영상과 레이더 정보를 새로운 방식으로 맞춰 앞차를 선택합니다. 코너 레이더와 레이더 트랙 기능이 모두 없는 차량에서는 기존 방식과 동일하게 동작합니다. 가감속 동작이 달라질 수 있으므로 검증을 마친 동일 차량에서만 켭니다. 변경값은 다음 OnRoad가 시작될 때 고정되므로, 변경 후 현재 주행을 끝내고 차량을 재시동하거나 기기를 재부팅해야 적용됩니다. 기존 `RadarMotionMode` 값은 업데이트 후 처음 시작할 때 새 이름으로 한 번 자동 이관됩니다.
-- `CarrotRadarCutInSensitivity`: 당근레이더모드 전용 CUT-IN 감도입니다. `0`은 사용 안 함, `1`은 둔감, `3`은 보통(기본값), `5`는 아주 민감이며 `2`와 `4`는 중간 단계입니다. 단계 `1`~`5`는 실제 측정 움직임이 각각 `0.50`, `0.40`, `0.35`, `0.25`, `0.20초` 계속될 때 확정하며, 물리 미래 예측시간은 5.0초로 고정합니다. 전방 레이더의 최근 실측 이력에서 0.50m 이상 강한 단방향 진입이 확인되면 timestamp 양자화로 확정을 놓치지 않도록 최대 20Hz 레이더 한 프레임만 반영하며, 작은 인접 차로 흔들림에는 적용하지 않습니다. 기존 레이더모드와 `EnableCornerRadar`에는 영향을 주지 않습니다. 다음 OnRoad 시작 때 읽으므로 변경 후 차량을 재시동하거나 기기를 재부팅해야 적용됩니다.
 - `DisableDM`: 운전자 모니터링을 비활성화할 수 있는 안전 관련 항목이며 재부팅이 필요합니다.
 - `SpeedFromPCM`: 비롱컨 순정 SCC의 버튼 스패밍과 커브·카메라 감속 방식에 영향을 줍니다.
 
@@ -231,7 +233,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
 | 정보 표시 | `ShowDebugUI`, `ShowTpms`, `ShowDateTime`, `ShowPathEnd`, `ShowDeviceState`, `ShowLaneInfo`, `ShowRadarInfo`, `ShowRouteInfo`, `ShowPlotMode` | 주행 화면의 디버그, 타이어, 시간, 차선, 레이더와 경로 정보 |
-| 경로 표시 | `ShowPathMode`, `ShowPathColor`, `ShowPathColorCruiseOff`, `ShowPathModeLane`, `ShowPathColorLane` | 레인리스·레인모드·크루즈 OFF 상태의 경로 모양과 색상 |
+| 경로 표시 | `CarrotTireTrajectory`, `ShowPathMode`, `ShowPathColor`, `ShowPathColorCruiseOff`, `ShowPathModeLane`, `ShowPathColorLane` | 타이어 궤적과 레인리스·레인모드·크루즈 OFF 상태의 경로 모양·색상 |
 | 밝기·주행화면 | `ShowCustomBrightness`, `ShowModelView`, `ShowCameraWithCluster` | 주행 중 밝기, 카메라·모델 표시 조합과 외부 HUD 연결 중 본체 카메라 표시 |
 | 외부 HUD·기본 | `ClusterHud`, `ClusterHudBrightness`, `ClusterHudOrientation`, `ClusterHudMirror`, `ClusterHudTheme`, `ClusterNaviMapTheme`, `ClusterNaviMapType`, `ClusterNaviMapFps` | TURZX 외부 HUD, 밝기, 화면 회전, 미러링과 지도 테마 |
 | 외부 HUD·화면·카메라 | `ClusterHudEncoder`, `ClusterHudLiveFps`, `ClusterHudScreenMode`, `ClusterHudPanelLayout`, `ClusterHudCameraViewMode` | 인코더, 전송 FPS와 화면·카메라·좌우 패널 구성 |
@@ -283,18 +285,21 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 <a id="system"></a>
 ## 시스템
 
-시스템에는 녹화, 전원, 네트워크, 지도, 소리와 소프트웨어 메뉴를 다루는 11개 항목이 있습니다.
+시스템에는 녹화, 전원, 카메라, 네트워크, 지도, 소리와 소프트웨어 메뉴를 다루는 13개 항목이 있습니다.
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
-| 녹화·전원 | `RecordRoadCam`, `MaxTimeOffroadMin` | 도로 카메라 저장과 시동 OFF 후 자동 전원 종료 시간 |
+| 녹화·전원 | `RecordRoadCam`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | 도로 카메라 저장, KA4 검증 로그 자동 전송과 시동 OFF 후 자동 전원 종료 시간 |
 | YouTube 라이브 | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | 카메라 영상 송출, 품질과 타임스탬프 |
+| 카메라 | `UseWideCamera` | 광각 전방 카메라 고장 시의 입력 대체 |
 | 네트워크·지도 | `HotspotOnBoot`, `MapboxStyle` | 부팅 시 핫스팟과 지도 배경 스타일 |
 | 사운드 | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | 안내음 언어와 일반·인게이지 볼륨 |
 | 소프트웨어 | `SoftwareMenu` | Carrot Web의 소프트웨어 메뉴 활성화 |
 
 - `RecordRoadCam`: `0` 녹화 안 함, `1` 일반 카메라, `2` 일반+광각 카메라입니다. 저장 공간 사용량을 확인하세요.
+- `CarrotValidationAutoUpload`: 기본값은 꺼짐입니다. 주차 중 한 번 동의하면 최대 7일 동안 해당 KA4 시험 조건의 로그 선택과 주행 후 Wi-Fi 전송을 로그별 재확인 없이 자동 처리합니다. 이벤트 캡처당 최대 3개, 캠페인당 최대 14개 캡처/42개 full rlog를 다루며 동시에 대기하는 큐는 최대 5개 캡처/750 MiB입니다. 750 MiB는 동시 대기 한도라 누적 전송량이나 재시도 데이터 사용량은 이를 넘을 수 있고, 서버의 장치별 일일 1 GiB 한도에 도달하면 보존한 로그를 다음 날 재시도할 수 있습니다. 브랜치에 내장되거나 배포 시 고정된 수신 서버만 사용하며 Carrot Web의 일반 전송 목적지로 우회할 수 없습니다. 설정 줄에는 정리된 대기 상태가 표시됩니다. 휴대폰 테더링은 모바일 데이터를 쓸 수 있고 설정을 꺼도 이미 서버에 전송된 자료는 자동 삭제되지 않습니다. 전체 범위와 개인정보는 [분석용 대시캠 로그 전송](dashcam-log-sharing.md#automatic-validation-upload)을 먼저 확인하세요.
 - `MaxTimeOffroadMin`: 시동이 꺼진 뒤 장치가 자동으로 꺼질 때까지의 시간입니다.
+- `UseWideCamera`: 광각 전방 카메라가 고장 난 장치에서만 끄고 장치를 재부팅합니다.
 - `CarrotYouTubeLive`: 네트워크 사용량, 발열과 개인정보 노출 가능성을 함께 확인하세요.
 - `HotspotOnBoot`: USIM을 장착한 장치에서 자동 핫스팟을 사용할 때의 설정입니다.
 - `SoftwareMenu`: 메모리 문제가 있을 때 끌 수 있는 Carrot Web 메뉴 설정입니다.
@@ -318,7 +323,7 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 ### 차량 구성을 확인해야 하는 설정
 
 - `HyundaiCameraSCC`, `CanfdHDA2`
-- `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity`
+- `EnableRadarTracks`, `EnableCornerRadar`
 - `SpeedFromPCM`, `DisableMinSteerSpeed`
 - `LateralTorqueCustom`, `CustomSteer*`
 - `DisableDM`

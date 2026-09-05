@@ -121,6 +121,17 @@ class TestParams:
     assert self.params.get("LiveParameters") is None
     assert self.params.get("LiveParameters", return_default=True) is None
 
+  def test_ka4_stock_scc_rearm_is_opt_in_and_survives_release_cleanup(self):
+    key = "Ka4StockSccStandstillRearm"
+    self.params.remove(key)
+
+    assert self.params.get(key, return_default=True) == 0
+
+    self.params.put_int(key, 1)
+    self.params.clear_all(ParamKeyFlag.DEVELOPMENT_ONLY)
+
+    assert self.params.get_int(key) == 1
+
   def test_params_get_type(self):
     # json
     self.params.put("ApiCache_FirehoseStats", {"a": 0})

@@ -311,6 +311,11 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"IsLdwsCar", {PERSISTENT, INT, "0"}},
     {"CanfdHDA2", {PERSISTENT, INT, "0"}},
     {"CanfdDebug", {PERSISTENT, INT, "0"}},
+    // Hidden A/B switch for validating the unproven KA4 stock-SCC 30-second re-arm.
+    // Keep this opt-in and persistent so an explicit 0/1 survives release boots.
+    {"Ka4StockSccStandstillRearm", {PERSISTENT, INT, "0"}},
+    // One-time, explicit consent for the bounded KA4 validation-log campaign.
+    {"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}},
 
     {"SoundVolumeAdjust", {PERSISTENT, INT, "100"}},
     {"SoundVolumeAdjustEngage", {PERSISTENT, INT, "10"}},

@@ -28,6 +28,7 @@ from .services.params import HAS_PARAMS, Params
 from .services.popular_values import start_popular_value_upload
 from .services.settings import get_settings_cached
 from .services.static_assets import create_static_cache_middleware, start_precompress
+from .services.validation_auto_upload import validation_auto_upload_loop
 
 VISION_DIAG_UPLOAD_MAX_BYTES = 16 * 1024 * 1024
 
@@ -114,6 +115,10 @@ async def on_startup(app: web.Application) -> None:
   app["realtime_raw_hub"] = RawWsHub(messaging)
   if HAS_PARAMS:
     app["hb_task"] = asyncio.create_task(heartbeat_loop(app))
+    app["validation_auto_upload_task"] = asyncio.create_task(
+      validation_auto_upload_loop(),
+      name="carrot-validation-auto-upload",
+    )
   app["git_status_task"] = asyncio.create_task(git_status_loop())
   app["auto_update_task"] = asyncio.create_task(auto_update_loop())
   app["popular_value_upload_task"] = start_popular_value_upload(app)
@@ -176,6 +181,18 @@ async def on_cleanup(app: web.Application) -> None:
       pass
     except Exception:
       pass
+
+  validation_auto_upload_task = app.get("validation_auto_upload_task")
+  if validation_auto_upload_task:
+    validation_auto_upload_task.cancel()
+    done, _pending = await asyncio.wait({validation_auto_upload_task}, timeout=5.0)
+    if validation_auto_upload_task in done:
+      try:
+        validation_auto_upload_task.result()
+      except asyncio.CancelledError:
+        pass
+      except Exception:
+        pass
 
   git_status_task = app.get("git_status_task")
   if git_status_task:

@@ -264,6 +264,16 @@ class Car:
     CS.useLaneLineSpeed = self.v_cruise_helper.useLaneLineSpeedApply
     CS.carrotCruise = 1 if self.v_cruise_helper.carrot_cruise_active else 0
 
+    controller = getattr(self.CI, "CC", None)
+    stop_start_frame = getattr(controller, "stock_scc_stop_start_frame", None)
+    controller_frame = int(getattr(controller, "frame", 0) or 0)
+    CS.ka4StockSccKeepaliveRequestCount = int(getattr(controller, "stock_scc_keepalive_request_count", 0) or 0)
+    CS.ka4StockSccKeepaliveQualified = stop_start_frame is not None
+    CS.ka4StockSccKeepaliveStoppedSec = (
+      max(0.0, (controller_frame - int(stop_start_frame)) * DT_CTRL)
+      if stop_start_frame is not None else 0.0
+    )
+
     self.CI.CS.softHoldActive = CS.softHoldActive
     state_done_ns = time.monotonic_ns()
     self.card_diag_stage_current = {

@@ -4,15 +4,21 @@ import asyncio
 import os
 import time
 import uuid
+from collections.abc import Collection, Mapping, Sequence
 from collections import deque
 from datetime import datetime
 from typing import Any
 
 from openpilot.selfdrive.carrot.web_upload import (
+  create_validation_upload_session,
   create_web_upload_session,
+  send_validation_upload_complete,
   send_web_upload_complete,
   upload_device_id,
   upload_folder_to_web,
+  upload_validation_folder_to_web,
+  validation_manifest_sha256,
+  validation_receipt_id,
 )
 
 from ...services.params import HAS_PARAMS, Params
@@ -51,6 +57,16 @@ _jobs: dict[str, dict[str, Any]] = {}
 
 class UploadCanceled(Exception):
   pass
+
+
+def _validation_auth_rejected(value: Any) -> bool:
+  if isinstance(value, Mapping):
+    try:
+      return int(value.get("status") or 0) in {401, 403}
+    except (TypeError, ValueError):
+      return False
+  message = str(value)
+  return "validation upload HTTP 401:" in message or "validation upload HTTP 403:" in message
 
 
 def jobs() -> dict[str, dict[str, Any]]:
@@ -280,12 +296,17 @@ def prune() -> None:
     _jobs.pop(old["id"], None)
 
 
-def create_job(segments: list[str]) -> dict[str, Any]:
+def create_job(
+  segments: list[str],
+  *,
+  action: str = "dashcam_upload",
+  run_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
   job_id = uuid.uuid4().hex[:12]
   now = time.time()  # noqa: TID251
   job = {
     "id": job_id,
-    "action": "dashcam_upload",
+    "action": str(action or "dashcam_upload"),
     "segments": list(segments),
     "status": "running",
     "log": "",
@@ -306,6 +327,7 @@ def create_job(segments: list[str]) -> dict[str, Any]:
     "created_at": now,
     "updated_at": now,
     "_activity_at": time.monotonic(),
+    "_run_options": dict(run_options or {}),
   }
   _jobs[job_id] = job
   prune()
@@ -332,16 +354,55 @@ def start_job(job: dict[str, Any]) -> asyncio.Task:
   return task
 
 
-async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = None) -> dict[str, Any]:
+async def run_upload_segments(
+  segments: list[str],
+  job: dict[str, Any] | None = None,
+  *,
+  artifact_kinds: Collection[str] | None = None,
+  notify_discord: bool = True,
+  concurrency_override: int | None = None,
+  completion_metadata: Mapping[str, Any] | None = None,
+  base_url_override: str | None = None,
+  safety_check: Any | None = None,
+  validation_capture_id: str | None = None,
+  validation_files: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+  def ensure_runtime_safe() -> None:
+    if safety_check is None:
+      return
+    try:
+      allowed = bool(safety_check())
+    except Exception:
+      allowed = False
+    if not allowed:
+      if job:
+        job["cancel_requested"] = True
+      raise UploadCanceled("automatic upload safety policy changed")
+
+  ensure_runtime_safe()
   params = Params() if HAS_PARAMS else None
-  base_url, token = upload.upload_target_settings()
+  validation_mode = bool(validation_capture_id and validation_files is not None)
+  configured_base_url, token = upload.upload_target_settings()
+  base_url = str(base_url_override or configured_base_url).rstrip("/")
+  if base_url_override is not None and configured_base_url != base_url and not validation_mode:
+    raise RuntimeError("upload destination changed after consent")
   meta = upload.upload_metadata(params)
   device_id = upload_device_id(meta)
+  if job and job.get("action") == "validation_auto_upload" and not validation_mode:
+    raise RuntimeError("automatic validation upload requires authenticated receipt mode")
   car_selected = meta.get("carName") or "none"
   storage_directory = f"{car_selected} {device_id}".strip()
-  if not token:
+  if validation_mode:
+    # Validation sessions are intentionally short lived. Obtain them just in
+    # time for each segment and completion below so a slow tethered transfer
+    # cannot strand the final receipt behind an expired bearer token.
+    token = ""
+  elif not token:
     token = await create_web_upload_session(base_url, meta, "dashcam")
-  remote_base_path = f"{base_url}/routes/{storage_directory}/".replace("\\", "/")
+  remote_base_path = (
+    f"{base_url}/validation/{device_id}/{validation_capture_id}/"
+    if validation_mode else f"{base_url}/routes/{storage_directory}/"
+  ).replace("\\", "/")
   total = len(segments)
   results: list[Any] = [None] * total  # filled by index so order matches input
 
@@ -362,21 +423,38 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
     )
 
   ensure_not_canceled(job)
+  ensure_runtime_safe()
 
   # Upload segments in parallel with bounded concurrency. Each segment uses an
   # independent HTTPS session. Keep the limit small because the upload service
   # and its backing storage are shared across devices.
-  try:
-    concurrency = max(1, min(6, int(os.environ.get("CARROT_WEB_UPLOAD_CONCURRENCY", "3") or "3")))
-  except Exception:
-    concurrency = 3
+  if validation_mode:
+    # The validation receiver intentionally allows only one outstanding
+    # challenge per device/IP. Serialize the at-most-three capture segments so
+    # parallel workers cannot race challenge claims, and issue each short-lived
+    # session immediately before its PUT.
+    concurrency = 1
+  elif concurrency_override is not None:
+    concurrency = max(1, min(6, int(concurrency_override)))
+  else:
+    try:
+      concurrency = max(1, min(6, int(os.environ.get("CARROT_WEB_UPLOAD_CONCURRENCY", "3") or "3")))
+    except Exception:
+      concurrency = 3
 
   prepare_sem = asyncio.Semaphore(concurrency)
 
   async def prepare_one(idx0: int, segment: str) -> tuple[int, list[Any], Exception | None]:
     try:
       async with prepare_sem:
-        return idx0, await asyncio.to_thread(segment_file_summary, segment_dir(segment)), None
+        ensure_runtime_safe()
+        if artifact_kinds is None:
+          return idx0, await asyncio.to_thread(segment_file_summary, segment_dir(segment)), None
+        return idx0, await asyncio.to_thread(
+          segment_file_summary,
+          segment_dir(segment),
+          artifact_kinds=artifact_kinds,
+        ), None
     except Exception as exc:
       return idx0, [], exc
 
@@ -494,6 +572,7 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
       )
 
     async with sem:
+      ensure_runtime_safe()
       if is_cancel_requested(job):
         return
       if job:
@@ -506,18 +585,63 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
         def should_cancel() -> bool:
           if job:
             touch(job)
-          return is_cancel_requested(job)
+          try:
+            unsafe = safety_check is not None and not bool(safety_check())
+          except Exception:
+            unsafe = True
+          if unsafe and job:
+            job["cancel_requested"] = True
+          return unsafe or is_cancel_requested(job)
 
-        ok = await upload_folder_to_web(
-          segment_path,
-          device_id,
-          segment,
-          base_url,
-          token,
-          should_cancel if job else None,
-          filenames=[str(item["name"]) for item in files],
-          on_progress=on_file_progress if job else None,
-        )
+        if validation_mode:
+          validation_token = await create_validation_upload_session(
+            base_url,
+            meta,
+            should_continue=safety_check,
+          )
+          ensure_runtime_safe()
+          try:
+            ok = await upload_validation_folder_to_web(
+              segment_path,
+              segment,
+              str(validation_capture_id),
+              base_url,
+              validation_token,
+              list(validation_files or []),
+              should_cancel if job or safety_check is not None else None,
+              on_progress=on_file_progress if job else None,
+            )
+          except Exception as exc:
+            if not _validation_auth_rejected(exc):
+              raise
+            ensure_runtime_safe()
+            validation_token = await create_validation_upload_session(
+              base_url,
+              meta,
+              should_continue=safety_check,
+            )
+            ensure_runtime_safe()
+            ok = await upload_validation_folder_to_web(
+              segment_path,
+              segment,
+              str(validation_capture_id),
+              base_url,
+              validation_token,
+              list(validation_files or []),
+              should_cancel if job or safety_check is not None else None,
+              on_progress=on_file_progress if job else None,
+            )
+        else:
+          ok = await upload_folder_to_web(
+            segment_path,
+            device_id,
+            segment,
+            base_url,
+            token,
+            should_cancel if job else None,
+            filenames=[str(item["name"]) for item in files],
+            on_progress=on_file_progress if job else None,
+          )
         results[idx0] = {
           "segment": segment,
           "route": route_name(segment),
@@ -560,6 +684,7 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
   await asyncio.gather(*(upload_one(i, seg) for i, seg in enumerate(segments)))
 
   ensure_not_canceled(job)
+  ensure_runtime_safe()
   results = [r for r in results if r is not None]
   ok_count = sum(1 for item in results if item["ok"])
   uploaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -575,6 +700,11 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
     "results": results,
     "message": f"{ok_count}/{len(results)} uploaded",
   }
+  if completion_metadata:
+    response_payload["validationCapture"] = dict(completion_metadata)
+  if validation_mode:
+    response_payload["captureId"] = str(validation_capture_id)
+    response_payload["files"] = [dict(item) for item in validation_files or []]
   response_payload["shareText"] = upload.upload_share_text(response_payload)
 
   if job:
@@ -589,11 +719,79 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
       phase_total=2,
     )
   ensure_not_canceled(job)
-  response_payload["webComplete"] = await send_web_upload_complete(
-    base_url,
-    token,
-    response_payload,
-  )
+  ensure_runtime_safe()
+  if validation_mode:
+    completion_token = await create_validation_upload_session(
+      base_url,
+      meta,
+      should_continue=safety_check,
+    )
+    ensure_runtime_safe()
+    response_payload["webComplete"] = await send_validation_upload_complete(
+      base_url,
+      completion_token,
+      response_payload,
+      should_continue=safety_check,
+    )
+    if _validation_auth_rejected(response_payload["webComplete"]):
+      ensure_runtime_safe()
+      completion_token = await create_validation_upload_session(
+        base_url,
+        meta,
+        should_continue=safety_check,
+      )
+      ensure_runtime_safe()
+      response_payload["webComplete"] = await send_validation_upload_complete(
+        base_url,
+        completion_token,
+        response_payload,
+        should_continue=safety_check,
+      )
+  else:
+    response_payload["webComplete"] = await send_web_upload_complete(base_url, token, response_payload)
+  ensure_not_canceled(job)
+  ensure_runtime_safe()
+  if validation_mode:
+    receipt = response_payload["webComplete"]
+    expected_manifest_sha256 = validation_manifest_sha256(
+      device_id,
+      str(validation_capture_id),
+      list(validation_files or []),
+      completion_metadata,
+    )
+    expected_files = {
+      (
+        str(item.get("segment") or ""),
+        str(item.get("name") or ""),
+        int(item.get("size") or -1),
+        str(item.get("sha256") or ""),
+      )
+      for item in validation_files or []
+    }
+    received_files = {
+      (
+        str(item.get("segment") or ""),
+        str(item.get("name") or ""),
+        int(item.get("size") or -1),
+        str(item.get("sha256") or ""),
+      )
+      for item in receipt.get("files") or []
+      if isinstance(item, Mapping)
+    }
+    receipt_matches = (
+      receipt.get("ok") is True
+      and receipt.get("receiptVersion") == 1
+      and receipt.get("captureId") == validation_capture_id
+      and receipt.get("verifiedDeviceId") == device_id
+      and receipt.get("deviceId") == device_id
+      and receipt.get("manifestSha256") == expected_manifest_sha256
+      and receipt.get("receiptId") == validation_receipt_id(expected_manifest_sha256)
+      and expected_files == received_files
+    )
+    if not receipt_matches:
+      response_payload["ok"] = False
+      receipt["ok"] = False
+      receipt.setdefault("error", "validation completion receipt did not match the local manifest")
   if job:
     progress(
       job,
@@ -605,10 +803,14 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
       phase_current=1,
       phase_total=2,
     )
-  response_payload["discord"] = await upload.send_discord_webhook(
-    upload.discord_webhook_url(params),
-    response_payload,
-  )
+  if notify_discord:
+    response_payload["discord"] = await upload.send_discord_webhook(
+      upload.discord_webhook_url(params),
+      response_payload,
+    )
+  else:
+    response_payload["discord"] = {"configured": False, "ok": False, "skipped": True}
+  ensure_not_canceled(job)
   if job:
     progress(
       job,
@@ -625,7 +827,11 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
 
 async def run_job(job: dict[str, Any]) -> None:
   try:
-    result = await run_upload_segments(list(job.get("segments") or []), job)
+    result = await run_upload_segments(
+      list(job.get("segments") or []),
+      job,
+      **dict(job.get("_run_options") or {}),
+    )
     finish(job, ok=bool(result.get("ok")), result=result)
   except UploadCanceled as exc:
     results = list(job.get("partial_results") or [])

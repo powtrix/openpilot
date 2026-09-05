@@ -65,6 +65,33 @@ QR_BACKUP_DEPENDENCY = "brotli"
 QR_BACKUP_PYDEPS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..", "pydeps"))
 QR_BACKUP_WHEEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..", "third_party", "wheels"))
 _qr_dependency_lock = threading.Lock()
+VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
+BACKUP_EXCLUDED_PARAMS = frozenset({VALIDATION_AUTO_UPLOAD_PARAM})
+
+
+def _validation_consent_is_disabled(value: Any) -> bool:
+  if value is False or value == 0:
+    return True
+  if isinstance(value, (bytes, bytearray, memoryview)):
+    value = bytes(value).decode("utf-8", errors="replace")
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in ("false", "off", "no"):
+      return True
+    try:
+      return float(normalized) == 0
+    except ValueError:
+      return False
+  return False
+
+
+def filter_param_values_for_backup(values: dict[str, Any]) -> dict[str, Any]:
+  """Keep explicit consent out of every portable settings representation."""
+  return {
+    key: value
+    for key, value in values.items()
+    if str(key) not in BACKUP_EXCLUDED_PARAMS
+  }
 
 
 # -----------------------
@@ -362,7 +389,15 @@ def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]
     params.put(key, str(value))
 
 
-def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None) -> None:
+def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *,
+                    allow_validation_auto_upload_enable: bool = False) -> None:
+  if (
+    name == VALIDATION_AUTO_UPLOAD_PARAM
+    and not _validation_consent_is_disabled(value)
+    and not allow_validation_auto_upload_enable
+  ):
+    raise PermissionError("automatic validation log collection requires explicit consent")
+
   if not HAS_PARAMS:
     _mem_store[name] = str(value)
     return
@@ -393,6 +428,9 @@ def get_all_param_values_for_backup() -> Dict[str, str]:
         continue
     else:
       key = str(k)
+
+    if key in BACKUP_EXCLUDED_PARAMS:
+      continue
 
     try:
       t = params.get_type(key)
@@ -443,6 +481,9 @@ def _backup_param_names() -> List[str]:
     else:
       key = str(k)
 
+    if key in BACKUP_EXCLUDED_PARAMS:
+      continue
+
     try:
       t = params.get_type(key)
     except Exception:
@@ -469,6 +510,8 @@ def _backup_param_type_map(names: Optional[List[str]] = None) -> Dict[str, Any]:
   params = Params()
   type_map: Dict[str, Any] = {}
   for key in names or _backup_param_names():
+    if key in BACKUP_EXCLUDED_PARAMS:
+      continue
     try:
       type_map[key] = params.get_type(key)
     except Exception:
@@ -491,6 +534,8 @@ def restore_param_values_from_backup(values: Dict[str, Any], source: str = "rest
   fails = []
 
   for key, value in values.items():
+    if key == VALIDATION_AUTO_UPLOAD_PARAM and not _validation_consent_is_disabled(value):
+      continue
     try:
       definition = definitions.get(key)
       t = resolve_param_type(params, key, definition)
@@ -848,6 +893,7 @@ def _decode_qr_value(data: bytes, pos: int) -> tuple[str, int]:
 
 
 def _build_params_qr_payload_v2(values: Dict[str, Any]) -> Dict[str, Any]:
+  values = filter_param_values_for_backup(values)
   try:
     code_names = _backup_param_names()
   except Exception:
@@ -884,6 +930,7 @@ def _build_params_qr_payload_v2(values: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_params_qr_binary(values: Dict[str, Any], version: int) -> bytes:
+  values = filter_param_values_for_backup(values)
   try:
     code_names = _backup_param_names()
   except Exception:
@@ -922,6 +969,7 @@ def _build_params_qr_binary(values: Dict[str, Any], version: int) -> bytes:
 
 
 def _build_params_qr_payload_v3(values: Dict[str, Any]) -> Dict[str, Any]:
+  values = filter_param_values_for_backup(values)
   brotli_module = _load_brotli_module()
 
   raw_bytes = _build_params_qr_binary(values, 3)
@@ -942,6 +990,7 @@ def _build_params_qr_payload_v3(values: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_params_qr_payload_v4(values: Dict[str, Any]) -> Dict[str, Any]:
+  values = filter_param_values_for_backup(values)
   raw_bytes = _build_params_qr_binary(values, 4)
   compressed = zlib.compress(raw_bytes, 9)
   checksum = hashlib.sha256(compressed).hexdigest()[:QR_BACKUP_CHECKSUM_CHARS].upper()
@@ -962,6 +1011,7 @@ def _build_params_qr_payload_v4(values: Dict[str, Any]) -> Dict[str, Any]:
 def build_params_qr_payload(values: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
   if values is None:
     values = get_all_param_values_for_backup()
+  values = filter_param_values_for_backup(values)
 
   try:
     return _build_params_qr_payload_v3(values)
@@ -1247,31 +1297,37 @@ def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional
     type_name = "unknown"
     normalized_value: Any = raw_value
 
-    try:
-      # Same type resolution as the write path: a not-yet-registered key is
-      # typed from its catalog definition instead of being marked invalid.
-      t = resolve_param_type(params, key, definitions.get(key))
-      if t is None:
-        status = "invalid"
-        reason = "unknown parameter"
-        can_apply = False
-      else:
-        type_name = _param_type_name(t)
-        if _is_unsupported_param_type(t):
-          status = "skipped"
-          reason = "unsupported type"
+    if key == VALIDATION_AUTO_UPLOAD_PARAM and not _validation_consent_is_disabled(raw_value):
+      status = "skipped"
+      reason = "explicit consent required"
+      can_apply = False
+      current_value = current_values.get(key, "")
+    else:
+      try:
+        # Same type resolution as the write path: a not-yet-registered key is
+        # typed from its catalog definition instead of being marked invalid.
+        t = resolve_param_type(params, key, definitions.get(key))
+        if t is None:
+          status = "invalid"
+          reason = "unknown parameter"
           can_apply = False
         else:
-          normalized_value = _normalize_param_value(t, raw_value)
-          current_value = current_values.get(key, "")
-          if _values_equal(t, current_value, normalized_value):
-            status = "same"
+          type_name = _param_type_name(t)
+          if _is_unsupported_param_type(t):
+            status = "skipped"
+            reason = "unsupported type"
             can_apply = False
-    except Exception as e:
-      current_value = current_values.get(key, "")
-      status = "invalid"
-      reason = str(e)
-      can_apply = False
+          else:
+            normalized_value = _normalize_param_value(t, raw_value)
+            current_value = current_values.get(key, "")
+            if _values_equal(t, current_value, normalized_value):
+              status = "same"
+              can_apply = False
+      except Exception as e:
+        current_value = current_values.get(key, "")
+        status = "invalid"
+        reason = str(e)
+        can_apply = False
 
     is_selected = can_apply and (not selected or key in selected)
     if is_selected:

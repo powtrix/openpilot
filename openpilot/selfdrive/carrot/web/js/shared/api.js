@@ -28,8 +28,7 @@ function getParamCommitter() {
 }
 
 async function setParam(name, value, options) {
-  await getParamCommitter().commit(name, value, options);
-  return true;
+  return getParamCommitter().commit(name, value, options);
 }
 
 
@@ -71,7 +70,10 @@ async function requestJson(url, options = {}) {
 async function postJson(url, bodyObj) {
   return requestJson(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Carrot-Web-Request": "1",
+    },
     body: JSON.stringify(bodyObj || {})
   });
 }

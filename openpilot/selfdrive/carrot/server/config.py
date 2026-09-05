@@ -38,6 +38,7 @@ CARROT_DASHCAM_READ_STATE_PATH = os.path.join(CARROT_STATE_DIR, "dashcam_read_st
 CARROT_SETTING_FAVORITES_PATH = os.path.join(CARROT_STATE_DIR, "setting_favorites.json")
 CARROT_SETTING_PROFILES_PATH = os.path.join(CARROT_STATE_DIR, "setting_profiles.json")
 CARROT_PARAM_CHANGES_PATH = os.path.join(CARROT_STATE_DIR, "param_changes.jsonl")
+CARROT_VALIDATION_UPLOAD_STATE_PATH = os.path.join(CARROT_STATE_DIR, "validation_upload_queue.json")
 CARROT_SETTING_UNIT_INDEX_PATH = os.path.join(CARROT_STATE_DIR, "setting_unit_index.json")
 CARROT_FINGERPRINT_BASELINE_PATH = os.path.join(CARROT_STATE_DIR, "fingerprint_baseline.json")
 CARROT_YOUTUBE_LIVE_STATE_PATH = os.path.join(CARROT_STATE_DIR, "youtube_live.json")

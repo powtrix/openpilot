@@ -305,7 +305,7 @@ def create_acc_cancel(packer, CP, CAN, cruise_info_copy):
   })
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
 
-def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
+def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active, *, openpilot_longitudinal):
 
 
   if CS.lfahda_cluster is not None:
@@ -317,11 +317,14 @@ def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
     rx_counter = None
     values["LFA_OptUsmSta"] = 2
     values["HDA_OptUsmSta"] = 2
-  values["HDA_CntrlModSta"] = 2 if long_active else 0
+  # Stock longitudinal owns the HDA state. Preserve the camera value instead
+  # of replacing an active OEM HDA session with CC.longActive=False.
+  if openpilot_longitudinal:
+    values["HDA_CntrlModSta"] = 2 if long_active else 0
   values["HDA_LFA_SymSta"] = 2 if lat_active else 0
   return [packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values, rx_counter=rx_counter)]
 
-def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
+def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudinal):
   ret = []
   if CS.adrv_0x161 is not None:
     values = copy.copy(CS.adrv_0x161)
@@ -333,21 +336,27 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
     values["LFA_ICON"] = 2 if lat_active else 1 if lat_enabled else 0
     values["LKA_ICON"] = 4 if lat_active else 3 if lat_enabled else 0
 
-    if values["ALERTS_2"] in [1, 2, 5, 6, 10, 21, 22]:
-      values["ALERTS_2"] = 0
-      values["DAW_ICON"] = 0
+    # With stock longitudinal, preserve the received OEM alert, sound, DAW,
+    # and mute fields while replacing ADRV_0x161's lateral icons. On variants
+    # that carry this message, ALERTS_5=5 is a decoded DBC value; this code does
+    # not establish its visible-cluster or audible association. Existing ADRV
+    # field suppression is retained only when openpilot owns longitudinal.
+    if openpilot_longitudinal:
+      if values["ALERTS_2"] in [1, 2, 5, 6, 10, 21, 22]:
+        values["ALERTS_2"] = 0
+        values["DAW_ICON"] = 0
 
-    if values["ALERTS_1"] == 0:
-      values["SOUNDS_1"] = 0
-      values["SOUNDS_2"] = 0
-      values["SOUNDS_4"] = 0
+      if values["ALERTS_1"] == 0:
+        values["SOUNDS_1"] = 0
+        values["SOUNDS_2"] = 0
+        values["SOUNDS_4"] = 0
 
-    if values["ALERTS_3"] in [3, 4, 11, 12, 13, 14, 17, 19, 26, 7, 8, 9, 10]:
-      values["ALERTS_3"] = 0
-      values["SOUNDS_3"] = 0
+      if values["ALERTS_3"] in [3, 4, 11, 12, 13, 14, 17, 19, 26, 7, 8, 9, 10]:
+        values["ALERTS_3"] = 0
+        values["SOUNDS_3"] = 0
 
-    if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
-      values["ALERTS_5"] = 0
+      if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
+        values["ALERTS_5"] = 0
 
     ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter=rx_counter))
   return ret

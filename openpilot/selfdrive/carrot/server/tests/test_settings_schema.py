@@ -187,6 +187,70 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
+def test_ka4_stock_scc_standstill_extension_is_explicit_opt_in(settings, params):
+  by_name = {p["name"]: p for p in params}
+  rearm = by_name["Ka4StockSccStandstillRearm"]
+  assert (rearm["min"], rearm["max"], rearm["default"]) == (0, 1, 0)
+  assert rearm["control"] == "toggle"
+  assert rearm["risk"] == "high"
+  assert "검증 대상: 2023년식" in rearm["descr"]
+  assert "주차된 상태" in rearm["descr"]
+  assert "30초" in rearm["descr"]
+  assert "시도" in rearm["descr"]
+  assert "in an attempt" in rearm["edescr"]
+
+  driving = next(category for category in settings["menu"] if category["id"] == "DRIVING")
+  start_auto = next(group for group in driving["groups"] if group["id"] == "START_AUTO")
+  auto_cruise = next(group for group in start_auto["groups"] if group["id"] == "BASIC_AUTOCRUISE")
+  assert "Ka4StockSccStandstillRearm" in auto_cruise["params"]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"Ka4StockSccStandstillRearm", {PERSISTENT, INT, "0"}}' in params_keys
+
+
+def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params):
+  by_name = {p["name"]: p for p in params}
+  auto_upload = by_name["CarrotValidationAutoUpload"]
+  assert (auto_upload["min"], auto_upload["max"], auto_upload["default"]) == (0, 1, 0)
+  assert auto_upload["control"] == "toggle"
+  assert auto_upload["risk"] == "high"
+  assert "주차 상태" in auto_upload["descr"]
+  assert "Wi-Fi" in auto_upload["descr"]
+  assert "full rlog" in auto_upload["descr"]
+  assert "정확한 위치" in auto_upload["descr"]
+  assert "로그마다 다시 확인" in auto_upload["descr"]
+  assert "배포 시 고정" in auto_upload["descr"]
+  assert "일반 전송 목적지로 우회할 수 없습니다" in auto_upload["descr"]
+  assert "모바일 데이터" in auto_upload["descr"]
+  assert "WPA2/WPA3" in auto_upload["descr"]
+  assert "No vehicle-control setting is changed" in auto_upload["edescr"]
+  assert "no per-log confirmation" in auto_upload["edescr"]
+  assert "ordinary Carrot Web upload destination cannot redirect" in auto_upload["edescr"]
+  disclosure_fragments = {
+    "descr": [
+      "캡처당 주변 full rlog 최대 3개", "최대 14개 캡처/42개 full rlog", "최대 5개 캡처/750 MiB",
+      "누적 전송량이나 재시도", "장치별 일일 한도는 1 GiB", "다음 날",
+    ],
+    "edescr": [
+      "three nearby full rlogs per event capture", "up to 14 captures / 42 full rlogs",
+      "5 captures / 750 MiB pending at once", "cumulative campaign uploads and retry traffic can exceed",
+      "1 GiB per-device daily limit", "next day",
+    ],
+    "cdescr": ["每个事件捕获", "最多 3 个完整 rlog", "14 个捕获/42 个完整 rlog", "5 个捕获/750 MiB", "累计上传量和重试流量", "每日 1 GiB", "第二天"],
+  }
+  for field, fragments in disclosure_fragments.items():
+    for fragment in fragments:
+      assert fragment in auto_upload[field], f"{field}: {fragment}"
+
+  system = next(category for category in settings["menu"] if category["id"] == "SYSTEM")
+  record = next(group for group in system["groups"] if group["id"] == "SYS_RECORD")
+  basic = next(group for group in record["groups"] if group["id"] == "SYS_RECORD_BASIC")
+  assert "CarrotValidationAutoUpload" in basic["params"]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}}' in params_keys
+
+
 def test_wide_camera_fallback_setting_is_exposed(settings, params):
   by_name = {p["name"]: p for p in params}
   use_wide_camera = by_name["UseWideCamera"]

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import math
-import time
 from numbers import Number
 
 from openpilot.cereal import car, log
@@ -11,7 +10,6 @@ from openpilot.common.pid import MultiplicativeUnwindPID
 from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 import numpy as np
-from collections import deque
 
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
@@ -26,10 +24,7 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.controls.lib.steer_ratio import resolve_vehicle_model_steer_ratio
 
 
-from openpilot.common.realtime import DT_CTRL, DT_MDL
-from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
-from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
+from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.selfdrive.carrot.carrot_controls import CarrotControls
@@ -40,6 +35,12 @@ LaneChangeDirection = log.LaneChangeDirection
 LAT_CURVATURE_SATURATION_ACCEL = 0.1  # infiniteCable2 LatControlCurvature: 곡률 기반 steer_limited 임계 (m/s^2 환산)
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
+
+
+def lane_mode_control_enabled(use_lane_lines: bool, v_turn_speed: int, curve_speed_threshold: int) -> bool:
+  curve_speed_abs = abs(v_turn_speed)
+  # Zero means no curve, not a curve-speed estimate below the configured threshold.
+  return use_lane_lines and (curve_speed_abs == 0 or curve_speed_abs > curve_speed_threshold)
 
 
 class Controls:
@@ -75,7 +76,7 @@ class Controls:
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
-    
+
     self.side_state = {
         "left":  {"main": {"dRel": None, "lat": None}, "sub": {"dRel": None, "lat": None}},
         "right": {"main": {"dRel": None, "lat": None}, "sub": {"dRel": None, "lat": None}},
@@ -167,13 +168,18 @@ class Controls:
 
     # Steering PID loop and lateral MPC
     lat_plan = self.sm['lateralPlan']
-    curve_speed_abs = abs(self.sm['carrotMan'].vTurnSpeed)
-    self.lanefull_mode_enabled = (lat_plan.useLaneLines and curve_speed_abs > self.params.get_int("UseLaneLineCurveSpeed"))
+    lat_plan_fresh = (self.sm.all_checks(['lateralPlan']) and lat_plan.mpcSolutionValid and
+                      lat_plan.modelMonoTime == self.sm.logMonoTime['modelV2'])
+    self.lanefull_mode_enabled = lat_plan_fresh and lane_mode_control_enabled(
+      lat_plan.useLaneLines,
+      self.sm['carrotMan'].vTurnSpeed,
+      self.params.get_int("UseLaneLineCurveSpeed"),
+    )
     lat_smooth_seconds = self.params.get_float("LatSmoothSec") * 0.01
     steer_actuator_delay = self.params.get_float("SteerActuatorDelay") * 0.01
     if steer_actuator_delay == 0.0:
-      steer_actuator_delay = self.sm['liveDelay'].lateralDelay 
-    
+      steer_actuator_delay = self.sm['liveDelay'].lateralDelay
+
     def smooth_value(val, prev_val, tau):
       alpha = 1 - np.exp(-DT_CTRL / tau) if tau > 0 else 1
       return alpha * val + (1 - alpha) * prev_val
@@ -184,7 +190,7 @@ class Controls:
       # VW MEB(ID.4/ID.5): 기본은 레인리스(raw 모델곡률 = infiniteCable2 동일).
       # carrot 횡플래너가 레인모드 활성(lat_plan.useLaneLines, UseLaneLineSpeed>0 & 차선감지)일 때만
       # 차선기반 lateralPlan 경로를 쓴다(opt-in). 모델 경로 출렁임(차선넘나듦)을 차선 지오메트리로 보완.
-      if getattr(lat_plan, 'useLaneLines', False) and len(lat_plan.curvatures) > 0:
+      if self.lanefull_mode_enabled and len(lat_plan.curvatures) > 0:
         curvature = get_lag_adjusted_curvature(self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
                                                steer_actuator_delay + lat_smooth_seconds, lat_plan.distances)
         new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
@@ -194,9 +200,12 @@ class Controls:
       if len(lat_plan.curvatures) == 0:
         new_desired_curvature = self.curvature
       else:
-        curvature = get_lag_adjusted_curvature(self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures, steer_actuator_delay + lat_smooth_seconds, lat_plan.distances)
+        curvature = get_lag_adjusted_curvature(
+          self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
+          steer_actuator_delay + lat_smooth_seconds, lat_plan.distances,
+        )
         new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
-    else:      
+    else:
       new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, self.desired_curvature, 0.1)
 
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
@@ -275,8 +284,8 @@ class Controls:
     desired_kph = min(CS.vCruiseCluster, self.sm['carrotMan'].desiredSpeed)
     setSpeed = float(desired_kph * CV.KPH_TO_MS)
     speeds = self.sm['longitudinalPlan'].speeds
+    CC.cruiseControl.resume = CC.enabled and CS.cruiseState.standstill and len(speeds) > 0 and not self.sm['longitudinalPlan'].shouldStop
     if len(speeds):
-      CC.cruiseControl.resume = CC.enabled and CS.cruiseState.standstill and speeds[-1] > 0.1
       vCluRatio = CS.vCluRatio if CS.vCluRatio > 0.5 else 1.0
       setSpeed = speeds[-1] / vCluRatio
 
