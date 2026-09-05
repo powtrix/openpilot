@@ -47,6 +47,27 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
+def test_ka4_stock_scc_standstill_extension_is_explicit_opt_in(settings, params):
+  by_name = {p["name"]: p for p in params}
+  rearm = by_name["Ka4StockSccStandstillRearm"]
+  assert (rearm["min"], rearm["max"], rearm["default"]) == (0, 1, 0)
+  assert rearm["control"] == "toggle"
+  assert rearm["risk"] == "high"
+  assert "검증 대상: 2023년식" in rearm["descr"]
+  assert "주차된 상태" in rearm["descr"]
+  assert "30초" in rearm["descr"]
+  assert "시도" in rearm["descr"]
+  assert "in an attempt" in rearm["edescr"]
+
+  driving = next(category for category in settings["menu"] if category["id"] == "DRIVING")
+  start_auto = next(group for group in driving["groups"] if group["id"] == "START_AUTO")
+  auto_cruise = next(group for group in start_auto["groups"] if group["id"] == "BASIC_AUTOCRUISE")
+  assert "Ka4StockSccStandstillRearm" in auto_cruise["params"]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"Ka4StockSccStandstillRearm", {PERSISTENT, INT, "0"}}' in params_keys
+
+
 def test_wide_camera_fallback_setting_is_exposed(settings, params):
   by_name = {p["name"]: p for p in params}
   use_wide_camera = by_name["UseWideCamera"]

@@ -3,6 +3,7 @@ from openpilot.common.parameterized import parameterized_class
 
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.test.longitudinal_maneuvers.maneuver import Maneuver
+from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant
 
 
 # TODO: make new FCW tests
@@ -151,7 +152,7 @@ def create_maneuvers(kwargs):
       **kwargs,
     ),
     Maneuver(
-      "slow to 5m/s with allow_throttle = False and pitch = +0.1",
+      "maintain cruise when model throttle probability is low and pitch = +0.1",
       duration=30.,
       initial_speed=20.,
       lead_relevancy=False,
@@ -159,7 +160,7 @@ def create_maneuvers(kwargs):
       cruise_values=[20., 20., 20.],
       pitch_values=[0., 0.1, 0.1],
       breakpoints=[0.0, 2., 2.01],
-      ensure_slowdown=True,
+      ensure_cruise_speed=not kwargs['force_decel'],
       **kwargs,
     )]
   if not kwargs['force_decel']:
@@ -189,3 +190,22 @@ class TestLongitudinalControl:
         print(maneuver.title, f'in {"e2e" if maneuver.e2e else "acc"} mode')
         valid, _ = maneuver.evaluate()
         assert valid
+
+
+def test_maneuver_plant_distinguishes_radar_and_vision_lead_response():
+  radar_plant = Plant(lead_relevancy=True, speed=20.0, distance_lead=35.0)
+  radar_plant.step(v_lead=20.0)
+  radar_plant.step(v_lead=20.0)
+  assert radar_plant.planner.mpc.lead_response_active
+
+  vision_plant = Plant(lead_relevancy=True, speed=20.0, distance_lead=35.0, radar_lead=False)
+  vision_plant.step(v_lead=20.0)
+  vision_plant.step(v_lead=20.0)
+  assert not vision_plant.planner.mpc.lead_response_active
+
+
+def test_force_decel_overrides_carrot_cruise_target():
+  plant = Plant(lead_relevancy=False, speed=20.0, force_decel=True)
+  speeds = [plant.step()['speed'] for _ in range(100)]
+  assert speeds[-1] < speeds[0] - 2.0
+  assert all(current <= previous for previous, current in zip(speeds[:-1], speeds[1:], strict=True))

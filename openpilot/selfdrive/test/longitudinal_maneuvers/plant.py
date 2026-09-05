@@ -4,18 +4,35 @@ import numpy as np
 
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
+from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper, DT_MDL
+from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class PlantSubMaster(dict):
+  def __init__(self, values):
+    super().__init__(values)
+    self.alive = {'carrotMan': False}
+
+
+def initialize_default_params():
+  params = Params()
+  for key in params.all_keys():
+    default_value = params.get_default_value(key)
+    if default_value is not None and params.get(key) is None:
+      params.put(key, default_value)
+
+
 class Plant:
   messaging_initialized = False
 
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
-               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False):
+               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
+               radar_lead=True):
     self.rate = 1. / DT_MDL
 
     if not Plant.messaging_initialized:
@@ -39,6 +56,7 @@ class Plant:
     self.enabled = enabled
     self.only_lead2 = only_lead2
     self.only_radar = only_radar
+    self.radar_lead = radar_lead
     self.e2e = e2e
     self.personality = personality
     self.force_decel = force_decel
@@ -51,6 +69,8 @@ class Plant:
     from opendbc.car.honda.values import CAR
     from opendbc.car.honda.interface import CarInterface
 
+    initialize_default_params()
+    self.carrot = CarrotPlanner()
     self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
 
   @property
@@ -92,11 +112,16 @@ class Plant:
     lead.aRel = float(a_lead - self.acceleration)
     lead.vLead = float(v_lead)
     lead.vLeadK = float(v_lead)
+    lead.aLead = float(a_lead)
     lead.aLeadK = float(a_lead)
     # TODO use real radard logic for this
     lead.aLeadTau = float(_LEAD_ACCEL_TAU)
     lead.status = status
     lead.modelProb = float(prob_lead)
+    # Most maneuver cases model a stable fused radar lead. Tests can disable
+    # this flag explicitly to retain coverage of vision-only lead behavior.
+    lead.radar = status and self.radar_lead
+    lead.radarTrackId = 1 if lead.radar else -1
     if not self.only_lead2:
       radar.radarState.leadOne = lead
     radar.radarState.leadTwo = lead
@@ -106,6 +131,7 @@ class Plant:
     # does not predict slowdown in e2e mode
     position = log.XYZTData.new_message()
     position.x = [float(x) for x in (self.speed + 0.5) * np.array(ModelConstants.T_IDXS)]
+    position.y = [0.0 for _ in ModelConstants.T_IDXS]
     model.modelV2.position = position
     model.modelV2.action.desiredAcceleration = float(self.acceleration + 0.1)
     velocity = log.XYZTData.new_message()
@@ -119,22 +145,26 @@ class Plant:
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
     ss.selfdriveState.experimentalMode = self.e2e
+    ss.selfdriveState.enabled = self.enabled
     ss.selfdriveState.personality = self.personality
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
+    car_state.carState.vEgoCluster = float(self.speed)
+    car_state.carState.vCluRatio = 1.0
+    car_state.carState.aEgo = float(self.acceleration)
     car_state.carState.standstill = bool(self.speed < 0.01)
     car_state.carState.vCruise = float(v_cruise * 3.6)
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
-          'carState': car_state.carState,
-          'carControl': car_control.carControl,
-          'controlsState': control.controlsState,
-          'selfdriveState': ss.selfdriveState,
-          'liveParameters': lp.liveParameters,
-          'modelV2': model.modelV2}
-    self.planner.update(sm)
+    sm = PlantSubMaster({'radarState': radar.radarState,
+                         'carState': car_state.carState,
+                         'carControl': car_control.carControl,
+                         'controlsState': control.controlsState,
+                         'selfdriveState': ss.selfdriveState,
+                         'liveParameters': lp.liveParameters,
+                         'modelV2': model.modelV2})
+    self.planner.update(sm, self.carrot)
     self.acceleration = self.planner.output_a_target
     self.speed = self.speed + self.acceleration * self.ts
     self.should_stop = self.planner.output_should_stop

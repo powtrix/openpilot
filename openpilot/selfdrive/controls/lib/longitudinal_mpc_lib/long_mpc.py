@@ -97,6 +97,11 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
 
+
+def get_effective_cruise_speed(v_cruise, carrot_v_cruise):
+  return min(float(v_cruise), float(carrot_v_cruise))
+
+
 def get_safe_obstacle_distance(v_ego, t_follow=None, comfort_brake=COMFORT_BRAKE, stop_distance=STOP_DISTANCE):
   if t_follow is None:
     t_follow = get_T_FOLLOW()
@@ -415,7 +420,8 @@ class LongitudinalMpc:
     if mode == 'blended':
       stop_x = 1000.0
     else:
-      v_cruise, stop_x, mode = carrot.v_cruise, carrot.stop_dist, carrot.mode
+      v_cruise = get_effective_cruise_speed(v_cruise, carrot.v_cruise)
+      stop_x, mode = carrot.stop_dist, carrot.mode
       desired_distance = desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow)
       t_follow = carrot.dynamic_t_follow(t_follow, radarstate.leadOne, desired_distance, self.prev_a)
 

@@ -4,9 +4,13 @@ import numpy as np
 import pytest
 
 from openpilot.cereal import car, log
+from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.controlsd import Controls
-from openpilot.selfdrive.controls.lib.drive_helpers import CAR_ROTATION_RADIUS, CONTROL_N, get_lag_adjusted_curvature
+from openpilot.selfdrive.controls.lib.drive_helpers import CAR_ROTATION_RADIUS, CONTROL_N, clip_curvature, get_lag_adjusted_curvature
+import openpilot.selfdrive.controls.lib.lane_planner_2 as lane_planner_module
 from openpilot.selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc, N as LAT_MPC_N
+import openpilot.selfdrive.controls.lib.lateral_planner as lateral_planner_module
+from openpilot.selfdrive.controls.lib.lateral_planner import LateralPlanner, apply_static_path_offset, publish_offset_evidence
 
 
 V_EGO = 20.0
@@ -54,11 +58,60 @@ class FakeParams:
     }.get(key, 0.0)
 
 
+class PlannerParams:
+  def __init__(self, path_offset_cm=10, adjust_lane_offset_cm=0):
+    self.path_offset_cm = path_offset_cm
+    self.adjust_lane_offset_cm = adjust_lane_offset_cm
+
+  def get_int(self, key):
+    return {
+      "AdjustLaneOffset": self.adjust_lane_offset_cm,
+      "PathOffset": self.path_offset_cm,
+      "UseLaneLineSpeed": 0,
+    }.get(key, 0)
+
+  def get_float(self, key):
+    return {
+      "LatMpcAccelCost": 120.0,
+      "LatMpcInputOffset": 4.0,
+      "LatMpcJerkCost": 4.0,
+      "LatMpcMotionCost": 7.0,
+      "LatMpcPathCost": 200.0,
+      "LatMpcSteeringRateCost": 7.0,
+    }.get(key, 0.0)
+
+
+class PlannerSubMaster(dict):
+  def __init__(self, values, model_mono_time):
+    super().__init__(values)
+    self.logMonoTime = {"modelV2": model_mono_time}
+
+  def all_checks(self, service_list=None):
+    return True
+
+
+class CapturePubMaster:
+  def send(self, service, message):
+    assert service == "lateralPlan"
+    self.message = message
+
+
 class FakeVehicleModel:
   def update_params(self, stiffness_factor, steer_ratio):
     pass
 
   def calc_curvature(self, steer_angle, v_ego, roll):
+    return 0.0
+
+  def roll_compensation(self, roll, v_ego):
+    return 0.0
+
+
+class FakeMebCurvaturePid:
+  def reset(self):
+    pass
+
+  def update(self, *args, **kwargs):
     return 0.0
 
 
@@ -92,11 +145,21 @@ class FakeCarrotControls:
 
 
 class FakeSubMaster(dict):
-  frame = 1
-  recv_frame = {"longitudinalPlan": 1}
+  def __init__(self, values, *, lateral_plan_checks=True, model_mono_time=1_000_000_000):
+    super().__init__(values)
+    self.frame = 1
+    self.recv_frame = {"longitudinalPlan": 1}
+    self.logMonoTime = {"modelV2": model_mono_time}
+    self.lateral_plan_checks = lateral_plan_checks
+
+  def all_checks(self, service_list=None):
+    if service_list == ['lateralPlan']:
+      return self.lateral_plan_checks
+    return True
 
 
-def build_controls(lateral_plan, raw_model_curvature):
+def build_controls(lateral_plan, raw_model_curvature, *, lateral_plan_checks=True,
+                   model_mono_time=1_000_000_000, is_vw_meb=False):
   CP = car.CarParams.new_message()
   CP.minSteerSpeed = 0.0
   CP.openpilotLongitudinalControl = False
@@ -125,7 +188,7 @@ def build_controls(lateral_plan, raw_model_curvature):
     "onroadEvents": [],
     "radarState": SimpleNamespace(),
     "selfdriveState": SimpleNamespace(enabled=True, active=True),
-  })
+  }, lateral_plan_checks=lateral_plan_checks, model_mono_time=model_mono_time)
 
   controls = Controls.__new__(Controls)
   controls.CI = FakeCarInterface()
@@ -136,11 +199,79 @@ def build_controls(lateral_plan, raw_model_curvature):
   controls.carrot_controls = FakeCarrotControls()
   controls.curvature = 0.0
   controls.desired_curvature = 0.0
-  controls.is_vw_meb = False
+  controls.is_vw_meb = is_vw_meb
+  controls.meb_curvature_pid = FakeMebCurvaturePid() if is_vw_meb else None
+  controls.calibrated_pose = None
   controls.params = FakeParams()
   controls.sm = sm
   controls.steer_limited_by_safety = False
   return controls
+
+
+def build_planner_model(raw_path_y, *, valid_path=True, lane_center_y=0.0, lane_mode=False,
+                        desire=log.Desire.none, lane_change_state=log.LaneChangeState.off,
+                        lane_change_direction=log.LaneChangeDirection.none,
+                        lane_width_left=0.0, lane_width_right=0.0):
+  trajectory_x = np.linspace(0.0, 100.0, LAT_MPC_N + 1)
+  trajectory_t = np.linspace(0.0, 3.2, LAT_MPC_N + 1)
+  path_x = trajectory_x if valid_path else trajectory_x[:-1]
+
+  def line(y):
+    return SimpleNamespace(
+      t=trajectory_t.tolist(),
+      x=trajectory_x.tolist(),
+      y=np.full(LAT_MPC_N + 1, y).tolist(),
+    )
+
+  return SimpleNamespace(
+    position=SimpleNamespace(
+      x=path_x.tolist(),
+      y=raw_path_y.tolist(),
+      z=np.zeros(LAT_MPC_N + 1).tolist(),
+      t=trajectory_t.tolist(),
+    ),
+    orientation=SimpleNamespace(
+      x=np.zeros(LAT_MPC_N + 1).tolist(),
+      z=np.zeros(LAT_MPC_N + 1).tolist(),
+    ),
+    orientationRate=SimpleNamespace(z=np.zeros(LAT_MPC_N + 1).tolist()),
+    velocity=SimpleNamespace(
+      x=np.full(LAT_MPC_N + 1, V_EGO).tolist(),
+      y=np.zeros(LAT_MPC_N + 1).tolist(),
+      z=np.zeros(LAT_MPC_N + 1).tolist(),
+    ),
+    acceleration=SimpleNamespace(x=np.zeros(LAT_MPC_N + 1).tolist()),
+    laneLines=[
+      line(lane_center_y - 3.5),
+      line(lane_center_y - 1.75),
+      line(lane_center_y + 1.75),
+      line(lane_center_y + 3.5),
+    ],
+    laneLineProbs=[0.0, 1.0, 1.0, 0.0] if lane_mode else [0.0, 0.0, 0.0, 0.0],
+    laneLineStds=[1.0, 0.0, 0.0, 1.0] if lane_mode else [1.0, 1.0, 1.0, 1.0],
+    roadEdges=[line(lane_center_y - 5.0), line(lane_center_y + 5.0)],
+    roadEdgeStds=[0.0, 0.0],
+    meta=SimpleNamespace(
+      desire=desire,
+      desireState=[],
+      laneWidthLeft=lane_width_left,
+      laneWidthRight=lane_width_right,
+      laneChangeState=lane_change_state,
+      laneChangeDirection=lane_change_direction,
+    ),
+  )
+
+
+def build_lateral_planner(params, monkeypatch):
+  monkeypatch.setattr(lateral_planner_module, "Params", lambda: params)
+  monkeypatch.setattr(lane_planner_module, "Params", lambda: params)
+
+  CP = car.CarParams.new_message()
+  CP.mass = 2200.0
+  CP.wheelbase = 3.09
+  CP.centerToFront = 1.236
+  CP.tireStiffnessRear = 140000.0
+  return LateralPlanner(CP)
 
 
 def test_straight_path_offset_mpc_plan_reaches_controlsd():
@@ -157,6 +288,8 @@ def test_straight_path_offset_mpc_plan_reaches_controlsd():
 
   lateral_plan = SimpleNamespace(
     useLaneLines=True,
+    mpcSolutionValid=True,
+    modelMonoTime=1_000_000_000,
     psis=offset_solution[:CONTROL_N, 2].tolist(),
     curvatures=offset_curvatures.tolist(),
     distances=offset_solution[:CONTROL_N, 0].tolist(),
@@ -175,3 +308,227 @@ def test_straight_path_offset_mpc_plan_reaches_controlsd():
   assert controls.desired_curvature == pytest.approx(expected_plan_curvature)
   assert CC.actuators.curvature == pytest.approx(expected_plan_curvature)
   assert np.sign(controls.desired_curvature) != np.sign(raw_model_curvature)
+
+
+@pytest.mark.parametrize("is_vw_meb", [False, True], ids=["standard", "vw-meb"])
+@pytest.mark.parametrize(("failure", "lateral_plan_checks", "plan_mono_time", "mpc_solution_valid"), [
+  ("invalid", False, 2_000_000_000, True),
+  ("duplicate-old-epoch", True, 1_950_000_000, True),
+  ("stale-service-and-epoch", False, 1_950_000_000, True),
+  ("mpc-invalid", True, 2_000_000_000, False),
+])
+def test_unusable_lane_plan_falls_back_to_current_model_curvature(
+    is_vw_meb, failure, lateral_plan_checks, plan_mono_time, mpc_solution_valid,
+):
+  del failure
+  current_model_mono_time = 2_000_000_000
+  raw_model_curvature = -0.001
+  stale_lane_curvature = 0.001
+  lateral_plan = SimpleNamespace(
+    useLaneLines=True,
+    mpcSolutionValid=mpc_solution_valid,
+    modelMonoTime=plan_mono_time,
+    psis=np.zeros(CONTROL_N).tolist(),
+    curvatures=np.full(CONTROL_N, stale_lane_curvature).tolist(),
+    distances=np.linspace(0.0, 50.0, CONTROL_N).tolist(),
+  )
+  controls = build_controls(
+    lateral_plan,
+    raw_model_curvature,
+    lateral_plan_checks=lateral_plan_checks,
+    model_mono_time=current_model_mono_time,
+    is_vw_meb=is_vw_meb,
+  )
+
+  controls.state_control()
+
+  raw_target = raw_model_curvature
+  if not is_vw_meb:
+    raw_target *= 1.0 - np.exp(-DT_CTRL / 0.1)
+  expected_curvature, _ = clip_curvature(V_EGO, 0.0, raw_target, 0.0)
+  assert controls.lanefull_mode_enabled is False
+  assert controls.desired_curvature == pytest.approx(expected_curvature)
+  assert controls.desired_curvature < 0.0
+
+
+def test_static_and_dynamic_offsets_are_logged_as_numeric_evidence():
+  path_xyz = np.zeros((LAT_MPC_N + 1, 3))
+  path_xyz[:, 1] = np.linspace(-0.02, 0.02, LAT_MPC_N + 1)
+  expected_before = path_xyz[:, 1].copy()
+
+  before = apply_static_path_offset(path_xyz, PATH_OFFSET_M)
+
+  assert before == pytest.approx(expected_before)
+  assert path_xyz[:, 1] - before == pytest.approx(PATH_OFFSET_M)
+
+  plan = log.LateralPlan.new_message()
+  publish_offset_evidence(plan, PATH_OFFSET_M, -0.03, before)
+  assert plan.staticPathOffset == pytest.approx(PATH_OFFSET_M)
+  assert plan.dynamicLaneOffset == pytest.approx(-0.03)
+  assert list(plan.pathBeforeStaticOffset) == pytest.approx(expected_before)
+
+
+def test_laneless_path_does_not_apply_configured_static_offset(monkeypatch):
+  params = PlannerParams()
+  planner = build_lateral_planner(params, monkeypatch)
+  raw_path_y = np.linspace(-0.02, 0.02, LAT_MPC_N + 1)
+  car_state = SimpleNamespace(vEgo=V_EGO, useLaneLineSpeed=0.0)
+  sm = PlannerSubMaster({
+    "carState": car_state,
+    "carrotMan": SimpleNamespace(vTurnSpeed=0),
+    "controlsState": SimpleNamespace(curvature=0.0),
+    "modelV2": build_planner_model(raw_path_y),
+  }, model_mono_time=1_000_000_000)
+  carrot = SimpleNamespace(atc_active=False)
+
+  planner.update(sm, carrot)
+
+  assert planner.pathOffset == pytest.approx(PATH_OFFSET_M)
+  assert planner.appliedPathOffset == pytest.approx(0.0)
+  assert not planner.lanelines_active
+  assert planner.LP.adjustLaneOffset == pytest.approx(0.0)
+  assert planner.raw_model_path_xyz[:, 1] == pytest.approx(raw_path_y)
+  assert planner.path_before_static_offset == pytest.approx(raw_path_y)
+  assert planner.path_xyz[:, 1] == pytest.approx(raw_path_y)
+
+  sm["modelV2"] = build_planner_model(
+    np.full(LAT_MPC_N + 1, 5.0),
+    valid_path=False,
+    lane_center_y=1.0,
+    lane_mode=True,
+  )
+  sm.logMonoTime["modelV2"] = 2_000_000_000
+  planner.update(sm, carrot)
+
+  assert planner.appliedPathOffset == pytest.approx(0.0)
+  assert not planner.lanelines_active
+  assert planner.path_before_static_offset == pytest.approx(raw_path_y)
+  assert planner.path_xyz[:, 1] == pytest.approx(raw_path_y)
+
+  pm = CapturePubMaster()
+  planner.publish(sm, pm, carrot)
+  assert pm.message.valid is False
+  assert pm.message.lateralPlan.modelMonoTime == 1_000_000_000
+  assert pm.message.lateralPlan.useLaneLines is False
+  assert pm.message.lateralPlan.staticPathOffset == pytest.approx(0.0)
+  assert pm.message.lateralPlan.dynamicLaneOffset == pytest.approx(0.0)
+
+
+def test_laneless_path_does_not_apply_filtered_dynamic_offset(monkeypatch):
+  params = PlannerParams(adjust_lane_offset_cm=10)
+  planner = build_lateral_planner(params, monkeypatch)
+  raw_path_y = np.zeros(LAT_MPC_N + 1)
+  sm = PlannerSubMaster({
+    "carState": SimpleNamespace(vEgo=V_EGO, useLaneLineSpeed=0.0),
+    "carrotMan": SimpleNamespace(vTurnSpeed=0),
+    "controlsState": SimpleNamespace(curvature=0.0),
+    "modelV2": build_planner_model(
+      raw_path_y,
+      lane_mode=True,
+      lane_width_left=2.2,
+      lane_width_right=2.1,
+    ),
+  }, model_mono_time=1_000_000_000)
+  carrot = SimpleNamespace(atc_active=False)
+
+  for frame in range(80):
+    sm.logMonoTime["modelV2"] = 1_000_000_000 + frame * 50_000_000
+    planner.update(sm, carrot)
+
+  assert planner.LP.lane_offset_filtered.x > 0.0
+  assert planner.LP.offset_total == pytest.approx(0.0)
+  assert not planner.lanelines_active
+  assert planner.appliedPathOffset == pytest.approx(0.0)
+  assert planner.path_before_static_offset == pytest.approx(raw_path_y)
+  assert planner.path_xyz[:, 1] == pytest.approx(raw_path_y)
+
+  pm = CapturePubMaster()
+  planner.publish(sm, pm, carrot)
+  assert pm.message.lateralPlan.staticPathOffset == pytest.approx(0.0)
+  assert pm.message.lateralPlan.dynamicLaneOffset == pytest.approx(0.0)
+
+
+def test_invalid_model_cycles_freeze_complete_lane_epoch_and_apply_static_offset_once(monkeypatch):
+  params = PlannerParams()
+  planner = build_lateral_planner(params, monkeypatch)
+  raw_path_y = np.zeros(LAT_MPC_N + 1)
+  car_state = SimpleNamespace(vEgo=V_EGO, useLaneLineSpeed=1.0)
+  sm = PlannerSubMaster({
+    "carState": car_state,
+    "carrotMan": SimpleNamespace(vTurnSpeed=0),
+    "controlsState": SimpleNamespace(curvature=0.0),
+    "modelV2": build_planner_model(raw_path_y, lane_mode=True),
+  }, model_mono_time=1_000_000_000)
+  carrot = SimpleNamespace(atc_active=False)
+
+  for frame in range(50):
+    sm.logMonoTime["modelV2"] = 1_000_000_000 + frame * 50_000_000
+    planner.update(sm, carrot)
+
+  valid_model_mono_time = sm.logMonoTime["modelV2"]
+  expected_raw_model_path = planner.raw_model_path_xyz.copy()
+  expected_t_idxs = planner.t_idxs.copy()
+  expected_pre_static = planner.path_before_static_offset.copy()
+  expected_plan_yaw = planner.plan_yaw.copy()
+  expected_plan_yaw_rate = planner.plan_yaw_rate.copy()
+  expected_velocity_xyz = planner.velocity_xyz.copy()
+  expected_v_plan = planner.v_plan.copy()
+  expected_plan_a = planner.plan_a.copy()
+  expected_lane_width_left = planner.LP.lane_width_left
+  expected_lane_width_right = planner.LP.lane_width_right
+  assert planner.lanelines_active
+  assert planner.appliedPathOffset == pytest.approx(PATH_OFFSET_M)
+  assert planner.path_xyz[:, 1] == pytest.approx(expected_pre_static + PATH_OFFSET_M)
+
+  invalid_model = build_planner_model(
+    np.full(LAT_MPC_N + 1, 5.0),
+    valid_path=False,
+    lane_center_y=1.0,
+    lane_mode=True,
+    desire=log.Desire.laneChangeRight,
+    lane_change_state=log.LaneChangeState.preLaneChange,
+    lane_change_direction=log.LaneChangeDirection.right,
+    lane_width_left=3.0,
+    lane_width_right=1.0,
+  )
+  invalid_model.position.z = np.full(LAT_MPC_N + 1, 2.0).tolist()
+  invalid_model.position.t = np.linspace(1.0, 4.2, LAT_MPC_N + 1).tolist()
+  invalid_model.orientation.z = np.full(LAT_MPC_N + 1, 0.3).tolist()
+  invalid_model.orientationRate.z = np.full(LAT_MPC_N + 1, 0.4).tolist()
+  invalid_model.velocity.x = np.full(LAT_MPC_N + 1, 5.0).tolist()
+  invalid_model.velocity.y = np.full(LAT_MPC_N + 1, 2.0).tolist()
+  invalid_model.acceleration.x = np.full(LAT_MPC_N + 1, -1.0).tolist()
+  sm["modelV2"] = invalid_model
+  for frame in range(3):
+    sm.logMonoTime["modelV2"] = 10_000_000_000 + frame * 50_000_000
+    planner.update(sm, carrot)
+
+    assert planner.model_mono_time == valid_model_mono_time
+    assert planner.raw_model_path_xyz == pytest.approx(expected_raw_model_path)
+    assert planner.t_idxs == pytest.approx(expected_t_idxs)
+    assert planner.plan_yaw == pytest.approx(expected_plan_yaw)
+    assert planner.plan_yaw_rate == pytest.approx(expected_plan_yaw_rate)
+    assert planner.velocity_xyz == pytest.approx(expected_velocity_xyz)
+    assert planner.v_plan == pytest.approx(expected_v_plan)
+    assert planner.plan_a == pytest.approx(expected_plan_a)
+    assert (planner.LP.lll_y + planner.LP.rll_y) / 2.0 == pytest.approx(0.0)
+    assert planner.LP.lane_width_left == pytest.approx(expected_lane_width_left)
+    assert planner.LP.lane_width_right == pytest.approx(expected_lane_width_right)
+    assert planner.LP.lane_change_multiplier == pytest.approx(1.0)
+    assert planner.model_desire == log.Desire.none
+    assert planner.path_before_static_offset == pytest.approx(expected_pre_static)
+    assert planner.path_xyz[:, 1] == pytest.approx(expected_pre_static + PATH_OFFSET_M)
+    assert planner.lanelines_active
+    assert planner.appliedPathOffset == pytest.approx(PATH_OFFSET_M)
+
+  pm = CapturePubMaster()
+  planner.publish(sm, pm, carrot)
+  lateral_plan = pm.message.lateralPlan
+  assert pm.message.valid is False
+  assert lateral_plan.modelMonoTime == valid_model_mono_time
+  assert lateral_plan.useLaneLines is False
+  assert lateral_plan.staticPathOffset == pytest.approx(0.0)
+  assert lateral_plan.dynamicLaneOffset == pytest.approx(0.0)
+  assert lateral_plan.pathBeforeStaticOffset == pytest.approx(expected_pre_static)
+  assert lateral_plan.laneChangeState == log.LaneChangeState.off
+  assert lateral_plan.laneChangeDirection == log.LaneChangeDirection.none

@@ -16,15 +16,24 @@ MAX_LANE_CENTERING_AWAY = 1.85
 KEEP_MIN_DISTANCE_FROM_LANE = 1.35
 KEEP_MIN_DISTANCE_FROM_EDGELANE = 1.15
 
+# laneWidthLeft/Right are independently filtered model estimates, while their
+# ordering can select the full configured AdjustLaneOffset once lane_width is
+# 2.9 m or wider. Treat differences up to 5 cm as indistinguishable: this is
+# half of the setting's minimum 10 cm adjustment step, so sub-step estimation
+# noise cannot flip a full adjustment from one side to the other.
+LANE_WIDTH_ASYMMETRY_DEADBAND_M = 0.05
+
+
 def lane_width_adjust_offset(lane_width, lane_width_left, lane_width_right, adjust_lane_offset):
   if (lane_width_left > 2.2 and lane_width_right > 2.2) or \
      (lane_width_left < 2.0 and lane_width_right < 2.0):
     return 0.0
-  if lane_width_left > lane_width_right:
+  lane_width_delta = lane_width_left - lane_width_right
+  if abs(lane_width_delta) <= LANE_WIDTH_ASYMMETRY_DEADBAND_M:
+    return 0.0
+  if lane_width_delta > 0.0:
     return np.interp(lane_width, [2.5, 2.9], [0.0, adjust_lane_offset])
-  if lane_width_right > lane_width_left:
-    return np.interp(lane_width, [2.5, 2.9], [0.0, -adjust_lane_offset])
-  return 0.0
+  return np.interp(lane_width, [2.5, 2.9], [0.0, -adjust_lane_offset])
 
 def clamp(num, min_value, max_value):
   # weird broken case, do something reasonable
@@ -139,7 +148,6 @@ class LanePlanner:
     # Find current lanewidth
     current_lane_width = abs(self.rll_y[0] - self.lll_y[0])
 
-    max_updated_count = 10.0 * DT_MDL
     both_lane_available = False
     #speed_lane_width = np.interp(v_ego*3.6, [0., 60.], [2.8, 3.5])
     if l_prob > 0.5 and r_prob > 0.5 and self.lane_change_multiplier > 0.5:
@@ -193,7 +201,7 @@ class LanePlanner:
         lane_path_y = path_from_left_lane if l_prob > 0.5 or l_prob > r_prob else path_from_right_lane
     elif l_prob > 0.7 and r_prob > 0.7:
       lane_path_y = (path_from_left_lane + path_from_right_lane) / 2.
-      # lane_width filtering에 의해서, 점점 줄어들때, 중앙선으로 붙어가는 현상이 생김.. 
+      # lane_width filtering에 의해서, 점점 줄어들때, 중앙선으로 붙어가는 현상이 생김..
       #if self.lane_width > 3.2:
       #  lane_path_y = path_from_right_lane
       #else:
@@ -237,7 +245,7 @@ class LanePlanner:
     #  self.d_prob, self.lanefull_mode,
     #  self.lane_width_left_filtered.x, self.lane_width, self.lane_width_right_filtered.x)
 
-    adjustLaneTime = self.params.get_float("LatMpcInputOffset") * 0.01 # 0.06 
+    adjustLaneTime = self.params.get_float("LatMpcInputOffset") * 0.01 # 0.06
     laneline_active = False
     self.d_prob_count = self.d_prob_count + 1 if self.d_prob > 0.3 else 0
     if self.lanefull_mode and self.d_prob_count > int(1 / DT_MDL):
@@ -253,9 +261,10 @@ class LanePlanner:
           path_xyz[:,1] = self.d_prob * lane_path_y_interp + (1.0 - self.d_prob) * path_xyz[:,1]
 
 
-    path_xyz[:, 1] += (CAMERA_OFFSET + self.lane_offset_filtered.x)
+    applied_lane_offset = self.lane_offset_filtered.x if laneline_active else 0.0
+    path_xyz[:, 1] += (CAMERA_OFFSET + applied_lane_offset)
 
-    self.offset_total = self.lane_offset_filtered.x
+    self.offset_total = applied_lane_offset
 
     return path_xyz, laneline_active
 
