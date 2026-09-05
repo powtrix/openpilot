@@ -416,7 +416,7 @@ def test_ka4_real_scc_rx_aborts_keepalive_and_panda_rejects_generic_reactivation
   assert not replay.CS.out.cruiseState.enabled
   assert not replay.controller.stock_scc_keepalive_pending
   assert replay.controller.stock_scc_keepalive_press_frames == 0
-  assert not replay.controller.stock_scc_keepalive_sent
+  assert not replay.controller.stock_scc_keepalive_requested
   assert not safety.get_controls_allowed()
   assert replay.last_safety_tx_results == [False]
   assert [request.frame for request in replay.injected] == [30, 32]

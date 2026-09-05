@@ -490,7 +490,20 @@ async def api_dashcam_upload_summary(request: web.Request) -> web.Response:
 async def api_dashcam_upload(request: web.Request) -> web.Response:
   try:
     segments = await request_upload_segments(request)
-    return web.json_response(await upload_jobs.run_upload_segments(segments))
+    running = upload_jobs.running_job()
+    if running:
+      return web.json_response({
+        "ok": False,
+        "error": "upload already running",
+        "job_id": running.get("id"),
+        "job": upload_jobs.snapshot(running),
+      }, status=409)
+    # Preserve the legacy synchronous response while registering it in the
+    # same single-job registry used by the modern endpoint and auto collector.
+    job = upload_jobs.create_job(segments)
+    await upload_jobs.start_job(job)
+    result = job.get("result") if isinstance(job.get("result"), dict) else {"ok": False, "error": "upload failed"}
+    return web.json_response(result)
   except web.HTTPException as e:
     return web.json_response({"ok": False, "error": e.text or e.reason}, status=e.status)
   except Exception as e:
@@ -573,10 +586,36 @@ async def api_dashcam_read_state_update(request: web.Request) -> web.Response:
   return web.json_response({"ok": True, **state})
 
 
+async def api_validation_auto_upload_status(request: web.Request) -> web.Response:
+  # Keep the optional validation service out of dashcam module import order;
+  # this endpoint is read-only and exposes no paths, URLs, or captured metadata.
+  from ...services.validation_auto_upload import (
+    VALIDATION_AUTO_UPLOAD_PARAM,
+    public_validation_upload_status,
+    read_validation_upload_state,
+  )
+
+  state = await asyncio.to_thread(read_validation_upload_state)
+  params = request.app.get("params")
+  try:
+    enabled = bool(params and params.get_bool(VALIDATION_AUTO_UPLOAD_PARAM))
+  except Exception:
+    enabled = False
+  task = request.app.get("validation_auto_upload_task")
+  response = web.json_response({
+    "ok": True,
+    **public_validation_upload_status(state, enabled),
+    "serviceRunning": bool(task is not None and not task.done()),
+  })
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
 def register(app: web.Application) -> None:
   app.router.add_get("/api/dashcam/routes", api_dashcam_routes)
   app.router.add_get("/api/dashcam/read-state", api_dashcam_read_state)
   app.router.add_post("/api/dashcam/read-state", api_dashcam_read_state_update)
+  app.router.add_get("/api/dashcam/validation-upload/status", api_validation_auto_upload_status)
   app.router.add_get("/api/dashcam/segments/{route}", api_dashcam_segments)
   app.router.add_get("/api/dashcam/report/{route}", api_dashcam_report)
   app.router.add_get("/api/dashcam/summary-source/{route}", api_dashcam_summary_source)

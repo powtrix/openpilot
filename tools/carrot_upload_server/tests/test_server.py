@@ -1,13 +1,19 @@
 import asyncio
+import os
+import sqlite3
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
-from aiohttp import FormData
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
+from .. import server as receiver_server
 from ..server import UPLOAD_SERVICE_KEY, Config, create_app
 
 
 DEVICE = "0123456789abcdef"
+OTHER_DEVICE = "fedcba9876543210"
 CLIENT_IP = "203.0.113.10"
 
 
@@ -20,6 +26,7 @@ def config(tmp_path: Path, *, quota: int = 1024 * 1024) -> Config:
     max_file_bytes=1024 * 1024,
     max_tmux_bytes=1024 * 1024,
     min_free_bytes=0,
+    validation_free_space_reserve_bytes=0,
     session_ttl_seconds=600,
     concurrent_per_device=3,
     concurrent_global=16,
@@ -146,6 +153,8 @@ def test_quota_and_file_validation(tmp_path: Path):
 
       first = await upload("qlog", b"123456")
       assert first.status == 200
+      empty = await upload("empty", b"")
+      assert empty.status == 400
       # Replacing an existing remote path still consumes daily transfer quota.
       # Otherwise a client could evade the limit by overwriting one filename.
       over_quota = await upload("qlog", b"7890")
@@ -157,7 +166,7 @@ def test_quota_and_file_validation(tmp_path: Path):
   asyncio.run(run())
 
 
-def test_tmux_multipart_upload(tmp_path: Path):
+def test_tmux_multipart_upload(tmp_path: Path, monkeypatch):
   async def run():
     async with TestClient(TestServer(create_app(config(tmp_path), start_cleanup=False))) as client:
       token = await session(
@@ -169,6 +178,23 @@ def test_tmux_multipart_upload(tmp_path: Path):
       form.add_field("tmux_why", "can_error")
       form.add_field("files[0]", b"tmux output", filename="tmux.log", content_type="text/plain")
       form.add_field("files[1]", b'{"enabled":true}', filename="toggle_values.json", content_type="application/json")
+      service = client.app[UPLOAD_SERVICE_KEY]
+      original_progress = service._record_stream_progress
+      progress: list[tuple[int, int, int]] = []
+
+      async def record_progress(
+        reservation: Any,
+        state: Any,
+        **kwargs: Any,
+      ) -> None:
+        progress.append((
+          kwargs["received_bytes"],
+          kwargs["disk_written_bytes"],
+          kwargs.get("stored_bytes", 0),
+        ))
+        await original_progress(reservation, state, **kwargs)
+
+      monkeypatch.setattr(service, "_record_stream_progress", record_progress)
       response = await client.post(
         "/api/v1/tmux/upload",
         data=form,
@@ -186,6 +212,264 @@ def test_tmux_multipart_upload(tmp_path: Path):
       assert len(tmux_logs) == 1
       assert tmux_logs[0].read_bytes() == b"tmux output"
       assert not (tmp_path / "uploads" / "tmux" / "carrot__wip").exists()
+      assert progress
+      assert all(0 <= disk <= received and stored <= disk for received, disk, stored in progress)
+      assert any(received > disk for received, disk, _stored in progress)
+      for previous, current in zip(progress, progress[1:], strict=False):
+        if current[1] > previous[1]:
+          assert current[0] == previous[0]
+
+  asyncio.run(run())
+
+
+def test_received_progress_keeps_free_space_reserved_until_write(tmp_path: Path, monkeypatch):
+  async def run():
+    cfg = replace(config(tmp_path), min_free_bytes=10)
+    monkeypatch.setattr(
+      receiver_server.shutil,
+      "disk_usage",
+      lambda _path: type("DiskUsage", (), {"free": 15})(),
+    )
+    async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+      token = await session(client)
+      service = client.app[UPLOAD_SERVICE_KEY]
+      original_progress = service._record_reservation_progress
+      before_write = asyncio.Event()
+      release_write = asyncio.Event()
+      first_progress: tuple[int, int] | None = None
+
+      async def interleave_progress(
+        reservation: Any,
+        received_bytes: int,
+        stored_bytes: int = 0,
+        *,
+        disk_written_bytes: int,
+      ) -> None:
+        nonlocal first_progress
+        await original_progress(
+          reservation,
+          received_bytes,
+          stored_bytes,
+          disk_written_bytes=disk_written_bytes,
+        )
+        if first_progress is None and reservation.device_id == DEVICE:
+          first_progress = (received_bytes, disk_written_bytes)
+          before_write.set()
+          await release_write.wait()
+
+      monkeypatch.setattr(service, "_record_reservation_progress", interleave_progress)
+      request = asyncio.create_task(client.put(
+        f"/api/v1/upload/{DEVICE}/route--0/qlog.zst",
+        data=b"abcd",
+        headers={
+          "Authorization": f"Bearer {token}",
+          "X-Forwarded-For": CLIENT_IP,
+          "X-File-Size": "4",
+        },
+      ))
+      await asyncio.wait_for(before_write.wait(), timeout=1)
+      assert first_progress == (4, 0)
+      parts = list(cfg.storage_root.rglob("*.part"))
+      assert len(parts) == 1
+      assert parts[0].stat().st_size == 0
+      with sqlite3.connect(cfg.db_path) as connection:
+        assert connection.execute(
+          "SELECT received_bytes, disk_written_bytes FROM upload_reservations",
+        ).fetchone() == (4, 0)
+
+      unexpected = None
+      try:
+        unexpected = await service._reserve(OTHER_DEVICE, "203.0.113.11", 4)
+      except web.HTTPInsufficientStorage:
+        pass
+      finally:
+        if unexpected is not None:
+          await service._finish_reservation(unexpected, 0)
+        release_write.set()
+      assert unexpected is None
+      response = await asyncio.wait_for(request, timeout=2)
+      assert response.status == 200, await response.text()
+
+  asyncio.run(run())
+
+
+def test_partial_write_crash_reconciliation_charges_network_only(tmp_path: Path):
+  async def run():
+    cfg = replace(config(tmp_path), reservation_lease_seconds=1, stale_part_seconds=1)
+    service = create_app(cfg, start_cleanup=False)[UPLOAD_SERVICE_KEY]
+    reservation = await service._reserve(DEVICE, CLIENT_IP, 4)
+    await service._record_reservation_progress(
+      reservation,
+      4,
+      disk_written_bytes=2,
+    )
+    part = cfg.storage_root / "routes" / "TEST" / ".qlog.aaaaaaaaaaaaaaaa.part"
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"ab")
+    os.utime(part, (0, 0))
+    with sqlite3.connect(cfg.db_path) as connection:
+      connection.execute(
+        "UPDATE upload_reservations SET touched_at=0 WHERE reservation_id=?",
+        (reservation.reservation_id,),
+      )
+
+    result = await service.cleanup()
+    assert result["staleReservations"] == 1
+    assert result["staleParts"] == 1
+    assert not part.exists()
+    with sqlite3.connect(cfg.db_path) as connection:
+      assert connection.execute("SELECT COUNT(*) FROM upload_reservations").fetchone()[0] == 0
+      assert connection.execute(
+        "SELECT committed_bytes, reserved_bytes, stored_bytes FROM daily_usage ORDER BY scope",
+      ).fetchall() == [(4, 0, 0), (4, 0, 0)]
+
+  asyncio.run(run())
+
+
+def test_stream_timeout_charges_partial_body_and_releases_slot(tmp_path: Path, monkeypatch):
+  async def run():
+    cfg = config(tmp_path)
+    async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+      token = await session(client)
+      service = client.app[UPLOAD_SERVICE_KEY]
+      original_body_chunks = service._body_chunks
+      first_call = True
+
+      async def timeout_first_body(content: Any, chunk_size: int, **kwargs: Any):
+        nonlocal first_call
+        if first_call:
+          first_call = False
+          yield b"a"
+          raise web.HTTPRequestTimeout(text="upload body idle deadline exceeded")
+        async for chunk in original_body_chunks(content, chunk_size, **kwargs):
+          yield chunk
+
+      monkeypatch.setattr(service, "_body_chunks", timeout_first_body)
+      headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Forwarded-For": CLIENT_IP,
+        "X-File-Size": "2",
+      }
+      timed_out = await client.put(
+        f"/api/v1/upload/{DEVICE}/route--0/qlog.zst",
+        data=b"ab",
+        headers=headers,
+      )
+      assert timed_out.status == 408
+      assert service._active_global == 0
+      assert not list(cfg.storage_root.rglob("*.part"))
+      with sqlite3.connect(cfg.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM upload_reservations").fetchone()[0] == 0
+        assert connection.execute(
+          "SELECT committed_bytes FROM daily_usage ORDER BY scope",
+        ).fetchall() == [(1,), (1,)]
+
+      retry = await client.put(
+        f"/api/v1/upload/{DEVICE}/route--0/qlog.zst",
+        data=b"ab",
+        headers=headers,
+      )
+      assert retry.status == 200, await retry.text()
+
+  asyncio.run(run())
+
+
+def test_tmux_body_deadline_releases_legacy_capacity(tmp_path: Path, monkeypatch):
+  async def run():
+    cfg = config(tmp_path)
+    async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+      token = await session(client, purpose="tmux")
+      service = client.app[UPLOAD_SERVICE_KEY]
+      original_await_body = service._await_body_operation
+      first_call = True
+
+      async def timeout_first_operation(operation: Any, **kwargs: Any):
+        nonlocal first_call
+        if first_call:
+          first_call = False
+          raise web.HTTPRequestTimeout(text="upload body idle deadline exceeded")
+        return await original_await_body(operation, **kwargs)
+
+      monkeypatch.setattr(service, "_await_body_operation", timeout_first_operation)
+
+      def form() -> FormData:
+        value = FormData()
+        value.add_field("files[0]", b"tmux output", filename="tmux.log", content_type="text/plain")
+        return value
+
+      headers = {"Authorization": f"Bearer {token}", "X-Forwarded-For": CLIENT_IP}
+      timed_out = await client.post("/api/v1/tmux/upload", data=form(), headers=headers)
+      assert timed_out.status == 408
+      assert service._active_global == 0
+      with sqlite3.connect(cfg.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM upload_reservations").fetchone()[0] == 0
+
+      retry = await client.post("/api/v1/tmux/upload", data=form(), headers=headers)
+      assert retry.status == 200, await retry.text()
+
+  asyncio.run(run())
+
+
+def test_slow_legacy_json_admission_covers_full_handler_and_isolates_validation(
+  tmp_path: Path,
+  monkeypatch,
+):
+  async def run():
+    cfg = replace(
+      config(tmp_path),
+      request_concurrent_per_ip=1,
+      request_concurrent_global=1,
+      validation_request_concurrent_per_ip=1,
+      validation_request_concurrent_global=1,
+    )
+    async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+      token = await session(client)
+      service = client.app[UPLOAD_SERVICE_KEY]
+      original_json_body = service._json_body
+      body_started = asyncio.Event()
+      release_body = asyncio.Event()
+      session_body_calls = 0
+
+      async def blocking_json_body(request: web.Request, limit: int, **kwargs: Any) -> Any:
+        nonlocal session_body_calls
+        if request.path == "/api/v1/session":
+          session_body_calls += 1
+          if session_body_calls == 1:
+            body_started.set()
+            await release_body.wait()
+        return await original_json_body(request, limit, **kwargs)
+
+      monkeypatch.setattr(service, "_json_body", blocking_json_body)
+      slow_session = asyncio.create_task(client.post(
+        "/api/v1/session",
+        json={"deviceId": DEVICE, "purpose": "dashcam"},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      ))
+      await asyncio.wait_for(body_started.wait(), timeout=1)
+
+      blocked_complete = await client.post(
+        "/api/v1/complete",
+        json={"deviceId": DEVICE},
+        headers={"Authorization": f"Bearer {token}", "X-Forwarded-For": CLIENT_IP},
+      )
+      assert blocked_complete.status in {429, 503}
+      assert session_body_calls == 1
+      assert service._request_active_global == 1
+
+      validation = await client.post(
+        "/api/v1/validation/challenge",
+        json={"deviceId": DEVICE},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert validation.status == 200, await validation.text()
+
+      release_body.set()
+      completed_session = await asyncio.wait_for(slow_session, timeout=2)
+      assert completed_session.status == 200, await completed_session.text()
+      assert service._request_active_global == 0
+      assert service._validation_request_active_global == 0
+      assert not service._request_active_by_ip
+      assert not service._validation_request_active_by_ip
 
   asyncio.run(run())
 

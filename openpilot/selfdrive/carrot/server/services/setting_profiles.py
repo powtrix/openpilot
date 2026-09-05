@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from ..config import CARROT_SETTING_PROFILES_PATH
 from .params import (
+  filter_param_values_for_backup,
   get_param_values,
   preview_param_restore_values,
   restore_param_values_validated,
@@ -90,11 +91,11 @@ def _clean_values(values: Any) -> Dict[str, Any]:
     return {}
   _, _, by_name, _ = get_settings_cached()
   allowed = set(by_name.keys())
-  return {
+  return filter_param_values_for_backup({
     str(key): value
     for key, value in values.items()
     if str(key) in allowed
-  }
+  })
 
 
 def _setting_defaults() -> Dict[str, Any]:
@@ -107,7 +108,7 @@ def _setting_defaults() -> Dict[str, Any]:
 
 def snapshot_current_setting_values() -> Dict[str, Any]:
   defaults = _setting_defaults()
-  return get_param_values(list(defaults.keys()), defaults)
+  return filter_param_values_for_backup(get_param_values(list(defaults.keys()), defaults))
 
 
 def _sanitize_profile(raw: Any) -> Optional[Dict[str, Any]]:

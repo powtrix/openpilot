@@ -260,8 +260,9 @@ class CarController(CarControllerBase):
     self.stock_scc_keepalive_pending_frame = None
     self.stock_scc_keepalive_press_frames = 0
     self.stock_scc_keepalive_warning_recovery = False
-    self.stock_scc_warning_recovery_sent = False
-    self.stock_scc_keepalive_sent = False
+    self.stock_scc_warning_recovery_requested = False
+    self.stock_scc_keepalive_requested = False
+    self.stock_scc_keepalive_request_count = 0
     self.stock_scc_last_keepalive_frame = None
     self.stock_scc_button_source_counter = None
     self.paddle_mode = Params().get_int("PaddleMode")
@@ -746,11 +747,15 @@ class CarController(CarControllerBase):
           stock_scc_source_fresh=stock_scc_source_fresh,
         )
         if dat is not None:
-          repeat_count = 1 if self.stock_scc_keepalive_sent else self.button_spam3
+          repeat_count = 1 if self.stock_scc_keepalive_requested else self.button_spam3
           for _ in range(repeat_count):
             can_sends.append(dat)
+          if self.stock_scc_keepalive_requested:
+            # This counts controller frames appended to can_sends. It does not
+            # prove Panda transmission or acceptance by the stock SCC ECU.
+            self.stock_scc_keepalive_request_count = (self.stock_scc_keepalive_request_count + 1) & 0xFFFFFFFF
           self.cruise_buttons_msg_cnt += 1
-        self.stock_scc_keepalive_sent = False
+        self.stock_scc_keepalive_requested = False
 
     return can_sends
 
@@ -792,7 +797,7 @@ class CarController(CarControllerBase):
 
 
   def make_spam_button(self, CC, CS, *, stock_scc_source_fresh=False):
-    self.stock_scc_keepalive_sent = False
+    self.stock_scc_keepalive_requested = False
     if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
       self.activateCruise = 0
       self.stock_scc_keepalive_pending = False
@@ -864,13 +869,13 @@ class CarController(CarControllerBase):
       self.button_spamming_count = self.button_spamming_count + 1 if send_button == Buttons.RES_ACCEL else self.button_spamming_count - 1
       if keepalive_pending:
         if self.stock_scc_keepalive_warning_recovery:
-          self.stock_scc_warning_recovery_sent = True
+          self.stock_scc_warning_recovery_requested = True
           self.stock_scc_keepalive_warning_recovery = False
         self.stock_scc_keepalive_press_frames = max(0, self.stock_scc_keepalive_press_frames - 1)
         if self.stock_scc_keepalive_press_frames == 0:
           self.stock_scc_keepalive_pending = False
           self.stock_scc_keepalive_pending_frame = None
-        self.stock_scc_keepalive_sent = True
+        self.stock_scc_keepalive_requested = True
         self.stock_scc_last_keepalive_frame = self.frame
         self.last_button_frame = self.frame
         self.button_wait = max(self.button_wait, round(KA4_STOCK_SCC_POST_KEEPALIVE_BUTTON_QUIET / DT_CTRL))
@@ -888,8 +893,8 @@ class CarController(CarControllerBase):
     self.stock_scc_keepalive_pending_frame = None
     self.stock_scc_keepalive_press_frames = 0
     self.stock_scc_keepalive_warning_recovery = False
-    self.stock_scc_warning_recovery_sent = False
-    self.stock_scc_keepalive_sent = False
+    self.stock_scc_warning_recovery_requested = False
+    self.stock_scc_keepalive_requested = False
     self.stock_scc_last_keepalive_frame = None
 
   def _update_ka4_stock_scc_keepalive(self, CC, CS):
@@ -940,7 +945,7 @@ class CarController(CarControllerBase):
       CC.cruiseControl.cancel
     )
     if not info_display_active:
-      self.stock_scc_warning_recovery_sent = False
+      self.stock_scc_warning_recovery_requested = False
       if self.stock_scc_keepalive_warning_recovery:
         self.stock_scc_keepalive_pending = False
         self.stock_scc_keepalive_pending_frame = None
@@ -1065,7 +1070,7 @@ class CarController(CarControllerBase):
       stopped_time >= KA4_STOCK_SCC_FIRST_REARM_DELAY if last_keepalive_elapsed is None else
       last_keepalive_elapsed >= KA4_STOCK_SCC_MIN_REARM_INTERVAL
     )
-    warning_retry_due = info_display_active and not self.stock_scc_warning_recovery_sent and (
+    warning_retry_due = info_display_active and not self.stock_scc_warning_recovery_requested and (
       last_keepalive_elapsed is None or last_keepalive_elapsed >= KA4_STOCK_SCC_WARNING_RETRY_INTERVAL
     )
     final_rearm_due = (

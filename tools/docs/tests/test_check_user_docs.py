@@ -81,3 +81,28 @@ def test_override_requires_a_concrete_reason():
   assert extract_override_reason("Docs-Not-Needed: 내부 함수만 분리했고 사용자 동작은 동일함")
   assert extract_override_reason("Docs-Not-Needed: N/A") == ""
   assert extract_override_reason("Docs-Not-Needed:") == ""
+
+
+def test_validation_upload_docs_disclose_full_campaign_and_transfer_bounds():
+  required = {
+    REPO_ROOT / "docs/user/ko/dashcam-log-sharing.md": [
+      "full rlog만 최대 3개",
+      "최대 14개 캡처/42개 full rlog",
+      "최대 5개 캡처/750 MiB",
+      "누적 전송량이나 재시도 데이터 사용량 한도가 아닙니다",
+      "장치별 일일 1 GiB",
+      "다음 날 자동 재시도",
+    ],
+    REPO_ROOT / "docs/user/en/dashcam-log-sharing.md": [
+      "at most three full rlogs",
+      "at most 14 captures / 42 full rlogs",
+      "5 captures / 750 MiB",
+      "not a cap on cumulative campaign uploads or retry traffic",
+      "1 GiB per-device daily limit",
+      "retry automatically the next day",
+    ],
+  }
+  for path, fragments in required.items():
+    source = path.read_text(encoding="utf-8")
+    for fragment in fragments:
+      assert fragment in source, f"{path}: {fragment}"

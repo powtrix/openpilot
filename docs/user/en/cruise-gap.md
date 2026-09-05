@@ -5,7 +5,7 @@
 > [!NOTE]
 > This is the canonical English user guide maintained with the `carrot-wip` code. When user-visible behavior changes, update this document together with the related code and tests.
 
-This page explains all **31 cruise and following-gap settings** from the current implementation, including where each value enters the calculation and the direction of adjustment.
+This page explains all **29 cruise and following-gap settings** from the current implementation, including where each value enters the calculation and the direction of adjustment.
 
 Change them in **Carrot Web → Settings → Driving control → Cruise and following gap**.
 
@@ -225,8 +225,6 @@ For a clean baseline, use `EnableSpeedTF=0`, `DynamicTFollow=0`, `DynamicTFollow
 | Setting | Range/scale | Role |
 |---|---|---|
 | `LeadAccelResponse` | 0–5, default 0 | Responsiveness to a lead starting or accelerating at following-distance level 1 |
-| `RadarReactionFactor` | 0–200%, default 100% | How long measured lead acceleration persists into the future |
-| `JLeadFactor3` | 0–100, ×0.01 | How much lead acceleration change enters future trajectory prediction |
 
 ### `LeadAccelResponse`
 
@@ -257,22 +255,9 @@ Every level uses the strong cost reduction only while actual distance exceeds th
 
 Levels 1–3 do not change the target time gap. The level 4–5 exception that prioritizes the configured `TFollowGap1` as the base target applies only during positive lead acceleration; `DynamicTFollow` and lane-change corrections may still apply afterward. Lead-braking response and stopping behavior retain normal control at every level. Every level remains inactive with the experimental blended planner, a vision-only lead, and following-distance levels 2–4. Use level 5 only when you can verify that short-gap starts do not cause unwanted acceleration.
 
-### `RadarReactionFactor`
+The radar publisher uses fixed per-track decay when projecting lead acceleration. Measured `jLead` remains available to diagnostics and dynamic following-gap logic, but no separate user setting injects it into the MPC lead trajectory.
 
-Radar acceleration and jerk form `aLeadTau`, used by MPC to predict how long the lead's current acceleration or deceleration will continue.
-
-- Lower values assume the measured change persists longer and respond more quickly.
-- Higher values let it decay sooner and may respond more smoothly but later.
-- Too low can react to radar noise; too high can respond slowly to real lead braking.
-
-### `JLeadFactor3`
-
-The code smooths `jLead` as 10% new and 90% previous, multiplies by this percentage, clamps to -1 through +1, and inserts it into the future lead trajectory. Zero excludes jerk; 50 uses half; 100 uses the full allowed value.
-
-> [!NOTE]
-> Even with `JLeadFactor3=0`, `DynamicTFollow` separately uses raw `jLead`. Check both settings when isolating jerk-related behavior.
-
-For a baseline, set `DynamicTFollow=0`, `LeadAccelResponse=0`, `JLeadFactor3=0`, and `RadarReactionFactor=100`. If only TF1 response to a lead starting or accelerating is late, raise `LeadAccelResponse` from level 1 one step at a time. Change only one setting at once, and restore immediately if surging or unintended acceleration appears.
+For a baseline, set `DynamicTFollow=0` and `LeadAccelResponse=0`. If only TF1 response to a lead starting or accelerating is late, raise `LeadAccelResponse` from level 1 one step at a time. Change only one setting at once, and restore immediately if surging or unintended acceleration appears.
 
 <a id="carrot-cruise"></a>
 ## 7. Carrot cruise
@@ -340,5 +325,4 @@ Related: [Understanding Settings](settings.md) · [Tuning introduction](https://
 - `openpilot/selfdrive/controls/lib/longitudinal_planner.py`
 - `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py`
 - `openpilot/selfdrive/controls/lib/longcontrol.py`
-- `openpilot/selfdrive/controls/radard.py`
 - `opendbc_repo/opendbc/car/hyundai/carcontroller.py`

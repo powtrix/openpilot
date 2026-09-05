@@ -29,6 +29,8 @@ For example, if the device IP is `192.168.0.25`, open:
 
 See [Carrot Web](https://github.com/ajouatom/openpilot/wiki/Guide-Carrot-Web) for connection troubleshooting and an overview of the other screens.
 
+Carrot Web has no user login and trusts devices on the local network. Use a private WPA2/WPA3 tether or hotspot with a strong unique password; do not expose ports 7000 or 6999 to the internet or use Carrot Web on public Wi-Fi. Phone tethering can use mobile data for automatic uploads.
+
 ## Using the Settings screen
 
 Carrot Web provides:
@@ -97,30 +99,32 @@ Ignoring `x0.01`, `x0.001`, `cm`, `km/h`, or `%` can make a value appear one hun
 
 ## Settings map
 
-The current `carrot_settings.json` contains **171 parameters**. Every entry is assigned to one of these menus:
+The current `carrot_settings.json` contains **176 parameters**. Every entry is assigned to one of these menus:
 
 | Category | Count | Groups |
 |---|---:|---|
-| Driving control | 107 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
-| Vehicle and hardware | 16 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
+| Driving control | 112 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
+| Vehicle and hardware | 14 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
 | Display | 37 | Information, path, brightness/on-road view, external HUD |
-| System | 11 | Recording/power, network/map, sound, software |
+| System | 13 | Recording/power, camera, network/map, sound, software |
 
 ## Driving control
 
-These 107 settings can affect vehicle motion. Change one item at a time.
+These 112 settings can affect vehicle motion. Change one item at a time.
 
 <a id="start-auto"></a>
-### Startup and auto — 8 settings
+### Startup and auto — 10 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | Startup | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | Always-on lateral control, automatic engagement, and low-speed steering limits |
-| Auto cruise | `AutoCruiseControl`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | Automatic cruise activation and accelerator-pedal behavior |
+| Auto cruise | `AutoCruiseControl`, `SoftHoldOnCancel`, `Ka4StockSccStandstillRearm`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | Automatic cruise activation, soft hold after cancel, and experimental KA4 stock-SCC behavior |
 
 - `AlwaysLateral` permits lateral control even when cruise is not engaged.
 - `AutoEngage`: `0` off, `1` lateral on, `2` lateral on with cruise ready.
 - `AutoCruiseControl` covers Hyundai/Kia auto-cruise and soft-hold behavior.
+- `SoftHoldOnCancel` permits soft hold after stopping while cruise is canceled.
+- `Ka4StockSccStandstillRearm` is documented with its exact topology and interlocks under [KA4 stock-SCC standstill extension](buttons-presets.md#ka4-stock-scc-standstill).
 - `DisableMinSteerSpeed` is vehicle-specific and relates to low-speed steering restrictions on SMDPS-equipped cars.
 
 ### Buttons and presets — 15 settings
@@ -172,7 +176,7 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 
 `TrafficLightDetectMode` is `0` off, `1` stop detection, or `2` stop and go detection. This is model-based assistance; the driver must always verify the signal.
 
-### Cruise and following gap — 31 settings overall, 28 on Hyundai/Kia/Genesis
+### Cruise and following gap — 29 settings overall, 26 on Hyundai/Kia/Genesis
 
 | Section | Parameters | Purpose |
 |---|---|---|
@@ -181,7 +185,7 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 | [Stopping and restarting](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | Stop position, stop entry, and restart behavior |
 | [Longitudinal tuning](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | Hyundai/Kia/Genesis hide fixed `100/0/100` gains; other brands can adjust them |
 | [Following gap](cruise-gap.md#following-gap) | `TFollowGap1` through `TFollowGap4`, `DynamicTFollow`, `DynamicTFollowLC`, `EnableSpeedTF`, `TFollowDecelBoost` | Gap times, dynamic gap, and deceleration margin |
-| [Lead response](cruise-gap.md#lead-response) | `LeadAccelResponse`, `JLeadFactor3`, `RadarReactionFactor` | TF1 acceleration and other responses to lead-vehicle changes |
+| [Lead response](cruise-gap.md#lead-response) | `LeadAccelResponse` | TF1 MPC response to a lead starting or accelerating |
 | [Carrot cruise](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | Economy control and cruise deceleration limits |
 
 `MyDrivingMode` is `1` eco, `2` safe, `3` normal, or `4` high speed. High-speed mode ignores traffic-light control and increases acceleration tendency, so read its behavior before selecting it.
@@ -195,27 +199,23 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 <a id="vehicle-hardware"></a>
 ## Vehicle and hardware
 
-These 16 settings describe the car, harness, and device hardware configuration. Do not enable them merely as a display experiment.
+These 14 settings describe the car, harness, and device hardware configuration. Do not enable them merely as a display experiment.
 
 | Group | Parameters | Purpose |
 |---|---|---|
 | Hyundai/Kia | `HyundaiCameraSCC`, `IsLdwsCar`, `HapticFeedbackWhenSpeedCamera` | SCC connection, LDWS behavior, and speed-event haptics |
 | CAN FD/HDA | `CanfdHDA2`, `CanfdDebug`, `HDPuse` | HDA2 selection, CAN FD diagnostics, and HDP |
-| Radar | `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity` | SCC radar, raw tracks, corner radar, and Carrot Radar processing and cut-in sensitivity |
+| Radar | `EnableRadarTracks`, `EnableCornerRadar` | SCC radar tracks and corner-radar behavior |
 | Driver monitoring | `DisableDM`, `MuteDoor`, `MuteSeatbelt` | Driver monitoring and selected vehicle alerts |
 | Vehicle assistance | `MaxAngleFrames`, `SpeedFromPCM` | Steering-angle frames and stock-SCC speed control |
 | Device hardware | `HardwareC3xLite` | Speakerless C3X Lite audio and process configuration |
 
 > [!CAUTION]
-> Incorrect `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity`, or `SpeedFromPCM` values can change vehicle identification, SCC, radar, or longitudinal behavior. Confirm the vehicle, model year, HDA generation, harness location, and whether stock ACC is retained.
+> Incorrect `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `EnableCornerRadar`, or `SpeedFromPCM` values can change vehicle identification, SCC, radar, or longitudinal behavior. Confirm the vehicle, model year, HDA generation, harness location, and whether stock ACC is retained.
 
 See [Radar tracks and corner radar](radar.md) before changing radar modes.
 
 For dPath RadarD, `EnableRadarTracks=-2` is the vision-only experiment; `-1` always uses SCC without vision matching; `0` matches SCC to vision; `1` matches front radar without SCC; `2` matches front radar plus low-speed SCC; and `3` uses SCC unconditionally after front-radar/vision matching fails. Matching modes use central vision at probability `0.40` or higher when matching fails. Modes `-1` and `3` use vision only when SCC is absent, and ignore the lateral coordinate of an SCC selected unconditionally. Legacy Mando radar variants with 32 or 64 slots are handled automatically. A new stationary front lead requires vision or a matching corner detection; continuous front-radar observation alone cannot authorize it. When a separate measured moving target agrees with the visual position and speed, that vision cannot authorize or retain a different stationary reflection. Corner corroboration must match the selected stationary object itself. For a front candidate without corresponding corner corroboration, a vision-support interruption beyond the permitted brief hold resets both the pending object and its confirmation time before confirmation starts again. An already selected moving front can remain L1 within a bounded vision-uncertainty range while the same measured track stays physically continuous; a fixed 8 m difference alone no longer discards it. A new nearer match can replace it immediately, and gaps or physical jumps reset this allowance.
-
-`CarrotRadarMode` continuously tracks vehicles with the front and corner radars to detect cut-ins, then matches camera and radar information in a new way to select the vehicle ahead. On vehicles with neither corner-radar nor radar-track support, it behaves the same as the existing mode. It can change acceleration and braking, so enable it only on the same vehicle after completing validation. The value is latched when the next OnRoad session starts, so end the current drive and restart the vehicle or reboot the device after changing it. The previous `RadarMotionMode` value is migrated to the new name once on the first startup after updating.
-
-`CarrotRadarCutInSensitivity` controls only Carrot Radar Mode CUT-IN detection: `0` disables it, `1` is insensitive, `3` is normal (default), and `5` is very sensitive; `2` and `4` are the intermediate levels. Levels `1` through `5` require `0.50`, `0.40`, `0.35`, `0.25`, and `0.20 s` of continuing measured motion evidence, while the physical future prediction remains fixed at 5.0 seconds. A front-radar track with at least 0.50 m of strongly one-way progress in its recent measured history may receive at most one 20 Hz radar-frame credit so timestamp quantization does not discard a completed dwell; small adjacent drift does not. It does not affect conventional radar mode or `EnableCornerRadar`. The value is read at the next OnRoad start, so restart the vehicle or reboot the device after changing it.
 
 `HardwareC3xLite` must remain off on standard C3 and C3X hardware. Enable it only on a C3X Lite, then reboot the device. The setting skips the unavailable amplifier so startup is not delayed by I2C retries, uses the GPIO buzzer for alerts, disables `micd`, `soundd`, and `loggerd`, and turns off `RecordAudio`. Normal route logging is unavailable while this hardware mode is enabled.
 
@@ -227,7 +227,7 @@ Display contains 37 settings. Most on-road display settings are easy to reverse;
 | Group | Parameters | Purpose |
 |---|---|---|
 | Information | `ShowDebugUI`, `ShowTpms`, `ShowDateTime`, `ShowPathEnd`, `ShowDeviceState`, `ShowLaneInfo`, `ShowRadarInfo`, `ShowRouteInfo`, `ShowPlotMode` | Debug, tire, time, lane, radar, and route information |
-| Path | `ShowPathMode`, `ShowPathColor`, `ShowPathColorCruiseOff`, `ShowPathModeLane`, `ShowPathColorLane` | Path shape and color by driving state |
+| Path | `CarrotTireTrajectory`, `ShowPathMode`, `ShowPathColor`, `ShowPathColorCruiseOff`, `ShowPathModeLane`, `ShowPathColorLane` | Tire trajectory plus path shape and color by driving state |
 | Brightness/on-road view | `ShowCustomBrightness`, `ShowModelView`, `ShowCameraWithCluster` | Brightness, camera/model composition, and the on-device camera while the external HUD is connected |
 | External HUD | `ClusterHud`, `ClusterHudBrightness`, `ClusterHudOrientation`, and related `ClusterHud*` settings | Supported TURZX HUD layout, live brightness, screen rotation, camera, radar, encoder, and performance options |
 
@@ -274,15 +274,18 @@ The Replay event timeline also identifies Carrot Navi connection and route-sessi
 <a id="system"></a>
 ## System
 
-The 11 system settings cover recording, power, network, maps, sound, and software menus.
+The 13 system settings cover recording, power, cameras, network, maps, sound, and software menus.
 
 | Group | Parameters | Purpose |
 |---|---|---|
-| Recording and power | `RecordRoadCam`, `MaxTimeOffroadMin` | Road-camera storage and delayed shutdown |
+| Recording and power | `RecordRoadCam`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | Road-camera storage, automatic KA4 validation-log upload, and delayed shutdown |
 | YouTube Live | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | Video streaming, quality, and timestamp |
+| Camera | `UseWideCamera` | Input fallback for a failed wide road camera |
 | Network and map | `HotspotOnBoot`, `MapboxStyle` | Boot hotspot and map background style |
 | Sound | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | Prompt language and volume |
 | Software | `SoftwareMenu` | Carrot Web software-menu availability |
+
+`CarrotValidationAutoUpload` is off by default. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It can handle at most 3 full rlogs per event capture and 14 captures / 42 full rlogs per campaign, with at most 5 captures / 750 MiB pending at once. The 750 MiB concurrent-pending cap does not limit cumulative uploads or retry traffic; after the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. Uploads use only the receiver built into the branch or fixed at deployment time; the ordinary Web upload destination cannot redirect them. The setting row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
 
 Check storage use for recording and network use, heat, and privacy before enabling live streaming.
 

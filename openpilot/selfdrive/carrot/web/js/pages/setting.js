@@ -15,6 +15,8 @@ if (
   !carrotSettingsRuntime?.docs ||
   !carrotSettingsRuntime?.context ||
   !carrotSettingsRuntime?.entry ||
+  !carrotSettingsRuntime?.toggle ||
+  !carrotSettingsRuntime?.validationUpload ||
   !carrotSettingsRuntime?.view ||
   !carrotSettingsRuntime?.values
 ) {
@@ -31,6 +33,8 @@ const settingDerivedRuntime = carrotSettingsRuntime.derived;
 const settingDocumentationRuntime = carrotSettingsRuntime.docs;
 const settingContextRuntime = carrotSettingsRuntime.context;
 const settingEntryRuntime = carrotSettingsRuntime.entry;
+const settingToggleRuntime = carrotSettingsRuntime.toggle;
+const settingValidationUploadRuntime = carrotSettingsRuntime.validationUpload;
 const settingViewRuntime = carrotSettingsRuntime.view;
 const settingValueRepository = carrotSettingsRuntime.values;
 const SETTING_VALUES_TTL_MS = settingValueRepository.defaultTtlMs;
@@ -42,6 +46,85 @@ const settingProfileSectionExpandedState = new Map();
 const settingProfileMenuActions = new WeakMap();
 const settingProfileMenuControllers = new Map();
 let settingSoundSampleAudio = null;
+const VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload";
+let validationUploadStatusRequestSequence = 0;
+
+function formatValidationUploadTimestamp(epochSeconds) {
+  const value = Number(epochSeconds);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const locale = LANG === "ko" ? "ko-KR" : (LANG === "zh" ? "zh-CN" : "en-US");
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      dateStyle: "short",
+      timeStyle: "short",
+    }).format(new Date(value * 1000));
+  } catch (_) {
+    return "";
+  }
+}
+
+function validationUploadStatusText(payload) {
+  const status = settingValidationUploadRuntime.normalizeStatus(payload);
+  const labelKey = settingValidationUploadRuntime.statusLabelKeys[status.status]
+    || "validation_upload_status_error";
+  const parts = [
+    getUIText("validation_upload_status_summary", "Automatic upload: {status}", {
+      status: getUIText(labelKey, status.status),
+    }),
+  ];
+  if (status.pendingCaptures > 0) {
+    parts.push(getUIText("validation_upload_status_pending", "Pending {count}", {
+      count: status.pendingCaptures,
+    }));
+  }
+  const expires = formatValidationUploadTimestamp(status.expiresAt);
+  if (expires && status.enabled) {
+    parts.push(getUIText("validation_upload_status_expires", "Expires {time}", { time: expires }));
+  }
+  const lastUploaded = formatValidationUploadTimestamp(status.lastUploadedAt);
+  if (lastUploaded) {
+    parts.push(getUIText("validation_upload_status_last_upload", "Last upload {time}", {
+      time: lastUploaded,
+    }));
+  }
+  return parts.join(" · ");
+}
+
+async function refreshValidationUploadStatus(statusElement) {
+  if (!statusElement?.isConnected) return;
+  const requestId = String(++validationUploadStatusRequestSequence);
+  statusElement.dataset.requestId = requestId;
+  if (!statusElement.textContent) {
+    statusElement.textContent = getUIText("validation_upload_status_loading", "Checking automatic upload status...");
+  }
+  try {
+    const payload = await getJson("/api/dashcam/validation-upload/status");
+    if (statusElement.isConnected && statusElement.dataset.requestId === requestId) {
+      statusElement.textContent = validationUploadStatusText(payload);
+    }
+  } catch (_) {
+    if (statusElement.isConnected && statusElement.dataset.requestId === requestId) {
+      statusElement.textContent = getUIText(
+        "validation_upload_status_unavailable",
+        "Automatic upload status is temporarily unavailable.",
+      );
+    }
+  }
+}
+
+function confirmValidationUploadEnable() {
+  return appConfirm(
+    getUIText(
+      "validation_upload_enable_confirm",
+      "Enable automatic KA4 validation upload? Up to 3 full rlogs per event capture and up to 14 captures / 42 full rlogs per campaign may be selected. At most 5 captures / 750 MiB wait at once; that pending cap does not limit cumulative uploads or retry traffic. The 1 GiB per-device daily server limit can defer retained logs for retry the next day. Logs are uploaded without asking again for each one.",
+    ),
+    {
+      title: getUIText("validation_upload_enable_title", "Automatic validation upload consent"),
+      confirmLabel: getUIText("validation_upload_enable", "Agree & enable"),
+      cancelLabel: getUIText("cancel", "Cancel"),
+    },
+  );
+}
 
 function getSettingDerivedModel() {
   return settingDerivedRuntime.getModel({
@@ -239,6 +322,10 @@ function applyRestoredSettingValuesToRenderedItems(values, options = {}) {
     const valueButton = row.querySelector(".val");
     if (!valueButton) return;
     syncSettingControlState(row, values[name]);
+    // A live read is authoritative device state, not an optimistic render.
+    // Keep the consent edge baseline in sync so an automatic 1 -> 0 disable
+    // cannot make the next 0 -> 1 toggle bypass its confirmation dialog.
+    valueButton.dataset.committedValue = String(values[name]);
     if (animate) {
       row.classList.add("is-restored-live");
       window.setTimeout(() => row.classList.remove("is-restored-live"), 900);
@@ -2471,8 +2558,17 @@ async function renderItems(group, options = {}) {
     d.className = "descr";
     d.textContent = descr;
 
+    let validationUploadStatus = null;
+    if (!profile && name === VALIDATION_AUTO_UPLOAD_PARAM) {
+      validationUploadStatus = document.createElement("div");
+      validationUploadStatus.className = "muted mt-sm validation-upload-status";
+      validationUploadStatus.setAttribute("role", "status");
+      validationUploadStatus.setAttribute("aria-live", "polite");
+    }
+
     el.appendChild(top);
     el.appendChild(d);
+    if (validationUploadStatus) el.appendChild(validationUploadStatus);
 
     const popularTopValues = Array.isArray(popularEntry?.top_values) ? popularEntry.top_values : [];
     let contextPanel = null;
@@ -2591,6 +2687,7 @@ async function renderItems(group, options = {}) {
     const cur = (name in values) ? values[name] : p.default;
     syncSettingControlState(el, cur);
     val.dataset.committedValue = String(cur);
+    if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
 
     function normalizeSettingValue(raw) {
       const text = String(raw).trim();
@@ -2674,7 +2771,25 @@ async function renderItems(group, options = {}) {
     }
 
     async function commitSettingValue(next, commitOptions = {}) {
+      const previous = val.dataset.committedValue ?? val.dataset.rawValue ?? String(p.default);
+      const validationConsentConfirmed = commitOptions.validationConsentConfirmed === true;
+      const paramCommitOptions = { ...commitOptions };
+      delete paramCommitOptions.validationConsentConfirmed;
+      if (
+        !profile
+        && name === VALIDATION_AUTO_UPLOAD_PARAM
+        && Number(next) === 1
+        && String(previous) !== "1"
+        && !validationConsentConfirmed
+      ) {
+        if (!await confirmValidationUploadEnable()) {
+          syncSettingControlState(el, previous);
+          if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
+          return false;
+        }
+      }
       try {
+        let committed = next;
         if (profile) {
           const nextValues = { ...(profile.values || {}), [name]: next };
           const nextProfile = await saveSettingProfile(profile.id, { values: nextValues });
@@ -2684,17 +2799,28 @@ async function renderItems(group, options = {}) {
             profile.values = nextValues;
           }
         } else {
-          await setParam(name, next, commitOptions);
+          const result = await setParam(name, next, paramCommitOptions);
+          if (result && Object.prototype.hasOwnProperty.call(result, "value")) {
+            committed = result.value;
+          }
         }
-        syncSettingControlState(el, next);
-        val.dataset.committedValue = String(next);
+        syncSettingControlState(el, committed);
+        val.dataset.committedValue = String(committed);
         if (!profile) {
-          cacheSettingValue(name, next, group);
-          if (originGroup !== group) cacheSettingValue(name, next, originGroup);
+          cacheSettingValue(name, committed, group);
+          if (originGroup !== group) cacheSettingValue(name, committed, originGroup);
           refreshSettingHistory();
         }
+        if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
+        return true;
       } catch (e) {
+        // Controls update optimistically on input/change. Put every rejected
+        // write back on the last server-confirmed value so the screen never
+        // claims consent or a setting value that the device did not store.
+        syncSettingControlState(el, previous);
+        if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
         showAppToast((UI_STRINGS[LANG].set_failed || "set failed: ") + e.message, { tone: "error" });
+        return false;
       }
     }
 
@@ -2799,8 +2925,32 @@ async function renderItems(group, options = {}) {
     }
 
     if (toggleInput) {
-      toggleInput.onchange = () => {
-        commitSettingValue(toggleInput.checked ? 1 : 0);
+      toggleInput.onchange = async () => {
+        const next = toggleInput.checked ? 1 : 0;
+        const previous = val.dataset.committedValue ?? val.dataset.rawValue ?? String(p.default);
+        toggleInput.disabled = true;
+        try {
+          const requiresConfirmation = name === VALIDATION_AUTO_UPLOAD_PARAM
+            && next === 1
+            && String(previous) !== "1";
+          const result = await settingToggleRuntime.commit({
+            next,
+            previous,
+            requiresConfirmation,
+            confirm: confirmValidationUploadEnable,
+            commit: () => commitSettingValue(next, {
+              validationConsentConfirmed: requiresConfirmation,
+            }),
+            restore: (committedValue) => {
+              syncSettingControlState(el, committedValue);
+            },
+          });
+          if (!result.committed) {
+            if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
+          }
+        } finally {
+          toggleInput.disabled = false;
+        }
       };
     }
 
@@ -3226,6 +3376,10 @@ async function refreshSettingValuesFromDevice() {
     // The user may have navigated while the read was in flight.
     if (CURRENT_GROUP === group && shouldRefreshSettingValues()) {
       applyRestoredSettingValuesToRenderedItems(values, { animate: false });
+      const validationStatus = document.querySelector(
+        '#items .setting[data-setting-name="CarrotValidationAutoUpload"] .validation-upload-status',
+      );
+      if (validationStatus) refreshValidationUploadStatus(validationStatus);
     }
   } finally {
     settingLiveRefreshInFlight = false;
