@@ -38,6 +38,61 @@ def test_probe_accepts_current_and_legacy_ka4_fingerprint_values(fingerprint: st
   assert report["ka4StockSccGate"]["fingerprintIsKa4"]
 
 
+def test_rlog_init_data_populates_params_and_source_identity() -> None:
+  analyzer = ProbeAnalyzer("log", "downloaded-rlog.zst")
+  init_data = SimpleNamespace(
+    params=SimpleNamespace(entries=[
+      SimpleNamespace(key="Ka4StockSccStandstillRearm", value=b"1"),
+      SimpleNamespace(key="HyundaiCameraSCC", value=b"0"),
+    ]),
+    dongleId="test-dongle",
+    gitBranch="carrot-wip",
+    gitCommit="0123456789abcdef",
+    gitCommitDate="2026-09-05T00:00:00Z",
+    gitRemote="https://github.com/powtrix/openpilot.git",
+    dirty=False,
+  )
+  event = SimpleNamespace(logMonoTime=1, initData=init_data, which=lambda: "initData")
+
+  analyzer.feed_cereal_event(event)
+  report = analyzer.report()
+
+  assert report["params"] == {
+    "Ka4StockSccStandstillRearm": "1",
+    "HyundaiCameraSCC": "0",
+    "DongleId": "test-dongle",
+    "GitBranch": "carrot-wip",
+    "GitCommit": "0123456789abcdef",
+    "GitCommitDate": "2026-09-05T00:00:00Z",
+    "GitRemote": "https://github.com/powtrix/openpilot.git",
+    "GitDirty": "0",
+  }
+  assert report["initDataConflicts"] == {}
+
+
+def test_rlog_init_data_fails_closed_on_mixed_source_identity() -> None:
+  analyzer = ProbeAnalyzer("log", "combined-rlogs")
+
+  def event(commit: str) -> SimpleNamespace:
+    return SimpleNamespace(
+      logMonoTime=1,
+      initData=SimpleNamespace(
+        params=SimpleNamespace(entries=[]),
+        gitBranch="carrot-wip",
+        gitCommit=commit,
+        dirty=False,
+      ),
+      which=lambda: "initData",
+    )
+
+  analyzer.feed_cereal_event(event("commit-a"))
+  analyzer.feed_cereal_event(event("commit-b"))
+  report = analyzer.report()
+
+  assert report["params"]["GitCommit"] is None
+  assert report["initDataConflicts"]["GitCommit"] == ["commit-a", "commit-b"]
+
+
 @pytest.mark.parametrize(
   "schedule_mode,button_source_phase_frames,expected_schedules",
   [

@@ -32,6 +32,7 @@
               "params": [
                 "AutoCruiseControl",
                 "SoftHoldOnCancel",
+                "Ka4StockSccStandstillRearm",
                 "AutoGasTokSpeed",
                 "AutoGasCancelSpeed",
                 "AutoGasSyncSpeed",
@@ -1690,6 +1691,24 @@
       "max": 1,
       "default": 0,
       "unit": 1
+    },
+    {
+      "group": "오토크루즈",
+      "name": "Ka4StockSccStandstillRearm",
+      "title": "KA4 순정 SCC 정차 대기 연장 (시험)",
+      "descr": "카니발 KA4(검증 대상: 2023년식)의 CAN FD 순정 레이더 SCC 비롱컨 구성 전용 시험 기능입니다. 정차 중 안전 조건이 유지될 때 짧은 RES 신호를 보내 '가속 페달을 밟으십시오' 안내 시점을 약 30초 경계까지 늦추는 것을 시도합니다. 브레이크·가속페달·오토홀드·주차브레이크·운전자 버튼·SCC 오류·취소 상태에서는 보내지 않습니다. 실제 차량 검증 전에는 주차된 상태에서만 설정하고 계기판을 관찰할 수 있는 통제된 시험에서 사용하세요. 0:끄기, 1:켜기",
+      "egroup": "AUTOCRUISE",
+      "etitle": "KA4 Stock SCC Standstill Extension (Experimental)",
+      "edescr": "Experimental feature for a Carnival KA4 (current validation target: model year 2023) using CAN FD stock radar SCC without openpilot longitudinal control. While all standstill safety gates remain valid, it sends short RES groups in an attempt to defer the accelerator prompt toward the 30-second boundary. It sends nothing during brake, accelerator, Auto Hold, parking-brake, driver-button, SCC-fault, or cancel interlocks. Change it only while parked and use it only in a controlled test with the cluster visible. 0:Off, 1:On",
+      "cgroup": "自动巡航",
+      "ctitle": "KA4 原厂 SCC 停车等待延长（实验）",
+      "cdescr": "适用于 Carnival KA4（当前验证目标为 2023 年款）的 CAN FD 原厂雷达 SCC、且未使用 openpilot 纵向控制的实验功能。停车安全条件持续满足时，它会发送短 RES 信号，尝试把加速踏板提示延后到约 30 秒。踩刹车或加速踏板、Auto Hold、驻车制动、驾驶员按钮、SCC 故障或取消时不会发送。请仅在停车状态下更改，并在可观察仪表的受控测试中使用。0:关闭，1:开启",
+      "min": 0,
+      "max": 1,
+      "default": 0,
+      "unit": 1,
+      "control": "toggle",
+      "risk": "high"
     },
     {
       "group": "오토크루즈",

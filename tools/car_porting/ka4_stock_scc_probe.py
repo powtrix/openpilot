@@ -177,11 +177,11 @@ def _is_finite_number(value: Any) -> bool:
     return False
 
 
-def _decode_param(value: bytes | str | None) -> str | None:
+def _decode_param(value: Any) -> str | None:
   if value is None:
     return None
-  if isinstance(value, bytes):
-    return value.decode("utf-8", errors="backslashreplace")
+  if isinstance(value, (bytes, bytearray, memoryview)):
+    return bytes(value).decode("utf-8", errors="backslashreplace").rstrip("\x00")
   return str(value)
 
 
@@ -544,6 +544,7 @@ class ProbeAnalyzer:
     self.car_params: dict[str, Any] | None = None
     self.car_params_source: str | None = None
     self.params: dict[str, Any] = {}
+    self.init_data_conflicts: dict[str, list[str]] = {}
     self.states: list[StateSample] = []
     self.controls: list[ControlSample] = []
     self.alerts: list[AlertSample] = []
@@ -565,6 +566,45 @@ class ProbeAnalyzer:
   def set_car_params(self, cp: Any, source: str) -> None:
     self.car_params = summarize_car_params(cp)
     self.car_params_source = source
+
+  def feed_init_data(self, t: float, init_data: Any) -> None:
+    self._touch(t)
+    snapshot: dict[str, str] = {}
+    for entry in _safe_get(_safe_get(init_data, "params", SimpleNamespace()), "entries", ()):
+      key = str(_safe_get(entry, "key", ""))
+      value = _decode_param(_safe_get(entry, "value"))
+      if key and value is not None:
+        snapshot[key] = value
+
+    # These authoritative fields are recorded separately by loggerd even when
+    # a Params snapshot is incomplete. Mirroring them into the report's Params
+    # object lets a Web-downloaded rlog use the same source-identity checks as a
+    # live capture without ADB or SSH access.
+    for key, field in (
+      ("DongleId", "dongleId"),
+      ("GitBranch", "gitBranch"),
+      ("GitCommit", "gitCommit"),
+      ("GitCommitDate", "gitCommitDate"),
+      ("GitRemote", "gitRemote"),
+    ):
+      value = _decode_param(_safe_get(init_data, field))
+      if value:
+        snapshot[key] = value
+    dirty = _safe_get(init_data, "dirty")
+    if dirty is not None:
+      snapshot["GitDirty"] = "1" if bool(dirty) else "0"
+
+    for key, value in snapshot.items():
+      if key in self.init_data_conflicts:
+        if value not in self.init_data_conflicts[key]:
+          self.init_data_conflicts[key].append(value)
+        continue
+      previous = self.params.get(key)
+      if previous is not None and previous != value:
+        self.init_data_conflicts[key] = [str(previous), value]
+        self.params[key] = None
+      else:
+        self.params[key] = value
 
   def feed_can(self, service: str, t: float, src: int, address: int, data: bytes) -> None:
     self._touch(t)
@@ -764,6 +804,8 @@ class ProbeAnalyzer:
       self.feed_panda_states(t, event.pandaStates)
     elif which == "carParams":
       self.set_car_params(event.carParams, "rlog:carParams")
+    elif which == "initData":
+      self.feed_init_data(t, event.initData)
 
   def _stream_report(self) -> list[dict[str, Any]]:
     result = []
@@ -3943,6 +3985,7 @@ class ProbeAnalyzer:
       "carParamsSource": self.car_params_source,
       "carParams": self.car_params,
       "params": self.params,
+      "initDataConflicts": self.init_data_conflicts,
       "stateEvidence": self._state_report(),
       "streams": self._stream_report(),
       "decodeErrors": dict(self.decode_errors),
