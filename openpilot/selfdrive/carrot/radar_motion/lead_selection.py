@@ -22,6 +22,7 @@ from openpilot.selfdrive.carrot.radar_motion.predictor import (
 CUTIN_MAX_DREL_M = 80.0
 PRIMARY_DUPLICATE_MAX_DREL_DELTA_M = 3.5
 PRIMARY_DUPLICATE_MAX_YREL_DELTA_M = 1.8
+PRIMARY_PROXIMITY_MIN_VLEAD_DELTA_MPS = 2.5
 PRIMARY_ROW_MAX_DREL_DELTA_M = 8.0
 CUTIN_PRIMARY_FUTURE_MARGIN_M = 2.0
 FRONT_CUT_IN_MIN_DPATH_RATE_MPS = 0.75
@@ -64,6 +65,7 @@ STATIONARY_SHADOW_EQUIVALENCE_BRAKE_MPS2 = 2.5
 STATIONARY_PRIMARY_HANDOFF_MAX_ABS_VLEAD_MPS = 4.0
 STATIONARY_PRIMARY_HANDOFF_MAX_DPATH_M = 0.75
 STATIONARY_PRIMARY_HANDOFF_MIN_MODEL_PROBABILITY = 0.40
+STATIONARY_PRIMARY_HANDOFF_CONFIRMATION_S = 0.25
 STATIONARY_PRIMARY_HANDOFF_SUPPORT_HOLD_S = 1.0
 STATIONARY_PRIMARY_HANDOFF_MIN_CLOSER_MARGIN_M = 1.0
 
@@ -218,15 +220,17 @@ class DPathStationaryShadowTracker:
 
 
 class DPathStationaryPrimaryHandoffTracker:
-  """Hand a vision-confirmed stopped corner leadOne back to leadTwo."""
+  """Keep a vision-confirmed stopped corner hypothesis in leadTwo."""
 
   def __init__(self) -> None:
     self._identity: tuple[str, int, int] | None = None
+    self._since_s: float | None = None
     self._last_primary_s: float | None = None
     self._last_primary_candidate: DPathLeadCandidate | None = None
 
   def reset(self) -> None:
     self._identity = None
+    self._since_s = None
     self._last_primary_s = None
     self._last_primary_candidate = None
 
@@ -286,24 +290,36 @@ class DPathStationaryPrimaryHandoffTracker:
       if primary is not None and primary.get("status") and primary.get("radar")
       else -1
     )
-    primary_candidate = next((
+    supported = tuple(
       candidate for candidate in values
+      if float(candidate.lead.get("modelProb", 0.0))
+      >= STATIONARY_PRIMARY_HANDOFF_MIN_MODEL_PROBABILITY
+    )
+    primary_candidate = next((
+      candidate for candidate in supported
       if candidate.track_id == primary_track_id
     ), None)
+    if primary_candidate is None:
+      primary_candidate = min(
+        supported,
+        key=lambda candidate: (
+          abs(float(candidate.lead.get("dPath", math.inf))),
+          -float(candidate.lead.get("modelProb", 0.0)),
+          float(candidate.lead.get("dRel", math.inf)),
+        ),
+        default=None,
+      )
     if (
       primary_candidate is not None
-      and primary is not None
-      and float(primary.get("modelProb", 0.0))
-      >= STATIONARY_PRIMARY_HANDOFF_MIN_MODEL_PROBABILITY
     ):
       if (
         primary_candidate.identity != self._identity
         or not self._continuous(time_s, primary_candidate)
       ):
         self._identity = primary_candidate.identity
+        self._since_s = time_s
       self._last_primary_candidate = primary_candidate
       self._last_primary_s = time_s
-      return None
 
     if self._identity is None:
       return None
@@ -321,6 +337,12 @@ class DPathStationaryPrimaryHandoffTracker:
       or not self._continuous(time_s, candidate)
     ):
       self.reset()
+      return None
+    if (
+      self._since_s is None
+      or time_s - self._since_s
+      < STATIONARY_PRIMARY_HANDOFF_CONFIRMATION_S
+    ):
       return None
     if primary is None or not primary.get("status"):
       return None
@@ -732,8 +754,15 @@ def select_dpath_lead_two(
         )
         and (
           not lead_duplicates_primary(lead, primary)
-          or int(lead.get("radarTrackId", -1))
-          in allow_primary_proximity_track_ids
+          or (
+            int(lead.get("radarTrackId", -1))
+            in allow_primary_proximity_track_ids
+            and primary is not None
+            and abs(
+              float(lead.get("vLead", 0.0))
+              - float(primary.get("vLead", 0.0))
+            ) > PRIMARY_PROXIMITY_MIN_VLEAD_DELTA_MPS
+          )
         )
       )
     ),

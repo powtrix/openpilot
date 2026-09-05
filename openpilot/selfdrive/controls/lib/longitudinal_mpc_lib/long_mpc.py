@@ -8,9 +8,9 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function
-from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
-from openpilot.selfdrive.controls.lib.lead_response import build_lead_accel_reference
-from openpilot.selfdrive.carrot.traffic_stop import get_traffic_stop_obstacle_distance
+from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
+from openpilot.selfdrive.carrot.traffic_stop import get_traffic_stop_distance_adjust, get_traffic_stop_obstacle_distance
+from openpilot.selfdrive.controls.lib.longitudinal_preview import LEAD_ACCEL_MIN_TRACK_FRAMES, get_lead_accel_mpc_request
 
 if __name__ == '__main__':  # generating code
   from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -44,9 +44,6 @@ DANGER_ZONE_COST = 100.
 CRASH_DISTANCE = .25
 LEAD_DANGER_FACTOR = 0.8 # 0.75
 LIMIT_COST = 1e6
-PRED_DANGER_MARGIN_BP = [-5.0, -3.0, -1.0, 0.0]
-PRED_DANGER_A_CHANGE_COST = [20.0, 50.0, 120.0, A_CHANGE_COST]
-PRED_DANGER_A_CHANGE_COST_RECOVER = 20.0
 ACADOS_SOLVER_TYPE = 'SQP_RTI'
 
 
@@ -74,6 +71,12 @@ def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
     return 0.5
   else:
     raise NotImplementedError("Longitudinal personality not supported")
+
+
+def get_a_change_cost(prev_accel_constraint: bool, a_change_cost_starting: float,
+                      response_factor: float = 1.0) -> float:
+  base_cost = A_CHANGE_COST if prev_accel_constraint else a_change_cost_starting
+  return float(base_cost * np.clip(response_factor, 0.0, 1.0))
 
 
 def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
@@ -248,16 +251,16 @@ class LongitudinalMpc:
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
 
     self.a_change_cost = A_CHANGE_COST
-    self.lead_response_track_id = -1
-    self.lead_response_track_frames = 0
-    self.lead_response_active = False
-    self.lead_accel_reference = np.zeros(N+1)
+    self.jerk_cost_factor = 1.0
+    self.lead_accel_response_active = False
+    self.lead_accel_response_level = 0
 
     self.reset()
     self.source = SOURCES[2]
 
     self.t_follow = 1.0
     self.desired_distance = 0.0
+    self.base_desired_distances = np.zeros(2)
     self.lead_danger_factor = LEAD_DANGER_FACTOR
     self.predicted_danger_margin = 1e3
 
@@ -284,10 +287,8 @@ class LongitudinalMpc:
     self.crash_cnt = 0.0
     self.predicted_danger_margin = 1e3
     self.solution_status = 0
-    self.lead_response_track_id = -1
-    self.lead_response_track_frames = 0
-    self.lead_response_active = False
-    self.lead_accel_reference.fill(0.0)
+    self.lead_accel_response_active = False
+    self.lead_accel_response_level = 0
     # timers
     self.solve_time = 0.0
     self.time_qp_solution = 0.0
@@ -312,11 +313,20 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, jerk_factor=1.0, a_change_cost_starting=A_CHANGE_COST_STARTING):
+  def set_weights(self, prev_accel_constraint=True,
+                  personality=log.LongitudinalPersonality.standard,
+                  jerk_factor=1.0,
+                  a_change_cost_starting=A_CHANGE_COST_STARTING,
+                  a_change_cost_factor=1.0,
+                  jerk_cost_factor=1.0):
     #jerk_factor = get_jerk_factor(personality)
     if self.mode == 'acc':
-      a_change_cost = self.a_change_cost if prev_accel_constraint else a_change_cost_starting
-      cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
+      a_change_cost = get_a_change_cost(
+        prev_accel_constraint, a_change_cost_starting, a_change_cost_factor,
+      )
+      applied_jerk_cost_factor = float(np.clip(jerk_cost_factor, 0.0, 1.0))
+      cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST,
+                      a_change_cost, jerk_factor * applied_jerk_cost_factor * J_EGO_COST]
       constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     elif self.mode == 'blended':
       a_change_cost = 40.0 if prev_accel_constraint else 0
@@ -324,27 +334,16 @@ class LongitudinalMpc:
       constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     else:
       raise NotImplementedError(f'Planner mode {self.mode} not recognized in planner cost set')
+    self.a_change_cost = float(a_change_cost)
+    self.jerk_cost_factor = float(applied_jerk_cost_factor if self.mode == 'acc' else 1.0)
     self.set_cost_weights(cost_weights, constraint_cost_weights)
 
-  def apply_predicted_danger_a_change_cost(self, lead, base_a_change_cost, lead_obstacle, t_follow, comfort_brake, stop_distance):
+  def update_predicted_danger_margin(self, lead, lead_obstacle, t_follow, comfort_brake, stop_distance):
     self.predicted_danger_margin = 1e3
-    if not lead.status:
-      target_a_change_cost = base_a_change_cost
-    else:
+    if lead.status:
       safe_distance = get_safe_obstacle_distance(self.x_sol[:,1], t_follow, comfort_brake, stop_distance)
       danger_margin = lead_obstacle - self.x_sol[:,0] - self.lead_danger_factor * safe_distance
       self.predicted_danger_margin = float(np.min(danger_margin[PRED_DANGER_IDXS]))
-
-      danger_a_change_cost = float(np.interp(self.predicted_danger_margin,
-                                             PRED_DANGER_MARGIN_BP,
-                                             PRED_DANGER_A_CHANGE_COST))
-      target_a_change_cost = min(base_a_change_cost, danger_a_change_cost)
-
-    if target_a_change_cost < self.a_change_cost:
-      self.a_change_cost = target_a_change_cost
-    else:
-      self.a_change_cost = min(target_a_change_cost,
-                               self.a_change_cost + PRED_DANGER_A_CHANGE_COST_RECOVER)
 
   def set_cur_state(self, v, a):
     v_prev = self.x0[1]
@@ -356,12 +355,12 @@ class LongitudinalMpc:
 
   @staticmethod
   def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
-    a_lead_traj = a_lead * np.exp(-a_lead_tau * T_IDXS ** 2 / 2.0)
+    a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
     v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
     x_lead_traj = x_lead + np.cumsum(T_DIFFS * v_lead_traj)
     lead_xv = np.column_stack((x_lead_traj, v_lead_traj))
     return lead_xv
-  
+
   def process_lead(self, lead):
     v_ego = self.x0[1]
     if lead is not None and lead.status:
@@ -374,7 +373,7 @@ class LongitudinalMpc:
       x_lead = 50.0
       v_lead = v_ego + 10.0
       a_lead = 0.0
-      a_lead_tau = _LEAD_ACCEL_TAU
+      a_lead_tau = LEAD_ACCEL_TAU
 
     # MPC will not converge if immediate crash is expected
     # Clip lead distance to what is still possible to brake for
@@ -392,40 +391,45 @@ class LongitudinalMpc:
     self.cruise_min_a = min_a
     self.max_a = max_a
 
-  def _lead_response_ready(self, lead):
-    if not lead.status or not lead.radar:
-      self.lead_response_track_id = -1
-      self.lead_response_track_frames = 0
-      return False
-    track_id = int(lead.radarTrackId)
-    if track_id != self.lead_response_track_id:
-      self.lead_response_track_id = track_id
-      self.lead_response_track_frames = 1
-    else:
-      self.lead_response_track_frames += 1
-    # A new or handed-off target must be stable for two model frames before
-    # its acceleration can influence feed-forward. MPC obstacle safety is
-    # active immediately and does not wait for this gate.
-    return self.lead_response_track_frames >= 2
-
   def update(self, carrot, reset_state, radarstate, v_cruise, x, v, a, j,
              personality=log.LongitudinalPersonality.standard,
-             measured_a_ego=None):
+             prev_accel_constraint=True,
+             jerk_factor=1.0,
+             a_change_cost_starting=A_CHANGE_COST_STARTING,
+             lead_accel_response_enabled=False,
+             lead_track_frames=(0, 0),
+             measured_a_ego=0.0):
     v_ego = self.x0[1]
     a_ego = self.x0[2]
-    actual_a_ego = a_ego if measured_a_ego is None else float(measured_a_ego)
-    t_follow = carrot.get_T_FOLLOW(personality, v_ego, actual_a_ego)
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
+    # Use the previous cycle's controlling radar lead for the level 4-5 TF1
+    # exception. Cruise can be the MPC source while a valid lead pulls away.
+    # Requiring an opening gap avoids shrinking TF while ego is still closing.
+    tf_lead = radarstate.leadOne if self.source in ('lead0', 'cruise') else radarstate.leadTwo if self.source == 'lead1' else None
+    tf_lead_valid = (
+      tf_lead is not None
+      and tf_lead.status
+      and tf_lead.radar
+      and tf_lead.radarTrackId >= 0
+      and tf_lead.vRel >= 0.0
+    )
+    t_follow = carrot.get_T_FOLLOW(
+      personality, v_ego, a_ego,
+      lead_status=tf_lead_valid,
+      lead_accel=tf_lead.aLeadK if tf_lead_valid else 0.0,
+    )
 
-    # jLead still controls acceleration persistence in radard through
-    # aLeadTau. Do not inject it a second time into the MPC obstacle and cost.
     lead_xv_0, lead_v_0 = self.process_lead(radarstate.leadOne)
-    lead_xv_1, _ = self.process_lead(radarstate.leadTwo)
+    lead_xv_1, lead_v_1 = self.process_lead(radarstate.leadTwo)
 
     mode = self.mode
     comfort_brake = carrot.comfort_brake
     stop_distance = carrot.stop_distance
-    
+    self.base_desired_distances = np.array([
+      desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow),
+      desired_follow_distance(v_ego, lead_v_1, comfort_brake, stop_distance, t_follow),
+    ])
+
     if mode == 'blended':
       stop_x = 1000.0
     else:
@@ -433,14 +437,13 @@ class LongitudinalMpc:
       stop_x, mode = carrot.stop_dist, carrot.mode
       desired_distance = desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow)
       t_follow = carrot.dynamic_t_follow(t_follow, radarstate.leadOne, desired_distance, self.prev_a)
-    t_follow = carrot.apply_t_follow(t_follow)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
     # and then treat that as a stopped car/obstacle at this new distance.
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
-    
+
     self.desired_distance = desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow)
 
     self.params[:,0] = ACCEL_MIN if not reset_state else a_ego
@@ -460,7 +463,11 @@ class LongitudinalMpc:
                                  v_upper)
       cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow, comfort_brake, stop_distance)
 
-      adjust_dist = carrot.trafficStopDistanceAdjust if v_ego > 0.1 else -2.0
+      adjust_dist = get_traffic_stop_distance_adjust(
+        carrot.trafficStopDistanceAdjust,
+        v_ego,
+        getattr(carrot, "trafficStopModelLeadOffset", 0.0),
+      )
       traffic_stop_obstacle = get_traffic_stop_obstacle_distance(stop_x, cruise_obstacle[0], adjust_dist)
       x2 = traffic_stop_obstacle * np.ones(N+1)
 
@@ -475,12 +482,10 @@ class LongitudinalMpc:
       # These are not used in ACC mode
       x[:], v[:], a[:], j[:] = 0.0, 0.0, 0.0, 0.0
 
-      base_a_change_cost = A_CHANGE_COST
-
       #safe_distance = lead_0_obstacle[0] - get_safe_obstacle_distance(v_ego, comfort_brake, stop_distance)
-      self.lead_danger_factor = LEAD_DANGER_FACTOR #np.interp(safe_distance, [-30.0, 0.0], [0.9, LEAD_DANGER_FACTOR]) # ?닿구?곸슜?섎땲, ?ш퀬諛⑹???媛먯냽???덈Т 湲됱젙嫄고븯?붽쾬 媛숈쓬.
+      self.lead_danger_factor = LEAD_DANGER_FACTOR
       self.params[:,5] = self.lead_danger_factor
-      
+
     elif mode == 'blended':
       self.params[:,5] = 1.0
 
@@ -498,6 +503,46 @@ class LongitudinalMpc:
     else:
       raise NotImplementedError(f'Planner mode {self.mode} not recognized in planner update')
 
+    response_lead_index = 1 if self.source == 'lead1' else 0
+    response_lead = (radarstate.leadOne, radarstate.leadTwo)[response_lead_index]
+    response_gap_margin = (
+      float(response_lead.dRel - self.base_desired_distances[response_lead_index])
+      if response_lead.status else -1.0
+    )
+    response_track_stable = (
+      len(lead_track_frames) > response_lead_index
+      and lead_track_frames[response_lead_index] >= LEAD_ACCEL_MIN_TRACK_FRAMES
+    )
+    response_request = get_lead_accel_mpc_request(
+      carrot.leadAccelResponse,
+      enabled=(
+        mode == 'acc'
+        and lead_accel_response_enabled
+        and response_track_stable
+      ),
+      source=self.source,
+      lead_status=(
+        response_lead.status
+        and response_lead.radar
+        and response_lead.radarTrackId >= 0
+      ),
+      a_lead=response_lead.aLeadK,
+      a_ego=measured_a_ego,
+      v_rel=response_lead.vRel,
+      gap_margin=response_gap_margin,
+      speed_error=v_cruise - v_ego,
+    )
+    self.lead_accel_response_active = response_request.active
+    self.lead_accel_response_level = response_request.level if response_request.active else 0
+    self.set_weights(
+      prev_accel_constraint,
+      personality=personality,
+      jerk_factor=jerk_factor,
+      a_change_cost_starting=a_change_cost_starting,
+      a_change_cost_factor=response_request.a_change_cost_factor,
+      jerk_cost_factor=response_request.jerk_cost_factor,
+    )
+
     self.yref[:,1] = x
     self.yref[:,2] = v
     self.yref[:,3] = a
@@ -507,31 +552,7 @@ class LongitudinalMpc:
     self.solver.set(N, "yref", self.yref[N][:COST_E_DIM])
 
     self.params[:,2] = np.min(x_obstacles, axis=1)
-    previous_accel_reference = np.copy(self.prev_a)
-    self.lead_response_active = False
-    self.lead_accel_reference.fill(0.0)
-    if (
-      not reset_state
-      and self._lead_response_ready(radarstate.leadOne)
-    ):
-      lead_response = build_lead_accel_reference(
-        radarstate.leadOne,
-        mode=carrot.lead_response_mode,
-        v_ego=v_ego,
-        v_cruise=v_cruise,
-        desired_distance=self.desired_distance,
-        previous_acceleration=float(self.prev_a[0]),
-        time_indices=T_IDXS,
-      )
-      if lead_response is not None:
-        previous_accel_reference = lead_response.acceleration
-        self.lead_accel_reference = np.copy(lead_response.acceleration)
-        self.lead_response_active = True
-    else:
-      if reset_state:
-        self.lead_response_track_id = -1
-        self.lead_response_track_frames = 0
-    self.params[:,3] = previous_accel_reference
+    self.params[:,3] = np.copy(self.prev_a)
     self.params[:,4] = t_follow
     self.params[:,6] = comfort_brake
     self.params[:,7] = stop_distance
@@ -540,7 +561,7 @@ class LongitudinalMpc:
 
     self.run()
     if mode == 'acc':
-      self.apply_predicted_danger_a_change_cost(radarstate.leadOne, base_a_change_cost, lead_0_obstacle, t_follow, comfort_brake, stop_distance)
+      self.update_predicted_danger_margin(radarstate.leadOne, lead_0_obstacle, t_follow, comfort_brake, stop_distance)
 
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
             radarstate.leadOne.modelProb > 0.9):

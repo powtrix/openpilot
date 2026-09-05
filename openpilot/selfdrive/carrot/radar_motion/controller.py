@@ -25,12 +25,17 @@ from openpilot.selfdrive.carrot.radar_motion.predictor import (
 from openpilot.selfdrive.carrot.radar_motion.primary import (
   FrontRadarKinematicAssociator,
   RadarPointSnapshot,
+  STATIONARY_MAX_ABS_VLEAD_MPS,
   VisionRadarMatcher,
   lead_from_vision,
   lead_from_radar_point,
   match_dpath_primary_lead,
   prefer_front_radar_kinematics,
+  select_primary_radar_points,
+  snapshot_live_radar_points,
   snapshot_radar_points,
+  stationary_vision_support_probability,
+  unconditional_scc_match,
   vision_only_lead_allowed,
 )
 from openpilot.selfdrive.carrot.radar_motion.trajectory_cutin import (
@@ -39,8 +44,9 @@ from openpilot.selfdrive.carrot.radar_motion.trajectory_cutin import (
 
 
 # modelV2 is polled at 20 Hz while liveTracks may arrive just before or after
-# the camera exposure represented by timestampEof. A 0.10 s hard edge drops a
-# valid radar cycle when normal scheduling jitter puts it at 0.101-0.113 s.
+# the camera exposure represented by timestampEof. This bounds publication
+# skew only. A vehicle's declared sensor measurement delay can legitimately be
+# larger (VW MEB uses 0.8 s) and is applied below as a position projection.
 RADAR_MOTION_MAX_TIME_SKEW_S = 0.15
 # The 0x235/0x180/0x430 object stream is one radar cycle old when emitted.
 # Keep this separate from the vehicle's front-radar delay.
@@ -69,6 +75,10 @@ SCC_PHYSICAL_MATCH_MAX_DREL_M = 8.0
 SCC_PHYSICAL_MATCH_MAX_VLEAD_DELTA_MPS = 3.0
 SCC_PHYSICAL_MATCH_MAX_ABS_DPATH_M = 2.2
 SCC_PRIMARY_DUPLICATE_MAX_DREL_DELTA_M = 5.0
+RADAR_VISION_FALLBACK_MAX_ABS_DPATH_M = 1.0
+RADAR_VISION_FALLBACK_MIN_PROBABILITY = 0.40
+RADAR_MATCH_MAX_FARTHER_THAN_VISION_M = 8.0
+CORROBORATED_STATIONARY_VISION_RANGE_MISMATCH_HOLD_S = 0.15
 SCC_PRIMARY_DUPLICATE_MAX_VLEAD_DELTA_MPS = 3.0
 SCC_PRIMARY_CLOSER_MARGIN_M = 1.0
 CROSS_SENSOR_CLOSE_CUTIN_MIN_DREL_M = 2.0
@@ -280,6 +290,33 @@ def _scc_lead_two_can_compete(
   )
 
 
+def _central_vision_fallback_allowed(
+  vision: Any,
+  path: tuple[tuple[float, float], ...],
+) -> bool:
+  return bool(
+    vision is not None
+    and vision.probability >= RADAR_VISION_FALLBACK_MIN_PROBABILITY
+    and abs(
+      project_to_model_path(path, vision.d_rel, vision.y_rel).d_path
+    ) <= RADAR_VISION_FALLBACK_MAX_ABS_DPATH_M
+  )
+
+
+def _radar_match_is_dangerously_farther_than_vision(
+  match: Any,
+  vision: Any,
+  path: tuple[tuple[float, float], ...],
+) -> bool:
+  """Reject a permissive radar match that can hide a much nearer visual car."""
+  return bool(
+    match is not None
+    and _central_vision_fallback_allowed(vision, path)
+    and match.point.d_rel - vision.d_rel
+    > RADAR_MATCH_MAX_FARTHER_THAN_VISION_M
+  )
+
+
 @dataclass(frozen=True)
 class DPathRadarOutput:
   lead_one: dict[str, Any] | None
@@ -316,19 +353,17 @@ class RadarLeadDynamics:
   def update(
     self,
     points: tuple[RadarPointSnapshot, ...],
-    radar_reaction_factor: float,
   ) -> None:
-    factor = max(0.0, float(radar_reaction_factor))
     active: set[tuple[str, int]] = set()
     for point in points:
       identity = point.source, point.track_id
       active.add(identity)
       a_lead_tau = self._a_lead_tau.get(identity, LEAD_ACCEL_TAU_S)
       if (
-        abs(point.a_lead) < 0.5 * factor
+        abs(point.a_lead) < 0.5
         and abs(point.j_lead) < 0.5
       ):
-        a_lead_tau = LEAD_ACCEL_TAU_S * factor
+        a_lead_tau = LEAD_ACCEL_TAU_S
       else:
         a_lead_tau *= 1.0 - LEAD_ACCEL_FILTER_ALPHA
       self._a_lead_tau[identity] = a_lead_tau
@@ -354,8 +389,10 @@ class DPathRadarController:
     cut_in_sensitivity: int = 3,
     front_radar_measurement_delay_s: float = 0.0,
     corner_radar_measurement_delay_s: float = CORNER_RADAR_MEASUREMENT_DELAY_S,
+    production_live_tracks: bool = False,
   ) -> None:
     self.primary_matcher = VisionRadarMatcher()
+    self.scc_primary_fallback_matcher = VisionRadarMatcher()
     self.enable_radar_tracks = int(enable_radar_tracks)
     self.front_radar_measurement_delay_s = max(
       0.0, float(front_radar_measurement_delay_s),
@@ -363,6 +400,7 @@ class DPathRadarController:
     self.corner_radar_measurement_delay_s = max(
       0.0, float(corner_radar_measurement_delay_s),
     )
+    self.production_live_tracks = bool(production_live_tracks)
     self.motion_sensor = "corner" if prefer_corner_radar else "front"
     self.cut_in_sensitivity = max(0, min(5, int(cut_in_sensitivity)))
     self._reset_motion_pipeline()
@@ -375,10 +413,52 @@ class DPathRadarController:
     )
     self.scc_lead_two_tracker = DPathSccLeadTwoTracker()
     self.lead_dynamics = RadarLeadDynamics()
+    self._stationary_vision_range_mismatch_identity: (
+      tuple[str, int] | None
+    ) = None
+    self._stationary_vision_range_mismatch_since_s: float | None = None
 
   def _reset_motion_pipeline(self) -> None:
     self.trajectory_cutin = TrajectoryCutInDetector(self.cut_in_sensitivity)
     self._same_row_suppressed_until: dict[tuple[str, int, int], float] = {}
+
+  def _reset_stationary_vision_range_mismatch(self) -> None:
+    self._stationary_vision_range_mismatch_identity = None
+    self._stationary_vision_range_mismatch_since_s = None
+
+  def _reject_farther_radar_match(
+    self,
+    match: Any,
+    vision: Any,
+    path: tuple[tuple[float, float], ...],
+    time_s: float,
+  ) -> bool:
+    if not _radar_match_is_dangerously_farther_than_vision(
+      match, vision, path,
+    ):
+      self._reset_stationary_vision_range_mismatch()
+      return False
+
+    identity = (match.point.source, match.point.track_id)
+    corroborated_stationary = bool(
+      identity == self.primary_matcher.stationary_identity
+      and self.primary_matcher.stationary_corner_supported
+      and match.point.source == "frontRadar"
+      and match.point.measured
+      and abs(match.point.v_lead) <= STATIONARY_MAX_ABS_VLEAD_MPS
+    )
+    if not corroborated_stationary:
+      self._reset_stationary_vision_range_mismatch()
+      return True
+    if identity != self._stationary_vision_range_mismatch_identity:
+      self._stationary_vision_range_mismatch_identity = identity
+      self._stationary_vision_range_mismatch_since_s = time_s
+      return False
+    return bool(
+      self._stationary_vision_range_mismatch_since_s is not None
+      and time_s - self._stationary_vision_range_mismatch_since_s
+      >= CORROBORATED_STATIONARY_VISION_RANGE_MISMATCH_HOLD_S
+    )
 
   def _points_at_model_time(
     self,
@@ -386,32 +466,46 @@ class DPathRadarController:
     v_ego: float,
     radar_to_model_time_s: float,
   ) -> tuple[RadarPointSnapshot, ...]:
+    publication_skew_s = float(radar_to_model_time_s)
+    if (
+      not math.isfinite(publication_skew_s)
+      or abs(publication_skew_s) > RADAR_MOTION_MAX_TIME_SKEW_S
+    ):
+      return ()
+
     aligned: list[RadarPointSnapshot] = []
     batch: list[Any] = []
     batch_time_delta_s: float | None = None
+    snapshotter = (
+      snapshot_live_radar_points
+      if self.production_live_tracks
+      else snapshot_radar_points
+    )
     for point in radar_points:
-      source = str(getattr(point, "radarSource", getattr(point, "source", "")))
+      source = (
+        str(point.radarSource)
+        if self.production_live_tracks
+        else str(getattr(point, "radarSource", getattr(point, "source", "")))
+      )
       measurement_delay_s = (
         self.corner_radar_measurement_delay_s
         if source.rsplit(".", 1)[-1].startswith("corner")
         else self.front_radar_measurement_delay_s
       )
-      time_delta_s = radar_to_model_time_s + measurement_delay_s
-      if abs(time_delta_s) > RADAR_MOTION_MAX_TIME_SKEW_S:
-        continue
+      time_delta_s = publication_skew_s + measurement_delay_s
       if (
         batch
         and batch_time_delta_s is not None
         and time_delta_s != batch_time_delta_s
       ):
-        aligned.extend(snapshot_radar_points(
+        aligned.extend(snapshotter(
           batch, v_ego, batch_time_delta_s,
         ))
         batch.clear()
       batch.append(point)
       batch_time_delta_s = time_delta_s
     if batch and batch_time_delta_s is not None:
-      aligned.extend(snapshot_radar_points(
+      aligned.extend(snapshotter(
         batch, v_ego, batch_time_delta_s,
       ))
     return tuple(aligned)
@@ -532,11 +626,11 @@ class DPathRadarController:
     model: Any,
     yaw_rate_rad_s: float = 0.0,
     radar_to_model_time_s: float = 0.0,
-    radar_reaction_factor: float = 1.0,
   ) -> DPathRadarOutput:
     path = _model_path(model)
     if len(path) < 2:
       self.primary_matcher.reset()
+      self.scc_primary_fallback_matcher.reset()
       self.lead_two_tracker.reset()
       self.stationary_shadow_tracker.reset()
       self.stationary_primary_handoff_tracker.reset()
@@ -544,6 +638,7 @@ class DPathRadarController:
       self.primary_cut_out_predictor = RadarMotionPredictor()
       self.lead_dynamics.reset()
       self.trajectory_cutin.reset()
+      self._reset_stationary_vision_range_mismatch()
       return DPathRadarOutput(
         None, None, None, None, (), (), (), (), (), (), None,
       )
@@ -553,7 +648,7 @@ class DPathRadarController:
       v_ego,
       radar_to_model_time_s,
     )
-    self.lead_dynamics.update(points, radar_reaction_factor)
+    self.lead_dynamics.update(points)
     front_kinematic_matches = self.front_kinematic_associator.update(points)
 
     # This is intentionally first: model lead zero identifies leadOne with
@@ -567,6 +662,45 @@ class DPathRadarController:
       enable_radar_tracks=self.enable_radar_tracks,
       yaw_rate_rad_s=yaw_rate_rad_s,
     )
+    vision = self.primary_matcher.vision_fallback
+    if self.enable_radar_tracks == -1:
+      # -1 is the legacy unconditional SCC mode. It intentionally does not
+      # require a vision match and ignores SCC lateral position entirely.
+      primary_match = unconditional_scc_match(points)
+      self._reset_stationary_vision_range_mismatch()
+    elif self._reject_farther_radar_match(
+      primary_match, vision, path, time_s,
+    ):
+      # A farther permissive match must not hide a strongly visible nearer car.
+      primary_match = None
+    if primary_match is None and self.enable_radar_tracks == 3:
+      # 3 uses front-radar/vision matching first, then always trusts the SCC
+      # longitudinal object if matching fails. Vision is the final fallback
+      # only when no SCC object exists.
+      primary_match = unconditional_scc_match(points)
+    if primary_match is not None:
+      self.scc_primary_fallback_matcher.reset()
+    elif self.enable_radar_tracks == 2:
+      # Some Mando radars temporarily omit a close in-lane lead while the OEM
+      # SCC stream and vision still agree on it. Fill only a missing L1: using a
+      # separate matcher prevents SCC from replacing an existing front lead,
+      # and an empty stationary set forbids uncorroborated radar-only promotion.
+      primary_match = self.scc_primary_fallback_matcher.match(
+        model,
+        tuple(
+          point for point in select_primary_radar_points(points, 2)
+          if point.source == "scc"
+        ),
+        path,
+        time_s=time_s,
+        stationary_points=(),
+        prefer_corner_stationary=False,
+        prefer_primary_stationary=True,
+        yaw_rate_rad_s=yaw_rate_rad_s,
+        allowed_output_sources=frozenset(("scc",)),
+      )
+    else:
+      self.scc_primary_fallback_matcher.reset()
     lead_one = None
     if primary_match is not None:
       lead_one = self._lead_from_radar_point(
@@ -576,15 +710,11 @@ class DPathRadarController:
         primary_match.score,
       )
     else:
-      vision = self.primary_matcher.vision_fallback
       if (
         vision is not None
-        and vision_only_lead_allowed(
-          self.enable_radar_tracks,
-          side_cutin_supported=(
-            self.primary_matcher
-            .vision_only_side_cutin_supported
-          ),
+        and (
+          vision_only_lead_allowed(self.enable_radar_tracks)
+          or _central_vision_fallback_allowed(vision, path)
         )
       ):
         lead_one = lead_from_vision(
@@ -735,12 +865,16 @@ class DPathRadarController:
       ),
       default=None,
     )
-    front_motion_points = tuple(
-      point for point in points if point.source == "frontRadar"
-    )
-    front_scoped_motion_points = _scoped_motion_points(
-      front_motion_points, path,
-    )
+    if self.motion_sensor == "front":
+      front_motion_points = motion_points
+      front_scoped_motion_points = scoped_motion_points
+    else:
+      front_motion_points = tuple(
+        point for point in points if point.source == "frontRadar"
+      )
+      front_scoped_motion_points = _scoped_motion_points(
+        front_motion_points, path,
+      )
     primary_track_id = (
       int(lead_one.get("radarTrackId", -1))
       if lead_one is not None and lead_one.get("radar")
@@ -766,11 +900,15 @@ class DPathRadarController:
       if prediction.track_id == primary_track_id
     ), default=0.0)
     stationary_primary_candidates = []
+    primary_vision = self.primary_matcher.vision_fallback
     for point, _, projection in scoped_motion_points:
       if not _is_corner(point):
         continue
+      model_probability = stationary_vision_support_probability(
+        primary_vision, point,
+      )
       lead = self._lead_from_radar_point(
-        point, projection.d_path, 0.03, 0.0,
+        point, projection.d_path, model_probability, 0.0,
       )
       stationary_primary_candidates.append(DPathLeadCandidate(
         lead=lead,
