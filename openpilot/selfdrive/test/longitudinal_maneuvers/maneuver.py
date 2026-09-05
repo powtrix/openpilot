@@ -80,7 +80,11 @@ class Maneuver:
         print("Crashed!!!!")
         valid = False
 
-      if self.ensure_start and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
+      # A tiny positive relative speed appears for a few MPC frames while the
+      # stopped ego/lead estimates cross. Require a response once the lead has
+      # become meaningfully faster instead of treating that numerical crossover
+      # as a failed start.
+      if self.ensure_start and log['v_rel'] > 0.1 and log['acceleration'] < 1e-3:
         print('LongitudinalPlanner not starting!')
         valid = False
 

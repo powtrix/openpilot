@@ -1,4 +1,5 @@
 import itertools
+from openpilot.cereal import log
 from openpilot.common.parameterized import parameterized_class
 
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
@@ -193,15 +194,23 @@ class TestLongitudinalControl:
 
 
 def test_maneuver_plant_distinguishes_radar_and_vision_lead_response():
-  radar_plant = Plant(lead_relevancy=True, speed=20.0, distance_lead=35.0)
-  radar_plant.step(v_lead=20.0)
-  radar_plant.step(v_lead=20.0)
-  assert radar_plant.planner.mpc.lead_response_active
+  def run_response(radar_lead: bool) -> Plant:
+    plant = Plant(
+      lead_relevancy=True,
+      speed=20.0,
+      distance_lead=40.0,
+      radar_lead=radar_lead,
+      personality=log.LongitudinalPersonality.aggressive,
+    )
+    plant.carrot.leadAccelResponse = 3
+    plant.v_lead_prev = 20.0
+    for _ in range(3):
+      plant.step(v_lead=20.0)
+    plant.step(v_lead=20.5)
+    return plant
 
-  vision_plant = Plant(lead_relevancy=True, speed=20.0, distance_lead=35.0, radar_lead=False)
-  vision_plant.step(v_lead=20.0)
-  vision_plant.step(v_lead=20.0)
-  assert not vision_plant.planner.mpc.lead_response_active
+  assert run_response(True).planner.mpc.lead_accel_response_active
+  assert not run_response(False).planner.mpc.lead_accel_response_active
 
 
 def test_force_decel_overrides_carrot_cruise_target():
