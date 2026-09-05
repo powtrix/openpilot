@@ -264,7 +264,6 @@ class CarController(CarControllerBase):
     self.stock_scc_keepalive_sent = False
     self.stock_scc_last_keepalive_frame = None
     self.stock_scc_button_source_counter = None
-    self.paddle_mode = Params().get_int("PaddleMode")
 
     self.steerDeltaUpOrg = self.steerDeltaUp = self.steerDeltaUpLC = self.params.STEER_DELTA_UP
     self.steerDeltaDownOrg = self.steerDeltaDown = self.steerDeltaDownLC = self.params.STEER_DELTA_DOWN
@@ -313,7 +312,6 @@ class CarController(CarControllerBase):
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
       self.ka4_stock_scc_standstill_rearm = params.get_int("Ka4StockSccStandstillRearm") > 0
-      self.paddle_mode = params.get_int("PaddleMode")
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -570,7 +568,7 @@ class CarController(CarControllerBase):
           can_sends.extend(hyundaicanfd.create_ccnc_messages(
             self.CP, self.packer, self.CAN, self.frame, CC, CS, hud_control, apply_angle,
             left_lane_warning, right_lane_warning, self.enable_corner_radar, stopping,
-            self.canfd_debug, self.paddle_mode,
+            self.canfd_debug,
           ))
           if hda2:
             can_sends.extend(hyundaicanfd.create_adrv_messages(self.CP, self.packer, self.CAN, self.frame))
