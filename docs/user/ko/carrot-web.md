@@ -115,6 +115,8 @@ HUD와 웹 영상은 참고 화면입니다. 차량의 실제 경고와 전방 �
 - `change branch`: 로컬 또는 원격 브랜치를 선택합니다.
 - `reset repo`: 저장소 연결과 브랜치를 강제로 초기화합니다.
 
+이 사용자 포크의 실제 브랜치 이름은 `dkcarrot-wip`입니다. 새로 설치할 때 comma 설치 화면에는 `powtrix/dkcarrot-wip`를 입력하고, 이미 설치된 장치에서는 `change branch`에서 `powtrix > dkcarrot-wip`를 선택합니다. 기존 `carrot-wip`는 이전 설치 장치와의 호환을 위해 같은 커밋을 가리키는 미러로 유지되지만, 원본 당근 브랜치와 구분하려면 `dkcarrot-wip`를 사용하세요.
+
 > [!CAUTION]
 > `git sync`, `git reset`, `reset repo`는 로컬 코드 변경을 잃게 할 수 있습니다. 의미를 모르면 실행하지 말고, 지원 요청 시 현재 브랜치와 커밋만 `Info`에서 확인하세요.
 

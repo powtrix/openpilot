@@ -115,6 +115,8 @@ Tools contains management actions that can immediately change device or reposito
 - `change branch`: choose a local or remote branch.
 - `reset repo`: forcibly reset repository remotes and branch state.
 
+The actual branch name for this user fork is `dkcarrot-wip`. For a new installation, enter `powtrix/dkcarrot-wip` in the comma installer; on an existing installation, select `powtrix > dkcarrot-wip` under `change branch`. The legacy `carrot-wip` branch remains a same-commit compatibility mirror for previously installed devices, but use `dkcarrot-wip` to distinguish this fork from the original carrot branch.
+
 > [!CAUTION]
 > `git sync`, `git reset`, and `reset repo` can discard local code changes. If you do not understand the action, do not run it. For a support request, read the current branch and commit from `Info` instead.
 

@@ -231,7 +231,6 @@ def handle_agnos_update() -> None:
       print(f"[agnos] manifest_path: {manifest_path}", flush=True)
   except OSError as e:
     print(f"[agnos] model read failed: {e}", flush=True)
-    pass
   target_slot_number = get_target_slot_number()
   flash_agnos_update(manifest_path, target_slot_number, cloudlog)
   set_offroad_alert("Offroad_NeosUpdate", False)
@@ -470,19 +469,37 @@ def main() -> None:
     while True:
       wait_helper.ready_event.clear()
 
+      user_request = wait_helper.user_request
+      manual_request = user_request != UserRequest.NONE
+      if params.get_bool("IsOnroad") and not manual_request:
+        params.put("UpdaterState", "idle")
+        # Powered-on updates only run in response to the driver's button press.
+        wait_helper.sleep(5.0)
+        continue
+
       # Attempt an update
       exception = None
       try:
+        if manual_request:
+          params.put("UpdaterState", "checking...")
+
         # TODO: reuse overlay from previous updated instance if it looks clean
         init_overlay()
 
         # ensure we have some params written soon after startup
         updater.set_params(False, update_failed_count, exception)
 
-        if not system_time_valid() or first_run:
+        if not system_time_valid():
+          first_run = False
+          if manual_request:
+            raise RuntimeError("system time is invalid; connect to the internet before updating")
+          wait_helper.sleep(60)
+          continue
+        if first_run and not manual_request:
           first_run = False
           wait_helper.sleep(60)
           continue
+        first_run = False
 
         update_failed_count += 1
 
@@ -493,10 +510,10 @@ def main() -> None:
         # download update
         last_fetch = params.get("UpdaterLastFetchTime")
         timed_out = last_fetch is None or (datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - last_fetch > datetime.timedelta(days=3))
-        user_requested_fetch = wait_helper.user_request == UserRequest.FETCH
+        user_requested_fetch = user_request == UserRequest.FETCH
         if params.get_bool("NetworkMetered") and not timed_out and not user_requested_fetch:
           cloudlog.info("skipping fetch, connection metered")
-        elif wait_helper.user_request == UserRequest.CHECK:
+        elif user_request == UserRequest.CHECK:
           cloudlog.info("skipping fetch, only checking")
         else:
           updater.fetch_update()
@@ -525,7 +542,10 @@ def main() -> None:
 
       # infrequent attempts if we successfully updated recently
       wait_helper.user_request = UserRequest.NONE
-      wait_helper.sleep(5*60 if update_failed_count > 0 else 1.5*60*60)
+      if params.get_bool("IsOnroad"):
+        wait_helper.sleep(5.0)
+      else:
+        wait_helper.sleep(5*60 if update_failed_count > 0 else 1.5*60*60)
 
 
 if __name__ == "__main__":

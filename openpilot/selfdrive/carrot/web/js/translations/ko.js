@@ -307,7 +307,7 @@ window.CarrotTranslations.register("ko", {
     cellular_metered_desc: "제한된 연결에서 대용량 데이터 업로드를 방지합니다",
     hidden_network: "숨겨진 네트워크",
     connect_upper: "연결",
-    updates_offroad_only: "업데이트는 차량이 꺼져 있을 때만 다운로드됩니다.",
+    updates_offroad_only: "차량 전원이 켜진 상태에서도 수동 업데이트를 사용할 수 있습니다.",
     download: "다운로드",
     check_upper: "확인",
     install_update: "업데이트 설치",
