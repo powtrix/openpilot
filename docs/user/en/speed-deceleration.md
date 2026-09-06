@@ -315,7 +315,7 @@ Adjust by 100 (1 m) at a time under comparable no-lead signal stops, because the
 | Slowing with turn mode 0 | Future-model speed, applied-model speed, separate ATC |
 | Unwanted traffic-light stop/go | Detection mode, driving mode, model decision |
 
-Automatic CAN diagnostic logs are generated only when currently received vehicle or radar state from the present onroad session reports an actual error. CAN timeouts from the previous drive's shutdown are not used, and capture occurs five seconds after detection to include the immediate aftermath. When investigating a speed or deceleration issue, upload the affected drive from Carrot Web even if no automatic diagnostic log was generated.
+Automatic CAN diagnostic logs are generated only while `CarrotCommunityDataSharing=1` and currently received vehicle or radar state from the present onroad session reports an actual error. CAN timeouts from the previous drive's shutdown are not used, and capture occurs five seconds after detection to include the immediate aftermath. The community-sharing setting does not change speed, deceleration, or any vehicle-control decision. When it is off, or whenever no automatic diagnostic log was generated, explicitly select and upload the affected drive from Carrot Web for a speed/deceleration investigation.
 
 ## Code references
 

@@ -42,7 +42,10 @@ export function createSettingCommitter(options = {}) {
     if (!key) throw new TypeError("A parameter name is required");
 
     const source = normalizeSource(commitOptions.source);
-    const payload = await postJson(endpoint, { name: key, value, source });
+    const requestOptions = commitOptions.webConsent === true
+      ? Object.freeze({ webConsent: true })
+      : undefined;
+    const payload = await postJson(endpoint, { name: key, value, source }, requestOptions);
 
     // The server is the authority on what was actually stored.
     const stored = payload && Object.prototype.hasOwnProperty.call(payload, "value")

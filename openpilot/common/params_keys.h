@@ -316,6 +316,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"Ka4StockSccStandstillRearm", {PERSISTENT, INT, "0"}},
     // One-time, explicit consent for the bounded KA4 validation-log campaign.
     {"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}},
+    // Explicit opt-in for automatic data exchange with Carrot community services.
+    {"CarrotCommunityDataSharing", {PERSISTENT, BOOL, "0"}},
 
     {"SoundVolumeAdjust", {PERSISTENT, INT, "100"}},
     {"SoundVolumeAdjustEngage", {PERSISTENT, INT, "10"}},

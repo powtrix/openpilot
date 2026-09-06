@@ -13,6 +13,7 @@ from ipaddress import ip_address
 from typing import Any
 
 from openpilot.common.params import Params
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
 
 
 _DEFAULT_REPORT_URL_KEY = 23
@@ -197,6 +198,10 @@ class CwebPushReporter:
     print(line, flush=True)
 
   def poll_once(self) -> bool:
+    if not community_data_sharing_enabled(self.params):
+      self._status("disabled")
+      return False
+
     now = time.monotonic()
     local_ip = get_local_ip(self.iface)
     if not local_ip:
@@ -223,6 +228,9 @@ class CwebPushReporter:
         if self.dry_run:
           self._status("heartbeat_dry_run", ip=local_ip, payload=payload)
           return True
+        if not community_data_sharing_enabled(self.params):
+          self._status("disabled")
+          return False
         ok, status, body = post_json(self.heartbeat_url, payload, self.timeout_s)
         self._status(
           "heartbeat" if ok else "heartbeat_failed",
@@ -246,6 +254,9 @@ class CwebPushReporter:
       self._status("dry_run", ip=local_ip, payload=payload)
       return True
 
+    if not community_data_sharing_enabled(self.params):
+      self._status("disabled")
+      return False
     ok, status, body = post_json(self.report_url, payload, self.timeout_s)
     if ok:
       self.last_success_ip = local_ip

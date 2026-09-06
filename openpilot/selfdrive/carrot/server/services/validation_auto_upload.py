@@ -35,6 +35,14 @@ from .params import HAS_PARAMS, Params
 
 
 VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
+# This fork's automatic campaign is intentionally private to the owner's
+# comma device. Keep only a one-way identifier in the public branch; the NAS
+# has the raw device ID in its private deployment environment. The server
+# repeats the same allowlist check, while this client gate prevents another
+# installation from collecting full rlogs in the first place.
+DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256 = frozenset({
+  "6bb662f1e2215eff5f71c28790c40196e497d633beedcf550c01d487ec053b30",
+})
 STATE_SCHEMA_VERSION = 1
 CAMPAIGN_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 CLOCK_ROLLBACK_TOLERANCE_SECONDS = 60
@@ -108,10 +116,11 @@ def _configured_validation_upload_base_url(raw_override: Any) -> str:
   return normalized if _is_https_upload_url(normalized) else ""
 
 
-# The validation receiver sees a short-lived device JWT while establishing an
-# authenticated upload session. Until comma exposes a purpose-scoped proof,
-# automatic collection must only trust the operator-controlled built-in
-# receiver (or one immutable deployment-time override), never a Web UI value.
+# The validation receiver sees only a challenge-bound signature made with the
+# device registration key while establishing an upload session; it never sees
+# a reusable comma API bearer. Automatic collection still trusts only the
+# operator-controlled built-in receiver (or one immutable deployment-time
+# override), never a Web UI value.
 # A non-empty malformed override disables the feature instead of silently
 # falling back to a different receiver than the deployer intended.
 VALIDATION_UPLOAD_BASE_URL = _configured_validation_upload_base_url(
@@ -1130,6 +1139,15 @@ def _git_identity(params: Any) -> dict[str, Any]:
 
 
 def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
+  device_id = _param_text(params, "DongleId")
+  device_id_sha256 = hashlib.sha256(device_id.encode("utf-8")).hexdigest() if device_id else ""
+  if device_id_sha256 not in DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256:
+    return False, {
+      "reason": "device_not_allowed",
+      "deviceId": device_id or "unknown",
+      "deviceAllowed": False,
+    }
+
   raw = None
   for key in ("CarParams", "CarParamsPersistent"):
     try:
@@ -1152,6 +1170,8 @@ def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
       and not bool(flags & int(HyundaiFlags.CAMERA_SCC))
     )
     return gate, {
+      "deviceId": device_id,
+      "deviceAllowed": True,
       "carFingerprint": str(cp.carFingerprint),
       "pcmCruise": bool(cp.pcmCruise),
       "openpilotLongitudinalControl": bool(cp.openpilotLongitudinalControl),

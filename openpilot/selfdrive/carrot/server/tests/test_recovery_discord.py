@@ -136,3 +136,66 @@ def test_recovery_dsm_upload_uses_automatic_session(monkeypatch):
     payload,
     b"tmux-data",
   )
+
+
+def test_recovery_bundled_community_destinations_fail_closed(monkeypatch):
+  for key in (
+    "CARROT_EXCEPTION_DISCORD_WEBHOOK_URL",
+    "CARROT_SUPPORT_DISCORD_WEBHOOK_URL",
+    "CARROT_DISCORD_WEBHOOK_URL",
+    "DISCORD_WEBHOOK_URL",
+  ):
+    monkeypatch.delenv(key, raising=False)
+  monkeypatch.setattr(recovery, "_read_param", lambda _key, default="": default)
+  monkeypatch.setattr(
+    recovery,
+    "_post_tmux_upload",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("community upload must be blocked")),
+  )
+
+  assert recovery._support_webhook_url() == ""
+  assert recovery._exception_webhook_url() == ""
+  result = recovery._send_tmux_carrot_logs({"dongle_id": "device"}, b"tmux")
+  assert result["ok"] is False
+  assert result["disabled_by_community_sharing"] is True
+
+
+def test_recovery_custom_discord_destinations_remain_independent(monkeypatch):
+  monkeypatch.setattr(recovery, "_read_param", lambda _key, default="": default)
+  monkeypatch.setenv("CARROT_EXCEPTION_DISCORD_WEBHOOK_URL", "https://operator.example/exception")
+  monkeypatch.setenv("CARROT_SUPPORT_DISCORD_WEBHOOK_URL", "https://operator.example/support")
+
+  assert recovery._exception_webhook_url() == "https://operator.example/exception"
+  assert recovery._support_webhook_url() == "https://operator.example/support"
+
+
+def test_recovery_carrot_logs_revocation_blocks_final_network_call(monkeypatch):
+  decisions = iter((True, False))
+  monkeypatch.setattr(recovery, "_community_data_sharing_enabled", lambda: next(decisions))
+  monkeypatch.setattr(
+    recovery,
+    "_request_result",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network called after revocation")),
+  )
+
+  result = recovery._send_tmux_carrot_logs({"dongle_id": "device"}, b"tmux")
+
+  assert result["ok"] is False
+  assert result["disabled_by_community_sharing"] is True
+
+
+def test_recovery_bundled_discord_revocation_blocks_final_network_call(monkeypatch):
+  default_url = recovery._default_exception_webhook_url()
+  decisions = iter((True, False))
+  monkeypatch.setattr(recovery, "_exception_webhook_url", lambda: default_url)
+  monkeypatch.setattr(recovery, "_community_data_sharing_enabled", lambda: next(decisions))
+  monkeypatch.setattr(
+    recovery,
+    "_request_result",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network called after revocation")),
+  )
+
+  result = recovery._send_tmux_discord("tmux_send", b"tmux")
+
+  assert result["ok"] is False
+  assert result["disabled_by_community_sharing"] is True

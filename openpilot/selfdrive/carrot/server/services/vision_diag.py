@@ -15,6 +15,8 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, FormData
 
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
+
 from ..config import VISION_DIAG_DEFAULT_DISCORD_KEY, VISION_DIAG_DEFAULT_DISCORD_WEBHOOK
 from .params import HAS_PARAMS, Params
 from .vision_test import LOG_PATH as VISION_TEST_LOG_PATH
@@ -158,6 +160,8 @@ def vision_diag_discord_webhook_url(params: Any | None = None) -> str:
     if value:
       return value
   if os.environ.get("CARROT_VISION_DIAG_DISCORD_WEBHOOK_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+    return ""
+  if not community_data_sharing_enabled(params):
     return ""
   return _decode_obfuscated(VISION_DIAG_DEFAULT_DISCORD_WEBHOOK, VISION_DIAG_DEFAULT_DISCORD_KEY)
 
@@ -415,6 +419,15 @@ async def upload_diagnostic_bundle_to_discord(
   if not url.startswith(("http://", "https://")):
     return {"configured": True, "ok": False, "error": "invalid webhook url"}
 
+  default_url = _decode_obfuscated(VISION_DIAG_DEFAULT_DISCORD_WEBHOOK, VISION_DIAG_DEFAULT_DISCORD_KEY)
+  if url == default_url and not community_data_sharing_enabled(params):
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+    }
+
   snapshot = await asyncio.to_thread(get_server_diagnostic_snapshot)
   meta = _diagnostic_metadata(params)
   upload_snapshot_title = "COMMA SERVER SNAPSHOT AT DISCORD UPLOAD"
@@ -456,6 +469,13 @@ async def upload_diagnostic_bundle_to_discord(
   try:
     timeout = ClientTimeout(total=20)
     async with ClientSession(timeout=timeout) as session:
+      if url == default_url and not community_data_sharing_enabled(params):
+        return {
+          "configured": True,
+          "ok": False,
+          "skipped": True,
+          "disabled_by_community_sharing": True,
+        }
       async with session.post(url, data=form) as resp:
         text = await resp.text()
         if 200 <= resp.status < 300:

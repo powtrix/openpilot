@@ -1,13 +1,13 @@
 import asyncio
 import json
 import socket
-import ssl
 import time
 import urllib.error
 import urllib.request
 
 from aiohttp import web
 
+from ...community_data import community_data_sharing_enabled
 from .params import HAS_PARAMS, Params
 
 
@@ -28,6 +28,9 @@ def register_my_ip_sync(params: "Params") -> tuple[bool, str]:
   """
   기존 carrot_man.py의 register_my_ip()를 그대로 옮긴 버전 (동기)
   """
+  if not community_data_sharing_enabled(params):
+    return False, "Community data sharing disabled"
+
   try:
     token = "12345678"
     local_ip = get_local_ip()
@@ -56,8 +59,10 @@ def register_my_ip_sync(params: "Params") -> tuple[bool, str]:
       method="POST",
     )
 
-    ctx = ssl._create_unverified_context()
-    with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
+    if not community_data_sharing_enabled(params):
+      return False, "Community data sharing disabled"
+
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
       body = resp.read().decode("utf-8", errors="replace")
       return (200 <= resp.status < 300), body
 

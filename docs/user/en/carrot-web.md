@@ -17,7 +17,7 @@ Example: `http://192.168.0.25:7000`
 
 Select the white carrot icon on the device to show a large QR code for its current address. On C3, use the bottom-left button; on C4, use the bottom status-icon row. Scan it with a phone on the same network to connect. If the device IP changes while the QR screen is open, both the QR code and displayed address update automatically. Long addresses scale to fit instead of being shortened. The last QR refresh time appears below the address as numeric `HH:MM:SS`, with the 30-second auto-close countdown on the right. Tap the QR screen to close it, or leave it open and it closes when the countdown reaches zero.
 
-Carrot Web is a local device-management interface. Do not expose it directly to the internet or give its address, a remote-support link, or terminal access to an untrusted person.
+Carrot Web is a local device-management interface. Do not expose it directly to the internet or give its address, a remote-support link, or terminal access to an untrusted person. Enabling either automatic KA4 validation upload or Carrot community data sharing requires a fresh, short-lived one-use Web session from the exact same private-IP origin. This blocks ordinary browser cross-site requests and public-host DNS rebinding, but it is not a user login and does not authenticate another client already on the same local network.
 
 ## Pages at a glance
 
@@ -95,6 +95,12 @@ The Settings page is divided into `Device` and `carrotpilot` tabs.
 
 See [Understanding Settings](settings.md) for ranges, units, and a safe tuning order.
 
+### Carrot community data sharing
+
+`System > Record & Power > Carrot Community Data Sharing` is a high-risk consent setting that is off by default. Enabling it permits device identifiers, vehicle name, branch/commit, local network address and heartbeat status, all setting values and the catalog, automatic onroad/exception tmux diagnostics, and setting snapshots to be sent to Carrot community servers or bundled Discord webhooks. Popular-setting downloads, CWP address registration, and bundled Discord notifications from Support Terminal, Vision diagnostics, and manual dashcam-upload completion use the same consent. Phone tethering may use mobile data, and disabling it does not delete data already sent.
+
+Turning it off immediately blocks new community requests and automatic tmux capture/retries. A user-entered NAS or Discord URL, a manually started dashcam-log upload itself, and the remote-support tunnel itself remain independent. However, the default `adot.synology.me` DK receiver accepts automatic KA4 validation only and blocks manual dashcam/tmux uploads; manual upload requires a separately authenticated private receiver. The bundled default-Discord completion notice for a dashcam upload is also blocked. KA4 automatic validation uses the separate consent immediately below and a fixed private-NAS receiver, so it can continue while community sharing is off when `CarrotValidationAutoUpload` remains enabled. Neither consent value is stored in file backups, profiles, or QR transfer.
+
 ## Tools page
 
 Tools contains management actions that can immediately change device or repository state.
@@ -126,7 +132,7 @@ The actual branch name for this user fork is `dkcarrot-wip`. For a new installat
 - `capture tmux`: capture the current tmux log and download it through the browser.
 - `send tmux`: request a server-log upload.
 
-CAN diagnostics are uploaded automatically only when a currently received `carState` or `radarState` from the present onroad session reports a real CAN error. A timeout left over from the previous drive is not used, and capture is delayed for five seconds after detection so the log includes the immediate aftermath. In an automatic diagnostic log, `CarrotException can_error queued` means the upload was queued; the preceding `current onroad CAN error detected from ...` line identifies the source used for the decision.
+Ordinary post-drive onroad diagnostics and exception/CAN-error tmux diagnostics are captured and uploaded automatically only while `CarrotCommunityDataSharing=1`. A CAN error is selected only when a currently received `carState` or `radarState` from the present onroad session reports it. A timeout left over from the previous drive is not used, and capture is delayed for five seconds after detection so the log includes the immediate aftermath. In an automatic diagnostic log, `CarrotException can_error queued` means the upload was queued; the preceding `current onroad CAN error detected from ...` line identifies the source used for the decision. Turning consent off discards pending automatic exception transfers. A user-triggered `send tmux` can still use a configured NAS or custom webhook, but Carrot Logs and bundled default Discord destinations are blocked without consent.
 - `install required`: check and install packages used by optional Carrot Web features.
 - `delete all videos`: delete screen recordings.
 - `delete all logs`: delete stored driving logs.
@@ -181,6 +187,8 @@ Terminal commands run immediately on the device and can have a much wider impact
 6. Select `Stop` as soon as support is complete.
 
 Use `Allow all` or an unlimited session only if you understand the risk and will monitor the entire session. Never post the link or PIN in a public channel.
+
+The remote-support tunnel is explicitly started by the user and can still be created while community sharing is off. However, automatic delivery of its link and PIN to the bundled Carrot support Discord is blocked, so send the displayed details directly to the designated helper. A separately configured support Discord URL remains independent. Bundled Discord upload of a Vision diagnostic bundle follows the same rule.
 
 ## Connection and display troubleshooting
 
