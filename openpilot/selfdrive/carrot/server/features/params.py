@@ -29,9 +29,16 @@ from ..services.params import (
   restore_param_values_validated,
   restore_param_values_from_backup,
   set_param_value,
+  COMMUNITY_DATA_SHARING_PARAM,
+  THIRD_PARTY_DATA_SHARING_PARAM,
   VALIDATION_AUTO_UPLOAD_PARAM,
 )
 from ..services.settings import get_settings_cached
+from ..services.web_consent import (
+  WEB_CONSENT_SESSION_TTL_SECONDS,
+  consume_web_consent_session,
+  issue_web_consent_session,
+)
 from .system import is_drive_engaged
 
 
@@ -69,19 +76,23 @@ def _request_is_explicitly_offroad(request: web.Request) -> bool:
 
 
 def _request_has_web_consent_proof(request: web.Request) -> bool:
-  """Reject form/redirect based cross-site consent attempts.
+  """Consume the one-use, local-origin proof issued after Web confirmation."""
+  return consume_web_consent_session(request)
 
-  The custom header is deliberately supplied by Carrot Web's shared JSON
-  client. Browsers cannot add it from an ordinary cross-site form, and the
-  JSON media type keeps aiohttp from accepting a text/plain body as consent.
-  """
-  try:
-    return (
-      request.content_type == "application/json"
-      and request.headers.get("X-Carrot-Web-Request") == "1"
-    )
-  except Exception:
-    return False
+
+async def api_web_consent_session(request: web.Request) -> web.Response:
+  token = issue_web_consent_session(request)
+  if token is None:
+    return web.json_response({
+      "ok": False,
+      "error": "Web consent sessions require a trusted local Carrot Web origin",
+      "error_code": "WEB_CONSENT_ORIGIN_REJECTED",
+    }, status=403, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+  return web.json_response({
+    "ok": True,
+    "token": token,
+    "expires_in": WEB_CONSENT_SESSION_TTL_SECONDS,
+  }, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 async def api_params_bulk(request: web.Request) -> web.Response:
@@ -173,6 +184,7 @@ async def api_param_set(request: web.Request) -> web.Response:
       return web.json_response({
         "ok": False,
         "error": "automatic validation log collection requires an explicit Carrot Web consent request",
+        "error_code": "WEB_CONSENT_PROOF_REQUIRED",
       }, status=403)
     # Require the parked/offroad proof for every positive write, not only an
     # apparent 0->1 transition. That keeps a stale read or concurrent disable
@@ -184,15 +196,66 @@ async def api_param_set(request: web.Request) -> web.Response:
       }, status=409)
     allow_validation_auto_upload_enable = True
 
+  allow_community_data_sharing_enable = False
+  if name == COMMUNITY_DATA_SHARING_PARAM and _binary_param_value(value) == 1:
+    if not _request_has_web_consent_proof(request):
+      return web.json_response({
+        "ok": False,
+        "error": "Carrot community data sharing requires an explicit Carrot Web consent request",
+        "error_code": "WEB_CONSENT_PROOF_REQUIRED",
+      }, status=403)
+    if not _request_is_explicitly_offroad(request):
+      return web.json_response({
+        "ok": False,
+        "error": "Carrot community data sharing can only be enabled while offroad",
+      }, status=409)
+    allow_community_data_sharing_enable = True
+
+  allow_third_party_data_sharing_enable = False
+  if name == THIRD_PARTY_DATA_SHARING_PARAM and _binary_param_value(value) == 1:
+    if not _request_has_web_consent_proof(request):
+      return web.json_response({
+        "ok": False,
+        "error": "automatic third-party data sharing requires an explicit Carrot Web consent request",
+        "error_code": "WEB_CONSENT_PROOF_REQUIRED",
+      }, status=403)
+    if not _request_is_explicitly_offroad(request):
+      return web.json_response({
+        "ok": False,
+        "error": "automatic third-party data sharing can only be enabled while offroad",
+      }, status=409)
+    allow_third_party_data_sharing_enable = True
+
   try:
     set_param_value(
       name,
       value,
       p,
       allow_validation_auto_upload_enable=allow_validation_auto_upload_enable,
+      allow_community_data_sharing_enable=allow_community_data_sharing_enable,
+      allow_third_party_data_sharing_enable=allow_third_party_data_sharing_enable,
     )
   except Exception as e:
     return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+  # The boot-time popular-values exchange is skipped while consent is off.
+  # Start the same one-shot refresh immediately on a later explicit opt-in so
+  # the user does not need to restart Carrot Web for the setting to take
+  # effect. The service rechecks consent at each network request.
+  if name == COMMUNITY_DATA_SHARING_PARAM and _binary_param_value(value) == 1:
+    try:
+      session = request.app.get("http")
+      previous_task = request.app.get("popular_value_upload_task")
+      if session is not None and (previous_task is None or previous_task.done()):
+        from ..services.popular_values import refresh_popular_values_once
+        request.app["popular_value_upload_task"] = asyncio.create_task(
+          refresh_popular_values_once(session, upload=True),
+          name="carrot-popular-values-consent-refresh",
+        )
+    except Exception:
+      # Consent storage must not be reported as failed because this optional
+      # first exchange could not be scheduled. Later settings reads can retry.
+      pass
 
   # Changing settings while driving stays allowed on purpose; the history just
   # records that it happened. append_param_change never raises, so a log
@@ -384,6 +447,7 @@ async def api_params_restore_json(request: web.Request) -> web.Response:
 
 
 def register(app: web.Application) -> None:
+  app.router.add_get("/api/web-consent/session", api_web_consent_session)
   app.router.add_get("/api/params_bulk", api_params_bulk)
   app.router.add_post("/api/param_set", api_param_set)
   app.router.add_get("/api/param_changes", api_param_changes)

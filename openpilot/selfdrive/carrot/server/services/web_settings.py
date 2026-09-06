@@ -334,7 +334,11 @@ def _normalize_web_upload_url(value: Any) -> str:
     # Migrate defaults used before the upload receiver moved to its dedicated
     # HTTPS virtual host. The main shind0 host serves Carrot Web and returns an
     # HTML 404 for upload API paths.
-    if url.casefold() in {"https://op.wjcloud.kr", "https://shind0.synology.me"}:
+    if url.casefold() in {
+      "https://op.wjcloud.kr",
+      "https://shind0.synology.me",
+      "https://upload.shind0.synology.me",
+    }:
       return DEFAULT_WEB_UPLOAD_URL
     return url
   except ValueError:

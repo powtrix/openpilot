@@ -5,6 +5,7 @@ from pathlib import Path
 
 import openpilot.system.loggerd.deleter as deleter
 import openpilot.system.loggerd.uploader as uploader
+from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.common.params import Params
 from openpilot.system.hardware.hw import Paths
 from openpilot.system.loggerd.xattr_cache import setxattr
@@ -78,6 +79,7 @@ class UploaderTestCase:
     self.params = Params()
     self.params.put("IsOffroad", True)
     self.params.put("DongleId", "0000000000000000")
+    self.params.put_bool(DK_THIRD_PARTY_DATA_SHARING_PARAM, True)
 
   def make_file_with_data(self, f_dir: str, fn: str, size_mb: float = .1, lock: bool = False,
                           upload_xattr: bytes | None = None, preserve_xattr: bytes | None = None) -> Path:

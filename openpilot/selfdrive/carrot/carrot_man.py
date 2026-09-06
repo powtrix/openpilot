@@ -33,6 +33,7 @@ from openpilot.system.hardware import PC, TICI
 from openpilot.selfdrive.navd.helpers import Coordinate
 from openpilot.common.constants import CV
 
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
 from openpilot.selfdrive.carrot.server.services.web_settings import read_web_settings
@@ -70,6 +71,9 @@ AUTO_ONROAD_TMUX_DELAY_SECONDS = float(os.environ.get("CARROT_AUTO_ONROAD_TMUX_D
 CARROT_CAN_ERROR_TMUX_DELAY_SECONDS = float(os.environ.get("CARROT_CAN_ERROR_TMUX_DELAY_SECONDS", "5"))
 CARROT_EXCEPTION_UPLOAD_RETRY_SECONDS = 60.0
 CARROT_EXCEPTION_TMUX_REASONS = ("exception", "log", "tmux_send", "can_error", "spi_error", "egpu_error")
+AUTOMATIC_EXCEPTION_TMUX_REASONS = tuple(
+  reason for reason in CARROT_EXCEPTION_TMUX_REASONS if reason != "tmux_send"
+)
 DISCORD_TMUX_FILE_MAX_BYTES = 8 * 1024 * 1024
 EXCEPTION_DISCORD_WEBHOOK_KEY = b"carrot-exception-v1"
 EXCEPTION_DISCORD_WEBHOOK_OBFUSCATED = (
@@ -107,12 +111,27 @@ def reset_carrot_exception_tmux_send_queue() -> None:
     _carrot_exception_tmux_send_queued = False
 
 
-def queue_carrot_exception_tmux_send(context: str = "", reason: str = "tmux_send") -> bool:
+def carrot_tmux_reason_allowed(reason: str | None, community_data_sharing: bool) -> bool:
+  """Allow explicit Web-tool tmux sends without community consent.
+
+  Automatic callers go through queue_carrot_exception_tmux_send(), whose
+  default preserves automatic provenance as `exception` and which is blocked
+  before writing while consent is off. The Tools dispatcher is the only path
+  that writes `tmux_send` directly, so it may use the user's private targets.
+  """
+  return reason == "tmux_send" or (
+    community_data_sharing and reason in AUTOMATIC_EXCEPTION_TMUX_REASONS
+  )
+
+
+def queue_carrot_exception_tmux_send(context: str = "", reason: str = "exception") -> bool:
   global _carrot_exception_tmux_send_queued
 
   with _carrot_exception_tmux_send_lock:
     try:
       params = Params()
+      if not community_data_sharing_enabled(params):
+        return False
       current = params.get("CarrotException")
       if current in (None, "", b""):
         put_nonblocking = getattr(params, "put_nonblocking", None)
@@ -868,7 +887,7 @@ class CarrotMan:
       "local_ip"          : get_private_ip_by_iface("wlan0"),
     }
 
-  def _post_tmux_target(self, label, url, headers, payload, send_settings=False):
+  def _post_tmux_target(self, label, url, headers, payload, send_settings=False, request_allowed=None):
     settings_path = None
     if send_settings:
       self.save_toggle_values()
@@ -881,12 +900,22 @@ class CarrotMan:
       "/data/media/tmux.log",
       settings_path,
       requests.post,
+      request_allowed,
     )
     print(f"[carrot_man] {label}: status={response.status_code} {response.text}")
     return response
 
   def send_tmux_web(self, tmux_why, send_settings=False):
     try:
+      request_allowed = None
+      if tmux_why != "tmux_send":
+        def automatic_request_allowed():
+          return community_data_sharing_enabled(self.params)
+
+        request_allowed = automatic_request_allowed
+        if not request_allowed():
+          print("[carrot_man] automatic DSM tmux upload skipped: community data sharing is disabled")
+          return None
       try:
         upload_settings = read_web_settings()
       except Exception:
@@ -894,10 +923,12 @@ class CarrotMan:
       payload = self._tmux_upload_payload(tmux_why)
       base_url, configured_token = web_upload_settings(upload_settings)
       session_token = configured_token or create_web_upload_session_sync(
-        base_url, payload, requests.post, "tmux",
+        base_url, payload, requests.post, "tmux", request_allowed,
       )
       url, headers = tmux_web_target(upload_settings, session_token)
-      return self._post_tmux_target("DSM tmux upload", url, headers, payload, send_settings)
+      return self._post_tmux_target(
+        "DSM tmux upload", url, headers, payload, send_settings, request_allowed,
+      )
     except Exception as e:
       print(f"web tmux sending error...: {e}")
       traceback.print_exc()
@@ -905,10 +936,16 @@ class CarrotMan:
 
   def send_tmux_carrot_logs(self, tmux_why, send_settings=False):
     """Send the independent copy consumed by the Discord carrot_logs forum."""
+    if not community_data_sharing_enabled(self.params):
+      print("[carrot_man] carrot_logs upload skipped: community data sharing is disabled")
+      return None
     try:
       payload = self._tmux_upload_payload(tmux_why)
       url, headers = carrot_logs_web_target()
-      return self._post_tmux_target("carrot_logs upload", url, headers, payload, send_settings)
+      return self._post_tmux_target(
+        "carrot_logs upload", url, headers, payload, send_settings,
+        lambda: community_data_sharing_enabled(self.params),
+      )
     except Exception as e:
       print(f"carrot_logs tmux sending error...: {e}")
       traceback.print_exc()
@@ -955,6 +992,8 @@ class CarrotMan:
       value = self._param_text(key)
       if value:
         return value
+    if not community_data_sharing_enabled(self.params):
+      return ""
     return self._decode_tmux_discord_webhook_url()
 
   def _github_repo_url(self):
@@ -1037,6 +1076,11 @@ class CarrotMan:
         toggle_file = open(toggle_path, "rb")
         opened_files.append(toggle_file)
         files.append(("files[1]", (f"toggles-{stamp}.json", toggle_file, "application/json")))
+
+      default_url = self._decode_tmux_discord_webhook_url()
+      if (tmux_why != "tmux_send" or url == default_url) and not community_data_sharing_enabled(self.params):
+        print("[carrot_man] discord tmux skipped: community data sharing is disabled")
+        return False
 
       if files:
         response = requests.post(
@@ -1186,8 +1230,30 @@ class CarrotMan:
 
           network_type = self.sm['deviceState'].networkType # if not force_wifi else NetworkType.wifi
           networkConnected = False if network_type == NetworkType.none else True
+          community_data_sharing = community_data_sharing_enabled(self.params)
 
-          if is_onroad and not can_error_tmux_requested:
+          # This setting is an explicit opt-in. Drop any pending automatic
+          # capture/retry state as soon as consent is withdrawn so enabling it
+          # later cannot upload an exception that happened while sharing was
+          # disabled. An explicit Tools request stored as `tmux_send` remains
+          # eligible for the configured DSM/custom webhook; the built-in
+          # Carrot destinations remain gated in their sender functions.
+          if not community_data_sharing:
+            pending_value = self.params.get("CarrotException")
+            if (pending_value in AUTOMATIC_EXCEPTION_TMUX_REASONS
+                or pending_tmux_reason in AUTOMATIC_EXCEPTION_TMUX_REASONS):
+              if pending_value in AUTOMATIC_EXCEPTION_TMUX_REASONS:
+                self.params.put("CarrotException", "")
+              pending_tmux_reason = None
+              pending_tmux_next_attempt_at = 0.0
+              reset_carrot_exception_tmux_send_queue()
+            is_tmux_sent = False
+            onroad_tmux_captured = False
+            onroad_tmux_next_attempt_at = 0.0
+            can_error_detected_at = None
+            can_error_tmux_requested = False
+
+          if community_data_sharing and is_onroad and not can_error_tmux_requested:
             car_state_current = current_onroad_car_state_seen and can_sm.alive['carState']
             radar_state_current = current_onroad_radar_state_seen and can_sm.alive['radarState']
             car_can_error, radar_can_error = carrot_can_error_sources(
@@ -1209,7 +1275,7 @@ class CarrotMan:
                 "CAN error observed in current onroad state", reason="can_error",
               )
 
-          if AUTO_ONROAD_DIAGNOSTICS and onroad_start_at is not None and not is_tmux_sent:
+          if community_data_sharing and AUTO_ONROAD_DIAGNOSTICS and onroad_start_at is not None and not is_tmux_sent:
             onroad_elapsed = now - onroad_start_at
             if not onroad_tmux_captured and onroad_elapsed >= AUTO_ONROAD_TMUX_DELAY_SECONDS and now >= onroad_tmux_next_attempt_at:
               if self.make_tmux_data():
@@ -1219,7 +1285,8 @@ class CarrotMan:
               else:
                 onroad_tmux_next_attempt_at = now + CARROT_EXCEPTION_UPLOAD_RETRY_SECONDS
 
-            if onroad_tmux_captured and networkConnected and now >= onroad_tmux_next_attempt_at:
+            if (onroad_tmux_captured and networkConnected and now >= onroad_tmux_next_attempt_at
+                and community_data_sharing_enabled(self.params)):
               web_response = self.send_tmux_web("onroad", send_settings = True)
               web_ok = web_response is not None and getattr(web_response, "ok", False)
               carrot_logs_response = self.send_tmux_carrot_logs("onroad", send_settings = True)
@@ -1239,7 +1306,7 @@ class CarrotMan:
             carrot_exception = None
             print("[carrot_man] CAN error tmux canceled after going offroad")
 
-          if carrot_exception in CARROT_EXCEPTION_TMUX_REASONS \
+          if carrot_tmux_reason_allowed(carrot_exception, community_data_sharing) \
               and pending_tmux_reason is None and now >= pending_tmux_next_attempt_at:
             if self.make_tmux_data():
               pending_tmux_reason = carrot_exception
@@ -1249,7 +1316,9 @@ class CarrotMan:
               pending_tmux_next_attempt_at = now + CARROT_EXCEPTION_UPLOAD_RETRY_SECONDS
               reset_carrot_exception_tmux_send_queue()
 
-          if pending_tmux_reason is not None and networkConnected and now >= pending_tmux_next_attempt_at:
+          if (carrot_tmux_reason_allowed(pending_tmux_reason, community_data_sharing)
+              and networkConnected and now >= pending_tmux_next_attempt_at
+              and (pending_tmux_reason == "tmux_send" or community_data_sharing_enabled(self.params))):
             web_response = self.send_tmux_web(pending_tmux_reason, send_settings = False)
             web_ok = web_response is not None and getattr(web_response, "ok", False)
             carrot_logs_response = self.send_tmux_carrot_logs(pending_tmux_reason, send_settings = False)

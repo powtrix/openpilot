@@ -41,6 +41,7 @@ def build_controller():
   controller.stock_scc_keepalive_request_count = 0
   controller.stock_scc_last_keepalive_frame = None
   controller.stock_scc_button_source_counter = None
+  controller.stock_scc_resume_alert_suppressed = False
   controller.ka4_stock_scc_standstill_rearm = True
   controller.activateCruise = 0
   controller.last_button_frame = 0
@@ -62,7 +63,7 @@ def build_controller():
 def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd=0.0,
                 hud_lead_info=2, sys_fail_state=0, take_over_req=0, brake_pressed=False, gas_pressed=False,
                 brake_hold_active=False, parking_brake=False, standstill=True, v_ego=0.0, v_ego_raw=0.0,
-                can_valid=True):
+                can_valid=True, adrv_0x161=None):
   return SimpleNamespace(
     is_metric=True,
     scc_control={
@@ -74,6 +75,7 @@ def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd
       "SysFailState": sys_fail_state,
       "TakeOverReq": take_over_req,
     },
+    adrv_0x161=adrv_0x161,
     buttons_counter=0,
     cruise_buttons_msg=None,
     cruise_buttons=deque([Buttons.NONE]),
@@ -87,6 +89,7 @@ def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd
       accFaulted=False,
       canValid=can_valid,
       activateCruise=False,
+      latEnabled=True,
       vEgo=v_ego,
       vEgoRaw=v_ego_raw,
       cruiseState=SimpleNamespace(enabled=True, speed=80 / 3.6),
@@ -97,6 +100,7 @@ def build_state(*, info_display=0, acc_mode=1, acc_obj_dist=5.0, acc_obj_rel_spd
 def build_control(*, lead_visible=True, lead_radar=1, lead_distance=5.0, lead_rel_speed=0.0):
   return SimpleNamespace(
     enabled=True,
+    latActive=True,
     cruiseControl=SimpleNamespace(resume=False, cancel=False),
     hudControl=SimpleNamespace(
       setSpeed=80 / 3.6,
@@ -137,6 +141,14 @@ def resume_message_requested(messages):
   return any(message[2]["CRUISE_BUTTONS"] == Buttons.RES_ACCEL for message in messages)
 
 
+def encoded_resume_alert(controller, CC, CS):
+  return create_lfa_icon_non_camera_scc(
+    FakePacker(), CS, controller.CAN, CC,
+    openpilot_longitudinal=False,
+    suppress_stock_scc_resume_alert=controller.stock_scc_resume_alert_suppressed,
+  )[0][2]["ALERTS_5"]
+
+
 def pulse_group_starts(pulse_frames):
   return [frame for index, frame in enumerate(pulse_frames)
           if index == 0 or frame != pulse_frames[index - 1] + KA4_STOCK_SCC_BUTTON_SOURCE_PERIOD_FRAMES]
@@ -159,7 +171,7 @@ def test_ka4_stock_scc_resume_state_requests_short_resume_press():
   assert not resume_message_requested(step_controller(controller, CC, CS, 306))
 
 
-def test_ka4_stock_scc_validation_switch_isolates_oem_behavior():
+def test_ka4_stock_scc_legacy_metadata_value_cannot_disable_automatic_behavior():
   controller = build_controller()
   controller.ka4_stock_scc_standstill_rearm = False
   CC = build_control()
@@ -167,9 +179,9 @@ def test_ka4_stock_scc_validation_switch_isolates_oem_behavior():
 
   enter_standstill_resume_state(controller, CC, CS)
 
-  assert controller.stock_scc_stop_start_frame is None
-  assert not controller.stock_scc_keepalive_pending
-  assert controller.create_button_messages(CC, CS, use_clu11=False) == []
+  assert controller.stock_scc_stop_start_frame == 0
+  assert controller.stock_scc_keepalive_pending
+  assert resume_message_requested(controller.create_button_messages(CC, CS, use_clu11=False))
 
 
 @pytest.mark.parametrize("state_frame, expected", [(2695, True), (2696, False), (2700, False), (3000, False)])
@@ -258,12 +270,14 @@ def test_ka4_stock_scc_rearm_cancels_on_driver_button():
 def test_ka4_stock_scc_rearm_cancels_on_main_button():
   controller = build_controller()
   CC = build_control()
-  CS = build_state()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
   CS.main_buttons[-1] = 1
 
   enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
 
 
 def test_ka4_stock_scc_rearm_cancels_on_acc_fault():
@@ -287,7 +301,7 @@ def test_ka4_alt_rearm_vetoes_raw_source_button_even_if_deque_is_stale(signal, v
   controller = build_controller()
   controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
   CC = build_control()
-  CS = build_state()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
   CS.cruise_buttons_msg = {
     "COUNTER": 17,
     "CRUISE_BUTTONS": Buttons.NONE,
@@ -301,6 +315,8 @@ def test_ka4_alt_rearm_vetoes_raw_source_button_even_if_deque_is_stale(signal, v
 
   assert CS.cruise_buttons[-1] == Buttons.NONE
   assert not controller.stock_scc_keepalive_pending
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
 
 
 @pytest.mark.parametrize("hud_lead_info", [0, 1, 4])
@@ -370,6 +386,7 @@ def test_ka4_stock_scc_short_press_aborts_on_every_safety_interlock(abort_case):
   assert not resume_message_requested(messages)
   assert not controller.stock_scc_keepalive_pending
   assert controller.stock_scc_keepalive_press_frames == 0
+  assert not controller.stock_scc_resume_alert_suppressed
 
 
 def test_ka4_stock_scc_ignores_front_vehicle_departure_notice():
@@ -439,21 +456,88 @@ def test_ka4_stock_scc_early_info_display_recovery_is_blocked_when_acc_mode_clos
   assert not controller.stock_scc_keepalive_pending
 
 
-def test_ka4_stock_scc_alerts_5_candidate_alone_does_not_trigger_early_recovery():
+def test_ka4_stock_scc_alerts_5_resume_prompt_triggers_early_recovery():
   controller = build_controller()
   CC = build_control()
-  CS = build_state(info_display=0)
-  # ALERTS_5=5 is only a candidate for the visible cluster prompt. The current
-  # controller contract intentionally reads SCC_CONTROL, not ADRV_0x161, until
-  # synchronized vehicle evidence establishes that association.
-  CS.adrv_0x161 = {"ALERTS_5": 5}
+  CS = build_state(info_display=0, adrv_0x161={"ALERTS_5": 5})
 
   pulse_frames = [frame for frame in range(250)
                   if resume_message_requested(step_controller(controller, CC, CS, frame))]
 
-  assert pulse_frames == []
-  assert not controller.stock_scc_warning_recovery_requested
-  assert resume_message_requested(step_controller(controller, CC, CS, 250))
+  assert pulse_frames == [30, 32, 34]
+  assert controller.stock_scc_warning_recovery_requested
+
+
+def test_ka4_stock_scc_resume_alert_is_masked_from_stop_start_until_thirty_seconds():
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
+
+  controller.frame = 0
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  assert controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 0
+
+  for frame in range(1, 31):
+    controller.frame = frame
+    controller._update_ka4_stock_scc_keepalive(CC, CS)
+  assert controller.stock_scc_stop_start_frame == 0
+
+  controller.frame = 2999
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  assert controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 0
+
+  controller.frame = 3000
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
+
+
+@pytest.mark.parametrize("interlock", ["brake", "gas", "auto_hold", "parking_brake", "cancel", "fault", "can_invalid"])
+def test_ka4_stock_scc_resume_alert_mask_releases_for_interlocks(interlock):
+  controller = build_controller()
+  CC = build_control()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
+
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  assert controller.stock_scc_resume_alert_suppressed
+
+  if interlock == "brake":
+    CS.out.brakePressed = True
+  elif interlock == "gas":
+    CS.out.gasPressed = True
+  elif interlock == "auto_hold":
+    CS.out.brakeHoldActive = True
+  elif interlock == "parking_brake":
+    CS.out.parkingBrake = True
+  elif interlock == "cancel":
+    CC.cruiseControl.cancel = True
+  elif interlock == "fault":
+    CS.out.accFaulted = True
+  elif interlock == "can_invalid":
+    CS.out.canValid = False
+
+  controller.frame = 1
+  controller._update_ka4_stock_scc_keepalive(CC, CS)
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
+
+
+def test_ka4_stock_scc_hda2_does_not_replace_resume_alert():
+  controller = build_controller()
+  controller.CP.flags |= HyundaiFlags.CANFD_HDA2
+  CC = build_control()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
+
+  for frame in range(31):
+    controller.frame = frame
+    controller._update_ka4_stock_scc_keepalive(CC, CS)
+
+  assert controller.stock_scc_stop_start_frame == 0
+  assert controller.stock_scc_keepalive_pending
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
 
 
 def test_ka4_stock_scc_info_display_4_at_096_seconds_triggers_immediate_recovery():
@@ -619,22 +703,40 @@ def test_stock_scc_rearm_is_limited_to_ka4_stock_longitudinal(fingerprint, pcm_c
   controller.CP.pcmCruise = pcm_cruise
   controller.CP.openpilotLongitudinalControl = openpilot_longitudinal
   CC = build_control()
-  CS = build_state()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
 
   enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
 
 
 def test_stock_scc_rearm_excludes_camera_scc_stock_longitudinal():
   controller = build_controller()
   controller.CP.flags |= HyundaiFlags.CAMERA_SCC
   CC = build_control()
-  CS = build_state()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
 
   enter_standstill_resume_state(controller, CC, CS)
 
   assert not controller.stock_scc_keepalive_pending
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
+
+
+@pytest.mark.parametrize("missing_flag", [HyundaiFlags.CANFD, HyundaiFlags.RADAR_SCC])
+def test_stock_scc_rearm_requires_all_exact_topology_flags(missing_flag):
+  controller = build_controller()
+  controller.CP.flags &= ~missing_flag
+  CC = build_control()
+  CS = build_state(adrv_0x161={"ALERTS_5": 5})
+
+  enter_standstill_resume_state(controller, CC, CS)
+
+  assert not controller.stock_scc_keepalive_pending
+  assert not controller.stock_scc_resume_alert_suppressed
+  assert encoded_resume_alert(controller, CC, CS) == 5
 
 
 def test_keepalive_button_is_not_duplicated_by_button_spam_setting():
@@ -921,6 +1023,39 @@ def test_stock_longitudinal_preserves_received_oem_alert_sound_daw_and_mute_fiel
                  "SOUNDS_1", "SOUNDS_2", "SOUNDS_3", "SOUNDS_4"):
     assert msg[2][signal] == original[signal]
   assert original == original_copy
+
+
+@pytest.mark.parametrize(("alerts_5", "expected"), [(3, 3), (4, 4), (5, 0)])
+def test_stock_longitudinal_masks_only_the_qualified_resume_alert(alerts_5, expected):
+  original = {
+    "COUNTER": 17,
+    "LFA_ICON": 0,
+    "LKA_ICON": 0,
+    "ALERTS_1": 1,
+    "ALERTS_2": 21,
+    "ALERTS_3": 26,
+    "ALERTS_5": alerts_5,
+    "MUTE": 1,
+    "DAW_ICON": 2,
+    "SOUNDS_1": 1,
+    "SOUNDS_2": 2,
+    "SOUNDS_3": 3,
+    "SOUNDS_4": 4,
+  }
+  CS = SimpleNamespace(adrv_0x161=original, out=SimpleNamespace(latEnabled=True))
+  CC = SimpleNamespace(latActive=True)
+  CAN = SimpleNamespace(ECAN=0)
+
+  msg = create_lfa_icon_non_camera_scc(
+    FakePacker(), CS, CAN, CC,
+    openpilot_longitudinal=False,
+    suppress_stock_scc_resume_alert=True,
+  )[0]
+
+  assert msg[2]["ALERTS_5"] == expected
+  for signal in ("ALERTS_1", "ALERTS_2", "ALERTS_3", "MUTE", "DAW_ICON",
+                 "SOUNDS_1", "SOUNDS_2", "SOUNDS_3", "SOUNDS_4"):
+    assert msg[2][signal] == original[signal]
 
 
 def test_openpilot_longitudinal_retains_existing_adrv_field_suppression():

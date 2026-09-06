@@ -4,6 +4,7 @@ import time
 import pyray as rl
 
 from openpilot.common.api import api_get
+from openpilot.common.external_data import third_party_data_sharing_enabled
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.lib.api_helpers import get_token
@@ -189,6 +190,9 @@ class FirehoseLayoutBase(Widget):
     return y
 
   def _get_status(self) -> tuple[str, rl.Color]:
+    if not third_party_data_sharing_enabled(self._params):
+      return tr("INACTIVE: automatic data sharing is disabled"), self.RED
+
     network_type = ui_state.sm["deviceState"].networkType
     network_metered = ui_state.sm["deviceState"].networkMetered
 
@@ -198,11 +202,17 @@ class FirehoseLayoutBase(Widget):
       return tr("INACTIVE: connect to an unmetered network"), self.RED
 
   def _fetch_firehose_stats(self):
+    if not third_party_data_sharing_enabled(self._params):
+      return
     try:
       dongle_id = self._params.get("DongleId")
       if not dongle_id or dongle_id == UNREGISTERED_DONGLE_ID:
         return
+      if not third_party_data_sharing_enabled(self._params):
+        return
       identity_token = get_token(dongle_id)
+      if not third_party_data_sharing_enabled(self._params):
+        return
       response = api_get(f"v1/devices/{dongle_id}/firehose_stats", access_token=identity_token, session=self._session)
       if response.status_code == 200:
         data = response.json()

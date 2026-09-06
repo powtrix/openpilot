@@ -419,7 +419,7 @@ Carrot Web 기본값 복원에 쓰이는 `carrot_settings.json`과 Params 최초
 | 턴 모드 0인데 감속 | `ModelTurnSpeedFactor`, `ApplyModelSpeed`, 별도 ATC 확인 |
 | 신호에서 불필요한 정지·출발 | `TrafficLightDetectMode`, 주행 모드, 모델 판단 확인 |
 
-CAN 오류로 자동 전송되는 진단 로그는 현재 온로드에서 새로 수신 중인 차량 또는 레이더 상태가 실제 오류를 보고할 때만 생성됩니다. 이전 주행 종료 과정의 CAN timeout은 사용하지 않으며, 오류 뒤의 상황을 포함하도록 감지 5초 후 캡처합니다. 따라서 속도·감속 이상을 분석할 때 자동 진단 로그가 없더라도 필요한 주행 구간은 Carrot Web에서 별도로 전송해야 합니다.
+CAN 오류로 자동 전송되는 진단 로그는 `DkThirdPartyDataSharing=1`과 `CarrotCommunityDataSharing=1`이 모두 설정되고 현재 온로드에서 새로 수신 중인 차량 또는 레이더 상태가 실제 오류를 보고할 때만 생성됩니다. 이전 주행 종료 과정의 CAN timeout은 사용하지 않으며, 오류 뒤의 상황을 포함하도록 감지 5초 후 캡처합니다. 두 공유 설정은 속도·감속이나 차량 제어 판단 자체를 바꾸지 않습니다. 따라서 설정이 꺼져 있거나 자동 진단 로그가 없더라도 속도·감속 이상을 분석할 때는 필요한 주행 구간을 Carrot Web에서 별도로 선택해 전송해야 합니다.
 
 ## 코드 기준
 

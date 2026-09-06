@@ -44,10 +44,10 @@ CANFD_JERK_ERROR_FULL_SCALE = 0.5
 CANFD_JERK_RELEASE_THRESHOLD = 0.1
 KA4_STOCK_SCC_MAX_STANDSTILL_GRACE = 30.0
 KA4_STOCK_SCC_OEM_REARM_INTERVAL = 3.0
-# This validation path treats SCC_CONTROL.InfoDisplay == 4 as an observed
+# This validation path treats SCC_CONTROL.InfoDisplay == 4 as a stock
 # standstill/resume-state input. On variants that carry ADRV_0x161,
-# ALERTS_5 == 5 is a separate decoded DBC value; available public logs do not
-# establish that value's visible-cluster association. The synthetic schedule's
+# ALERTS_5 == 5 decodes to the reported switch-or-pedal resume prompt, though
+# no synchronized route/cluster capture is available. The synthetic schedule's
 # assumption that an accepted RES changes the OEM timing remains unproven on-car.
 # Stop requesting early enough that the modeled final interval ends near 30 s.
 KA4_STOCK_SCC_REARM_CUTOFF = KA4_STOCK_SCC_MAX_STANDSTILL_GRACE - KA4_STOCK_SCC_OEM_REARM_INTERVAL
@@ -79,6 +79,17 @@ vibrate_intervals = [
   (6.0, 6.5),
   (7.5, 8.0),
 ]
+
+
+def _ka4_stock_scc_standstill_supported(CP):
+  return (
+    CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN and
+    CP.pcmCruise and
+    not CP.openpilotLongitudinalControl and
+    bool(CP.flags & HyundaiFlags.CANFD) and
+    bool(CP.flags & HyundaiFlags.RADAR_SCC) and
+    not bool(CP.flags & HyundaiFlags.CAMERA_SCC)
+  )
 
 def process_hud_alert(enabled, fingerprint, hud_control):
   sys_warning = (hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw))
@@ -247,10 +258,15 @@ class CarController(CarControllerBase):
     self.LFA_trigger = 0
 
     self.activeCarrot = 0
-    self.camera_scc_params = Params().get_int("HyundaiCameraSCC")
-    self.is_ldws_car = Params().get_bool("IsLdwsCar")
+    params = Params()
+    self.camera_scc_params = params.get_int("HyundaiCameraSCC")
+    self.is_ldws_car = params.get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
-    self.ka4_stock_scc_standstill_rearm = Params().get_int("Ka4StockSccStandstillRearm") > 0
+    self.ka4_stock_scc_standstill_rearm = _ka4_stock_scc_standstill_supported(self.CP)
+    if self.ka4_stock_scc_standstill_rearm:
+      # Keep the legacy Params value as route/validation metadata, but do not
+      # make this owner's requested KA4 behavior depend on a hidden UI toggle.
+      params.put_int_nonblocking("Ka4StockSccStandstillRearm", 1)
 
     self.stock_scc_stop_start_frame = None
     self.stock_scc_near_zero_frames = 0
@@ -265,7 +281,8 @@ class CarController(CarControllerBase):
     self.stock_scc_keepalive_request_count = 0
     self.stock_scc_last_keepalive_frame = None
     self.stock_scc_button_source_counter = None
-    self.paddle_mode = Params().get_int("PaddleMode")
+    self.stock_scc_resume_alert_suppressed = False
+    self.paddle_mode = params.get_int("PaddleMode")
 
     self.steerDeltaUpOrg = self.steerDeltaUp = self.steerDeltaUpLC = self.params.STEER_DELTA_UP
     self.steerDeltaDownOrg = self.steerDeltaDown = self.steerDeltaDownLC = self.params.STEER_DELTA_DOWN
@@ -313,7 +330,9 @@ class CarController(CarControllerBase):
       self.canfd_debug = params.get_int("CanfdDebug")
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
-      self.ka4_stock_scc_standstill_rearm = params.get_int("Ka4StockSccStandstillRearm") > 0
+      self.ka4_stock_scc_standstill_rearm = _ka4_stock_scc_standstill_supported(self.CP)
+      if self.ka4_stock_scc_standstill_rearm and params.get_int("Ka4StockSccStandstillRearm") != 1:
+        params.put_int_nonblocking("Ka4StockSccStandstillRearm", 1)
       self.paddle_mode = params.get_int("PaddleMode")
 
     actuators = CC.actuators
@@ -535,6 +554,10 @@ class CarController(CarControllerBase):
     if self.CP.flags & HyundaiFlags.CANFD:
       hda2 = self.CP.flags & HyundaiFlags.CANFD_HDA2
       hda2_long = hda2 and self.CP.openpilotLongitudinalControl
+      if not self.CP.openpilotLongitudinalControl:
+        # Compute the current-frame KA4 qualification and alert mask before
+        # replacing the cluster message, avoiding a visible one-frame leak.
+        self._update_ka4_stock_scc_keepalive(CC, CS)
       # steering control
       if camera_scc:
         can_sends.extend(hyundaicanfd.create_steering_messages_camera_scc(self.frame, self.packer, self.CP, self.CAN, CC, apply_steer_req, apply_torque, CS, apply_angle, self.lkas_max_torque, angle_control))
@@ -555,6 +578,7 @@ class CarController(CarControllerBase):
           can_sends.extend(hyundaicanfd.create_lfa_icon_non_camera_scc(
             self.packer, CS, self.CAN, CC,
             openpilot_longitudinal=self.CP.openpilotLongitudinalControl,
+            suppress_stock_scc_resume_alert=self.stock_scc_resume_alert_suppressed,
           ))
 
       # blinkers
@@ -592,7 +616,6 @@ class CarController(CarControllerBase):
                                                              self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS))
             self.accel_last = accel
       else:
-        self._update_ka4_stock_scc_keepalive(CC, CS)
         # button presses
         if self.camera_scc_params == 3: # camera scc but stock long
           send_button = self.make_spam_button(CC, CS)
@@ -896,15 +919,16 @@ class CarController(CarControllerBase):
     self.stock_scc_warning_recovery_requested = False
     self.stock_scc_keepalive_requested = False
     self.stock_scc_last_keepalive_frame = None
+    self.stock_scc_resume_alert_suppressed = False
 
   def _update_ka4_stock_scc_keepalive(self, CC, CS):
     """Keep KA4 radar-SCC auto-resume ready for at most 30 seconds.
 
-    This validation path uses InfoDisplay == 4 as an observed stock
-    standstill/resume state. On variants that carry ADRV_0x161, ALERTS_5 == 5
-    is a separate decoded DBC value; neither its visible-cluster association
-    nor an OEM timing change after an accepted short RES is established by the
-    available routes. The synthetic schedule ends its final short press no
+    InfoDisplay == 4 is a stock standstill/resume signal. ADRV_0x161
+    ALERTS_5 == 5 decodes to USE_SWITCH_OR_PEDAL_TO_ACCELERATE and matches the
+    owner's reported prompt, though no synchronized route/cluster capture is
+    available. An OEM timing change after an accepted short RES is not
+    established by the available routes. The synthetic schedule ends its final short press no
     later than 27 seconds, so its modeled three-second interval ends near 30
     seconds. An already-active InfoDisplay state is level-triggered and retried
     at a bounded rate instead of depending on a 0-to-4 edge.
@@ -913,22 +937,16 @@ class CarController(CarControllerBase):
     accelerator, Auto Hold, parking-brake, driver-button, SCC failure, or
     takeover interlocks.
     """
-    supported = (
-      self.ka4_stock_scc_standstill_rearm and
-      self.CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN and
-      self.CP.pcmCruise and
-      not self.CP.openpilotLongitudinalControl and
-      bool(self.CP.flags & HyundaiFlags.CANFD) and
-      bool(self.CP.flags & HyundaiFlags.RADAR_SCC) and
-      not bool(self.CP.flags & HyundaiFlags.CAMERA_SCC)
-    )
+    self.stock_scc_resume_alert_suppressed = False
+    supported = _ka4_stock_scc_standstill_supported(self.CP)
     if not supported:
       self._reset_ka4_stock_scc_keepalive()
       return
 
     scc_control = CS.scc_control or {}
     info_display = scc_control.get("InfoDisplay", 0)
-    info_display_active = info_display == 4
+    adrv_0x161 = getattr(CS, "adrv_0x161", None) or {}
+    resume_prompt_active = info_display == 4 or adrv_0x161.get("ALERTS_5", 0) == 5
     cruise_session_active = CC.enabled and CS.out.cruiseState.enabled and CS.out.canValid
     driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
     driver_main_button_pressed = bool(getattr(CS, "main_buttons", ()) and CS.main_buttons[-1] != Buttons.NONE)
@@ -944,7 +962,7 @@ class CarController(CarControllerBase):
       getattr(CS.out, "accFaulted", False) or driver_button_pressed or driver_main_button_pressed or raw_button_input or
       CC.cruiseControl.cancel
     )
-    if not info_display_active:
+    if not resume_prompt_active:
       self.stock_scc_warning_recovery_requested = False
       if self.stock_scc_keepalive_warning_recovery:
         self.stock_scc_keepalive_pending = False
@@ -993,6 +1011,9 @@ class CarController(CarControllerBase):
         self.stock_scc_near_zero_start_frame = self.frame
       self.stock_scc_near_zero_frames += 1
       self.stock_scc_stopped_lead_frames += 1
+      # Hide only the exact stock resume prompt while all current-frame safety
+      # gates are valid. Other OEM alerts and sounds remain untouched.
+      self.stock_scc_resume_alert_suppressed = not bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
       if self.stock_scc_near_zero_frames <= round(KA4_STOCK_SCC_NEAR_ZERO_DWELL / DT_CTRL):
         return
 
@@ -1022,6 +1043,11 @@ class CarController(CarControllerBase):
       self.stock_scc_keepalive_press_frames = 0
       self.stock_scc_keepalive_warning_recovery = False
       return
+
+    self.stock_scc_resume_alert_suppressed = (
+      stopped_time < KA4_STOCK_SCC_MAX_STANDSTILL_GRACE and
+      not bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
+    )
 
     cutoff_frames = round(KA4_STOCK_SCC_REARM_CUTOFF / DT_CTRL)
     if stopped_frames > cutoff_frames:
@@ -1070,7 +1096,7 @@ class CarController(CarControllerBase):
       stopped_time >= KA4_STOCK_SCC_FIRST_REARM_DELAY if last_keepalive_elapsed is None else
       last_keepalive_elapsed >= KA4_STOCK_SCC_MIN_REARM_INTERVAL
     )
-    warning_retry_due = info_display_active and not self.stock_scc_warning_recovery_requested and (
+    warning_retry_due = resume_prompt_active and not self.stock_scc_warning_recovery_requested and (
       last_keepalive_elapsed is None or last_keepalive_elapsed >= KA4_STOCK_SCC_WARNING_RETRY_INTERVAL
     )
     final_rearm_due = (

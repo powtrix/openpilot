@@ -1,13 +1,17 @@
 import asyncio
+import base64
 import hashlib
 import json
 from pathlib import Path
 
 import pytest
 from aiohttp import web
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 from openpilot.selfdrive.carrot import web_upload
 from openpilot.selfdrive.carrot.server.features.dashcam import catalog
+from openpilot.selfdrive.carrot.server.features.dashcam import routes as dashcam_routes
 from openpilot.selfdrive.carrot.server.features.dashcam import upload
 from openpilot.selfdrive.carrot.server.features.dashcam import upload_jobs
 from openpilot.selfdrive.carrot.server.services import dashcam_upload_report
@@ -646,6 +650,19 @@ def test_sync_session_is_issued_automatically_from_device_metadata():
   }
 
 
+def test_sync_session_guard_blocks_revoked_request_before_network():
+  def forbidden_post(*_args, **_kwargs):
+    raise AssertionError("network called after consent revocation")
+
+  with pytest.raises(PermissionError, match="no longer allowed"):
+    web_upload.create_web_upload_session_sync(
+      "https://upload.example",
+      {"dongle_id": "0123456789abcdef"},
+      forbidden_post,
+      request_allowed=lambda: False,
+    )
+
+
 def test_async_session_is_issued_automatically(monkeypatch):
   captured = {}
 
@@ -715,6 +732,24 @@ def test_tmux_web_post_sends_multipart_and_closes_files(tmp_path: Path):
   assert all(item[1][1].closed for item in captured["files"])
 
 
+def test_tmux_web_guard_blocks_revoked_request_and_closes_files(tmp_path: Path):
+  tmux_path = tmp_path / "tmux.log"
+  tmux_path.write_bytes(b"tmux-data")
+
+  def forbidden_post(*_args, **_kwargs):
+    raise AssertionError("network called after consent revocation")
+
+  with pytest.raises(PermissionError, match="no longer allowed"):
+    web_upload.post_tmux_web(
+      "https://upload.example/api/v1/tmux/upload",
+      {},
+      {"tmux_why": "exception"},
+      str(tmux_path),
+      post=forbidden_post,
+      request_allowed=lambda: False,
+    )
+
+
 def test_web_settings_migrate_previous_upload_keys():
   settings = web_settings.sanitize_web_settings({
     "toss_upload_url": "https://legacy.example/",
@@ -763,6 +798,91 @@ class FakeCompleteRequestContext:
 
   async def __aexit__(self, exc_type, exc, tb):
     return False
+
+
+class FakeHealthSession:
+  response = FakeCompleteResponse(200, '{"ok":true}')
+  requests = []
+
+  def __init__(self, *args, **kwargs):
+    pass
+
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, exc_type, exc, tb):
+    return False
+
+  def get(self, url, *, headers):
+    type(self).requests.append((url, headers))
+    return FakeCompleteRequestContext(type(self).response)
+
+
+def test_web_upload_health_preserves_safe_receiver_capabilities(monkeypatch):
+  FakeHealthSession.response = FakeCompleteResponse(200, json.dumps({
+    "ok": True,
+    "service": "dk-upload",
+    "deviceAllowlistConfigured": True,
+    "legacyUploadsEnabled": False,
+    "privateDetail": "must-not-cross-the-device-api",
+  }))
+  FakeHealthSession.requests = []
+  monkeypatch.setattr(web_upload, "ClientSession", FakeHealthSession)
+
+  result = asyncio.run(web_upload.check_web_upload_health("https://upload.example", ""))
+
+  assert result["ok"] is True
+  assert result["service"] == "dk-upload"
+  assert result["deviceAllowlistConfigured"] is True
+  assert result["legacyUploadsEnabled"] is False
+  assert "privateDetail" not in result
+  assert FakeHealthSession.requests == [("https://upload.example/api/v1/health", {})]
+
+
+def test_dashcam_upload_test_accepts_healthy_validation_only_receiver(monkeypatch):
+  async def fake_health(_base_url, _token):
+    return {
+      "ok": True,
+      "status": 200,
+      "service": "dk-upload",
+      "deviceAllowlistConfigured": True,
+      "legacyUploadsEnabled": False,
+    }
+
+  async def fail_legacy_session(*_args, **_kwargs):
+    pytest.fail("validation-only health must not probe the disabled legacy session API")
+
+  monkeypatch.setattr(upload, "upload_target_settings", lambda: ("https://adot.synology.me", ""))
+  monkeypatch.setattr(dashcam_routes, "check_web_upload_health", fake_health)
+  monkeypatch.setattr(dashcam_routes, "create_web_upload_session", fail_legacy_session)
+
+  response = asyncio.run(dashcam_routes.api_dashcam_upload_test(None))
+  payload = json.loads(response.body)
+
+  assert response.status == 200
+  assert payload["ok"] is True
+  assert payload["mode"] == "validation-only"
+  assert payload["session"] == "disabled"
+
+
+def test_validation_device_key_endpoint_exposes_only_enrollment_fingerprint(monkeypatch):
+  monkeypatch.setattr(
+    dashcam_routes,
+    "validation_device_key_fingerprint",
+    lambda: {"algorithm": "ES256", "sha256": "a" * 64},
+  )
+
+  response = asyncio.run(dashcam_routes.api_validation_device_key(None))
+  payload = json.loads(response.body)
+
+  assert response.status == 200
+  assert response.headers["Cache-Control"] == "no-store"
+  assert payload == {
+    "ok": True,
+    "algorithm": "ES256",
+    "sha256": "a" * 64,
+    "deviceAuthVersion": web_upload.VALIDATION_DEVICE_AUTH_VERSION,
+  }
 
 
 class FakeCompleteSession:
@@ -1059,7 +1179,7 @@ def validation_challenge(**overrides):
     "challengeId": "challenge-123",
     "nonce": "nonce-456",
     "audience": "carrot-validation",
-    "deviceAuthVersion": 1,
+    "deviceAuthVersion": web_upload.VALIDATION_DEVICE_AUTH_VERSION,
     "receiptVersion": 1,
     **overrides,
   }
@@ -1070,7 +1190,7 @@ def validation_session(**overrides):
     "ok": True,
     "token": "validation-session-token",
     "verifiedDeviceId": "device-123",
-    "deviceAuthVersion": 1,
+    "deviceAuthVersion": web_upload.VALIDATION_DEVICE_AUTH_VERSION,
     "receiptVersion": 1,
     **overrides,
   }
@@ -1111,15 +1231,17 @@ class ScriptedJsonSession:
     return ScriptedJsonContext(type(self).responses.pop(0))
 
 
-class RecordingDeviceApi:
+class RecordingDeviceProof:
   calls = []
 
-  def __init__(self, device_id):
-    self.device_id = device_id
-
-  def get_token(self, **kwargs):
-    type(self).calls.append({"deviceId": self.device_id, **kwargs})
-    return "signed-device-identity"
+  @classmethod
+  def create(cls, device_id, challenge_id, nonce, audience):
+    cls.calls.append((device_id, challenge_id, nonce, audience))
+    return {
+      "deviceKeyAlgorithm": "ES256",
+      "devicePublicKey": "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----\n",
+      "deviceProof": "signed-device-proof",
+    }
 
 
 def scripted_json_responses(*payloads):
@@ -1131,14 +1253,14 @@ def scripted_json_responses(*payloads):
   ]
 
 
-def test_validation_session_challenge_and_short_lived_device_jwt_contract(monkeypatch):
+def test_validation_session_uses_receiver_pinned_device_proof_contract(monkeypatch):
   scripted_json_responses(
     (200, validation_challenge()),
     (201, validation_session()),
   )
-  RecordingDeviceApi.calls = []
+  RecordingDeviceProof.calls = []
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
-  monkeypatch.setattr(web_upload, "Api", RecordingDeviceApi)
+  monkeypatch.setattr(web_upload, "create_validation_device_proof", RecordingDeviceProof.create)
 
   token = asyncio.run(web_upload.create_validation_upload_session(
     "https://upload.example",
@@ -1162,28 +1284,63 @@ def test_validation_session_challenge_and_short_lived_device_jwt_contract(monkey
         "deviceId": "device-123",
         "purpose": "validation",
         "challengeId": "challenge-123",
-        "identityToken": "signed-device-identity",
+        "deviceKeyAlgorithm": "ES256",
+        "devicePublicKey": "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----\n",
+        "deviceProof": "signed-device-proof",
       },
       "headers": None,
       "allow_redirects": False,
     },
   ]
-  assert RecordingDeviceApi.calls == [{
-    "deviceId": "device-123",
-    "payload_extra": {
-      "carrotUploadChallenge": "challenge-123",
-      "carrotUploadNonce": "nonce-456",
-      "carrotUploadPurpose": "validation",
-      "carrotUploadAudience": "carrot-validation",
-    },
-    "expiry_hours": pytest.approx(web_upload.VALIDATION_IDENTITY_TOKEN_TTL_SECONDS / 3600),
-  }]
+  assert RecordingDeviceProof.calls == [(
+    "device-123", "challenge-123", "nonce-456", "carrot-validation",
+  )]
+
+
+@pytest.mark.parametrize("algorithm", ["RS256", "ES256"])
+def test_validation_device_proof_is_raw_scoped_signature_not_replayable_jwt(monkeypatch, algorithm):
+  private_key = (
+    rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    if algorithm == "RS256"
+    else ec.generate_private_key(ec.SECP256R1())
+  )
+  private_pem = private_key.private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.PKCS8,
+    serialization.NoEncryption(),
+  ).decode("ascii")
+  monkeypatch.setattr(web_upload, "get_key_pair", lambda: (algorithm, private_pem, "unused"))
+
+  proof = web_upload.create_validation_device_proof(
+    "device-123", "challenge-123", "nonce-456", "https://nas.example/validation",
+  )
+  message = web_upload.validation_device_proof_message(
+    "device-123", "challenge-123", "nonce-456", "https://nas.example/validation",
+  )
+  public_key = serialization.load_pem_public_key(proof["devicePublicKey"].encode("ascii"))
+  signature = base64.urlsafe_b64decode(proof["deviceProof"] + "=" * (-len(proof["deviceProof"]) % 4))
+
+  assert proof["deviceProof"].count(".") == 0
+  if algorithm == "RS256":
+    public_key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+  else:
+    public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+  expected_der = public_key.public_bytes(
+    serialization.Encoding.DER,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+  )
+  assert web_upload.validation_device_key_fingerprint() == {
+    "algorithm": algorithm,
+    "sha256": hashlib.sha256(expected_der).hexdigest(),
+  }
 
 
 @pytest.mark.parametrize(("challenge", "session"), [
-  (validation_challenge(deviceAuthVersion=2), None),
+  (validation_challenge(deviceAuthVersion=1), None),
+  (validation_challenge(deviceAuthVersion=3), None),
   (validation_challenge(receiptVersion=2), None),
-  (validation_challenge(), validation_session(deviceAuthVersion=2)),
+  (validation_challenge(), validation_session(deviceAuthVersion=1)),
+  (validation_challenge(), validation_session(deviceAuthVersion=3)),
   (validation_challenge(), validation_session(receiptVersion=2)),
   (validation_challenge(), validation_session(verifiedDeviceId="different-device")),
 ])
@@ -1192,9 +1349,9 @@ def test_validation_session_rejects_unknown_protocol_capability_versions(monkeyp
   if session is not None:
     payloads.append((200, session))
   scripted_json_responses(*payloads)
-  RecordingDeviceApi.calls = []
+  RecordingDeviceProof.calls = []
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
-  monkeypatch.setattr(web_upload, "Api", RecordingDeviceApi)
+  monkeypatch.setattr(web_upload, "create_validation_device_proof", RecordingDeviceProof.create)
 
   with pytest.raises(RuntimeError, match=r"validation (challenge|session) HTTP 200"):
     asyncio.run(web_upload.create_validation_upload_session(
@@ -1207,9 +1364,9 @@ def test_validation_session_rechecks_live_safety_before_second_request(monkeypat
     (200, validation_challenge()),
     (201, validation_session()),
   )
-  RecordingDeviceApi.calls = []
+  RecordingDeviceProof.calls = []
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
-  monkeypatch.setattr(web_upload, "Api", RecordingDeviceApi)
+  monkeypatch.setattr(web_upload, "create_validation_device_proof", RecordingDeviceProof.create)
   checks = 0
 
   def safety_check():

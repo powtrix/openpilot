@@ -44,6 +44,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -115,8 +116,10 @@ TOOL_ACTIONS = {
 
 TMUX_LOG_PATH = "/data/media/tmux.log"
 PARAMS_DIR = "/data/params"
-DEFAULT_WEB_UPLOAD_URL = "https://upload.shind0.synology.me"
+DEFAULT_WEB_UPLOAD_URL = "https://adot.synology.me"
 DEFAULT_TMUX_WEB_UPLOAD_URL = "https://tmux.carrotpilot.app/upload"
+COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing"
+THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing"
 CWP_RECOVERY_BOOT_PARAM = "CwebPushRecoveryBoot"
 CWP_REPORT_URL_KEY = 23
 CWP_REPORT_URL_BYTES = (
@@ -832,11 +835,7 @@ _SUPPORT_OBFUSCATED_WEBHOOK_URL = (
 )
 
 
-def _support_webhook_url() -> str:
-  for key in ("CARROT_SUPPORT_DISCORD_WEBHOOK_URL", "CARROT_DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL"):
-    v = os.environ.get(key, "").strip()
-    if v:
-      return v
+def _default_support_webhook_url() -> str:
   try:
     data = base64.b64decode(_SUPPORT_OBFUSCATED_WEBHOOK_URL)
     decoded = bytes(b ^ _SUPPORT_OBFUSCATION_KEY[i % len(_SUPPORT_OBFUSCATION_KEY)] for i, b in enumerate(data))
@@ -851,6 +850,24 @@ def _read_param(key: str, default: str = "") -> str:
       return f.read().strip() or default
   except Exception:
     return default
+
+
+def _community_data_sharing_enabled() -> bool:
+  """Fail closed without importing openpilot from the recovery process."""
+  return (
+    _read_param(THIRD_PARTY_DATA_SHARING_PARAM) == "1"
+    and _read_param(COMMUNITY_DATA_SHARING_PARAM) == "1"
+  )
+
+
+def _support_webhook_url() -> str:
+  for key in ("CARROT_SUPPORT_DISCORD_WEBHOOK_URL", "CARROT_DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL"):
+    value = os.environ.get(key, "").strip()
+    if value:
+      return value
+  if not _community_data_sharing_enabled():
+    return ""
+  return _default_support_webhook_url()
 
 
 def _write_param(key: str, value: str) -> None:
@@ -903,6 +920,13 @@ def _cwp_url(path: str) -> str:
 
 
 def _cwp_request(path: str, payload: dict, timeout: int = 4) -> dict:
+  if not _community_data_sharing_enabled():
+    return {
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
   headers = {
     "Content-Type": "application/json",
     "Accept": "application/json",
@@ -919,6 +943,15 @@ def _cwp_request(path: str, payload: dict, timeout: int = 4) -> dict:
 
 def _cwp_status() -> dict:
   enabled = _read_param(CWP_RECOVERY_BOOT_PARAM) == "1"
+  if not _community_data_sharing_enabled():
+    return {
+      "ok": False,
+      "enabled": enabled,
+      "registered": None,
+      "state": "community-sharing-disabled",
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
   result = _cwp_request("/recovery/status", {"deviceId": _cwp_device_id()})
   body = result.get("body") if isinstance(result.get("body"), dict) else {}
   if not result.get("ok") or not body.get("ok"):
@@ -953,7 +986,7 @@ def _cwp_set_enabled(enabled: bool) -> dict:
 
 
 def _cwp_boot_worker(port: int = DEFAULT_PORT) -> None:
-  if _read_param(CWP_RECOVERY_BOOT_PARAM) != "1":
+  if not _community_data_sharing_enabled() or _read_param(CWP_RECOVERY_BOOT_PARAM) != "1":
     return
   deadline = time.monotonic() + 120.0
   candidate = ""
@@ -980,6 +1013,18 @@ def _cwp_boot_worker(port: int = DEFAULT_PORT) -> None:
   print("[recovery] CWP boot unavailable", flush=True)
 
 
+def _default_exception_webhook_url() -> str:
+  try:
+    data = base64.b64decode(EXCEPTION_DISCORD_WEBHOOK_OBFUSCATED)
+    decoded = bytes(
+      byte ^ EXCEPTION_DISCORD_WEBHOOK_KEY[index % len(EXCEPTION_DISCORD_WEBHOOK_KEY)]
+      for index, byte in enumerate(data)
+    )
+    return decoded.decode("utf-8").strip()
+  except Exception:
+    return ""
+
+
 def _exception_webhook_url() -> str:
   if os.environ.get("CARROT_EXCEPTION_DISCORD_WEBHOOK_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
     return ""
@@ -997,15 +1042,9 @@ def _exception_webhook_url() -> str:
     value = _read_param(key)
     if value:
       return value
-  try:
-    data = base64.b64decode(EXCEPTION_DISCORD_WEBHOOK_OBFUSCATED)
-    decoded = bytes(
-      byte ^ EXCEPTION_DISCORD_WEBHOOK_KEY[index % len(EXCEPTION_DISCORD_WEBHOOK_KEY)]
-      for index, byte in enumerate(data)
-    )
-    return decoded.decode("utf-8").strip()
-  except Exception:
+  if not _community_data_sharing_enabled():
     return ""
+  return _default_exception_webhook_url()
 
 
 def _exception_repo_url() -> str:
@@ -1154,7 +1193,13 @@ def _post_json(url: str, payload: dict, timeout: int = 12) -> dict:
   return _request_result(request, timeout)
 
 
-def _post_tmux_upload(url: str, headers: dict[str, str], payload: dict[str, str], raw: bytes) -> dict:
+def _post_tmux_upload(
+  url: str,
+  headers: dict[str, str],
+  payload: dict[str, str],
+  raw: bytes,
+  request_allowed: Callable[[], bool] | None = None,
+) -> dict:
   body, boundary = _multipart_form(payload, [("files[0]", "tmux.log", "text/plain", raw)])
   request = urllib.request.Request(url, data=body, headers={
     **headers,
@@ -1162,6 +1207,14 @@ def _post_tmux_upload(url: str, headers: dict[str, str], payload: dict[str, str]
     "Accept": "application/json",
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
+  if request_allowed is not None and not request_allowed():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
   return _request_result(request, 30)
 
 
@@ -1189,8 +1242,18 @@ def _send_tmux_dsm(payload: dict[str, str], raw: bytes) -> dict:
 
 
 def _send_tmux_carrot_logs(payload: dict[str, str], raw: bytes) -> dict:
+  if not _community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
   try:
-    return _post_tmux_upload(_carrot_logs_url(), {}, payload, raw)
+    return _post_tmux_upload(
+      _carrot_logs_url(), {}, payload, raw, _community_data_sharing_enabled,
+    )
   except Exception as exc:
     return {"configured": True, "ok": False, "error": str(exc)}
 
@@ -1199,6 +1262,14 @@ def _send_tmux_discord(reason: str, raw: bytes | None = None, web_result: dict |
   url = _exception_webhook_url()
   if not url or not url.startswith(("http://", "https://")):
     return {"configured": bool(url), "ok": False, "error": "Discord webhook is not configured"}
+  if url == _default_exception_webhook_url() and not _community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
   if raw is None:
     try:
       raw = Path(TMUX_LOG_PATH).read_bytes()
@@ -1226,6 +1297,14 @@ def _send_tmux_discord(reason: str, raw: bytes | None = None, web_result: dict |
     "Accept": "application/json",
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
+  if url == _default_exception_webhook_url() and not _community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
   result = _request_result(request, 12)
   result.pop("body", None)
   return result
@@ -1305,6 +1384,13 @@ def _send_support_webhook(payload: dict) -> dict:
   url = _support_webhook_url()
   if not url or not url.startswith(("http://", "https://")):
     return {"configured": bool(url), "ok": False, "skipped": True}
+  if url == _default_support_webhook_url() and not _community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+    }
   body = json.dumps({
     "username": "Carrot Support",
     "content": _support_message(payload),
@@ -1317,6 +1403,13 @@ def _send_support_webhook(payload: dict) -> dict:
     # Discord rejects urllib's default Python-urllib user agent with HTTP 403.
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
+  if url == _default_support_webhook_url() and not _community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+    }
   try:
     with urllib.request.urlopen(req, timeout=12) as resp:
       return {"configured": True, "ok": 200 <= resp.status < 300, "status": resp.status}

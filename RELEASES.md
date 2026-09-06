@@ -1,3 +1,9 @@
+dkcarrot-wip (2026-09-06)
+========================
+* Keep prepared branch updates installable while Carrot Web checks Git status
+* Focus the device target-branch picker on dkcarrot-wip and compatibility branches
+* Add powered manual updates and KA4 stock-SCC validation support
+
 carrot (2026-06-22)
 ========================
 * Update comma 4 system components (AGNOS, camera pipeline, and model runtime)

@@ -175,19 +175,40 @@ class GitBranchStatusProvider:
         return None
 
     def _behind_count(self, remote_name: str, remote_branch: str) -> int | None:
-        tracking_ref = f"refs/remotes/{remote_name}/{remote_branch}"
-        fetch_result = self._git(
-            "fetch",
-            "--quiet",
-            "--prune",
+        remote_ref = f"refs/heads/{remote_branch}"
+        remote_result = self._git(
+            "ls-remote",
+            "--heads",
             remote_name,
-            f"+refs/heads/{remote_branch}:{tracking_ref}",
+            remote_ref,
             timeout_s=self.command_timeout_s,
         )
-        if fetch_result.returncode != 0:
+        if remote_result.returncode != 0:
             return None
 
-        result = self._git("rev-list", "--count", f"HEAD..{tracking_ref}", timeout_s=1.0)
+        remote_head = ""
+        for line in remote_result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == remote_ref:
+                remote_head = parts[0]
+                break
+        if not remote_head:
+            return None
+
+        head_result = self._git("rev-parse", "HEAD", timeout_s=1.0)
+        if head_result.returncode != 0:
+            return None
+        if head_result.stdout.strip() == remote_head:
+            return 0
+
+        # ls-remote does not download objects. Count exactly when the remote
+        # commit is already local; otherwise report one available update until
+        # the user explicitly pulls/fetches it.
+        object_result = self._git("cat-file", "-e", f"{remote_head}^{{commit}}", timeout_s=1.0)
+        if object_result.returncode != 0:
+            return 1
+
+        result = self._git("rev-list", "--count", f"HEAD..{remote_head}", timeout_s=1.0)
         if result.returncode != 0:
             return None
         try:

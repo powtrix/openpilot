@@ -5,6 +5,7 @@ import os
 import re
 import time
 
+from ...community_data import community_data_sharing_enabled
 from .git_state import read_auto_update_state, write_auto_update_event, write_git_pull_time
 from .git_status import REPO_DIR, clear_git_status_cache, get_git_status
 from .web_settings import read_web_settings
@@ -259,7 +260,8 @@ async def _notify_cwp(old_head: str) -> None:
     post_json,
   )
 
-  if not old_head:
+  params = Params()
+  if not old_head or not community_data_sharing_enabled(params):
     return
 
   rc, new_head = await _git(["rev-parse", "HEAD"], GIT_INFO_TIMEOUT)
@@ -286,7 +288,7 @@ async def _notify_cwp(old_head: str) -> None:
   notify_url = os.environ.get("CWEB_PUSH_NOTIFY_URL") or _default_notify_url(report_url)
 
   payload = {
-    "deviceId": device_id(Params()),
+    "deviceId": device_id(params),
     "branch": branch,
     "count": len(commits),
     "head": new_head[:7],
@@ -299,7 +301,15 @@ async def _notify_cwp(old_head: str) -> None:
   if token:
     payload["token"] = token
 
-  ok, status, _ = await asyncio.to_thread(post_json, notify_url, payload, NOTIFY_TIMEOUT)
+  def post_if_still_allowed() -> tuple[bool, int, str] | None:
+    if not community_data_sharing_enabled(params):
+      return None
+    return post_json(notify_url, payload, NOTIFY_TIMEOUT)
+
+  result = await asyncio.to_thread(post_if_still_allowed)
+  if result is None:
+    return
+  ok, status, _ = result
   print(f"[auto_update] notify {'sent' if ok else 'failed'} commits={len(commits)} http={status}", flush=True)
 
 

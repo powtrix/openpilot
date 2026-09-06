@@ -8,7 +8,7 @@ from typing import Any
 REPO_DIR = "/data/openpilot"
 GIT_STATUS_TTL = 600.0
 GIT_STATUS_POLL_INTERVAL = 60.0
-FETCH_TIMEOUT = 25.0
+REMOTE_TIMEOUT = 25.0
 GIT_TIMEOUT = 8.0
 
 _cache: dict[str, Any] | None = None
@@ -16,7 +16,7 @@ _lock: asyncio.Lock | None = None
 
 
 def _now() -> float:
-  return time.time()
+  return time.time()  # noqa: TID251 - API consumers require a Unix timestamp
 
 
 def _lock_for_loop() -> asyncio.Lock:
@@ -52,7 +52,7 @@ async def _git(args: list[str], timeout: float = GIT_TIMEOUT) -> tuple[int, str]
     out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     out = (out_bytes or b"").decode("utf-8", "replace").strip()
     return int(proc.returncode or 0), out
-  except asyncio.TimeoutError:
+  except TimeoutError:
     return 124, "timeout"
   except Exception as exc:
     return 1, str(exc)
@@ -110,12 +110,6 @@ async def _read_status() -> dict[str, Any]:
   remote_branch = tracking["remote_branch"]
   upstream = tracking["upstream"]
 
-  fetch_rc = 0
-  fetch_out = ""
-  if remote and remote_branch:
-    refspec = f"+refs/heads/{remote_branch}:refs/remotes/{remote}/{remote_branch}"
-    fetch_rc, fetch_out = await _git(["fetch", "--quiet", remote, refspec], timeout=FETCH_TIMEOUT)
-
   if not upstream:
     return {
       "available": False,
@@ -130,23 +124,72 @@ async def _read_status() -> dict[str, Any]:
       "remote_branch": remote_branch,
       "checked_at": int(_now()),
       "error": "no upstream branch",
-      "fetch_error": fetch_out if fetch_rc != 0 else "",
+      "fetch_error": "",
     }
 
-  rc, counts = await _git(["rev-list", "--left-right", "--count", f"HEAD...{upstream}"])
-  if rc != 0:
-    return _error_state(counts or "failed to compare git refs", branch=branch, upstream=upstream)
+  # Query the advertised branch head without fetching into the live checkout.
+  # A normal fetch writes FETCH_HEAD, refs, logs, and objects under .git; the
+  # launcher intentionally treats those writes as a local modification and
+  # refuses to activate a prepared safe-staging update.
+  remote_ref = f"refs/heads/{remote_branch}"
+  remote_rc, remote_out = await _git(
+    ["ls-remote", "--heads", remote, remote_ref],
+    timeout=REMOTE_TIMEOUT,
+  )
+  if remote_rc != 0:
+    return _error_state(
+      remote_out or "failed to query remote branch",
+      branch=branch,
+      head=head,
+      upstream=upstream,
+      remote=remote,
+      remote_branch=remote_branch,
+      fetch_error=remote_out,
+    )
 
-  parts = counts.split()
-  ahead = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-  behind = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-  target_head = await _git_text(["rev-parse", upstream])
+  target_head = ""
+  for line in remote_out.splitlines():
+    parts = line.split()
+    if len(parts) == 2 and parts[1] == remote_ref:
+      target_head = parts[0]
+      break
+  if not target_head:
+    return _error_state(
+      f"remote branch not found: {remote_branch}",
+      branch=branch,
+      head=head,
+      upstream=upstream,
+      remote=remote,
+      remote_branch=remote_branch,
+      fetch_error="",
+    )
+
+  counts_exact = True
+  if target_head == head:
+    ahead = behind = 0
+  else:
+    # Exact counts are possible when the advertised commit is already in the
+    # local object store. Otherwise report at least one remote change without
+    # downloading anything; an explicit pull/update performs the real fetch.
+    object_rc, _ = await _git(["cat-file", "-e", f"{target_head}^{{commit}}"])
+    if object_rc == 0:
+      rc, counts = await _git(["rev-list", "--left-right", "--count", f"HEAD...{target_head}"])
+      if rc != 0:
+        return _error_state(counts or "failed to compare git refs", branch=branch, upstream=upstream)
+      parts = counts.split()
+      ahead = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+      behind = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    else:
+      counts_exact = False
+      ahead = 0
+      behind = 1
 
   return {
-    "available": fetch_rc == 0,
-    "state": "ok" if fetch_rc == 0 else "fetch_error",
+    "available": True,
+    "state": "ok",
     "behind": behind,
     "ahead": ahead,
+    "counts_exact": counts_exact,
     "branch": branch,
     "head": head,
     "target_head": target_head,
@@ -154,7 +197,7 @@ async def _read_status() -> dict[str, Any]:
     "remote": remote,
     "remote_branch": remote_branch,
     "checked_at": int(_now()),
-    "error": fetch_out if fetch_rc != 0 else "",
+    "error": "",
   }
 
 

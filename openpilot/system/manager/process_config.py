@@ -4,6 +4,7 @@ import importlib.util
 
 from openpilot.cereal import car
 from openpilot.common.params import Params
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
 from openpilot.system.hardware import PC, TICI
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 
@@ -57,6 +58,9 @@ def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
+
+def enable_cweb_push(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return community_data_sharing_enabled(params)
 
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
@@ -182,6 +186,8 @@ procs = [
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", enable_updated, enabled=not PC),
   #PythonProcess("uploader", "openpilot.system.loggerd.uploader", enable_connect),
+  # statsd only aggregates metrics on-device. Athena owns the separate network
+  # upload boundary and is gated by DkThirdPartyDataSharing.
   PythonProcess("statsd", "openpilot.system.statsd", always_run),
   PythonProcess("feedbackd", "openpilot.selfdrive.ui.feedback.feedbackd", only_onroad),
 
@@ -197,7 +203,7 @@ procs = [
   PythonProcess("carrot_navi", "openpilot.selfdrive.carrot.carrot_navi", always_run, restart_if_crash=True),
 
   PythonProcess("carrot_server", "openpilot.selfdrive.carrot.carrot_server", always_run, enabled=not CARROT_WEB_EXTERNAL),
-  PythonProcess("cweb_push", "openpilot.selfdrive.carrot.cweb_push", always_run, enabled=not PC),
+  PythonProcess("cweb_push", "openpilot.selfdrive.carrot.cweb_push", enable_cweb_push, enabled=not PC),
   PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True),
 
   #Xiaoge data broadcaster (conditional on ShareData param)

@@ -324,7 +324,8 @@ def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active, *, openpilot
   values["HDA_LFA_SymSta"] = 2 if lat_active else 0
   return [packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values, rx_counter=rx_counter)]
 
-def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudinal):
+def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudinal,
+                                   suppress_stock_scc_resume_alert=False):
   ret = []
   if CS.adrv_0x161 is not None:
     values = copy.copy(CS.adrv_0x161)
@@ -336,11 +337,10 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudina
     values["LFA_ICON"] = 2 if lat_active else 1 if lat_enabled else 0
     values["LKA_ICON"] = 4 if lat_active else 3 if lat_enabled else 0
 
-    # With stock longitudinal, preserve the received OEM alert, sound, DAW,
-    # and mute fields while replacing ADRV_0x161's lateral icons. On variants
-    # that carry this message, ALERTS_5=5 is a decoded DBC value; this code does
-    # not establish its visible-cluster or audible association. Existing ADRV
-    # field suppression is retained only when openpilot owns longitudinal.
+    # With stock longitudinal, preserve every received OEM alert, sound, DAW,
+    # and mute field while replacing ADRV_0x161's lateral icons, except for the
+    # exact KA4 resume prompt during its controller-qualified 30 s grace. The
+    # controller makes that narrow decision from current vehicle state.
     if openpilot_longitudinal:
       if values["ALERTS_2"] in [1, 2, 5, 6, 10, 21, 22]:
         values["ALERTS_2"] = 0
@@ -357,6 +357,9 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC, *, openpilot_longitudina
 
       if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
         values["ALERTS_5"] = 0
+
+    elif suppress_stock_scc_resume_alert and values.get("ALERTS_5") == 5:
+      values["ALERTS_5"] = 0
 
     ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter=rx_counter))
   return ret
