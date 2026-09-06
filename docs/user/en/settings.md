@@ -29,7 +29,7 @@ For example, if the device IP is `192.168.0.25`, open:
 
 See [Carrot Web](https://github.com/ajouatom/openpilot/wiki/Guide-Carrot-Web) for connection troubleshooting and an overview of the other screens.
 
-Carrot Web has no user login and trusts devices on the local network. Use a private WPA2/WPA3 tether or hotspot with a strong unique password; do not expose ports 7000 or 6999 to the internet or use Carrot Web on public Wi-Fi. Enabling either high-risk data-sharing setting requires an exact same-origin request from a private IP plus a fresh short-lived one-use Web session. This mitigates browser CSRF and public-host DNS rebinding, but does not authenticate another client already on that network. Phone tethering can use mobile data for automatic uploads.
+Carrot Web has no user login and trusts devices on the local network. Use a private WPA2/WPA3 tether or hotspot with a strong unique password; do not expose ports 7000 or 6999 to the internet or use Carrot Web on public Wi-Fi. Enabling `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, or `CarrotValidationAutoUpload` requires an exact same-origin request from a private IP plus a fresh short-lived one-use Web session. This mitigates browser CSRF and public-host DNS rebinding, but does not authenticate another client already on that network. Phone tethering can use mobile data for automatic uploads.
 
 ## Using the Settings screen
 
@@ -103,28 +103,28 @@ The current `carrot_settings.json` contains **177 parameters**. Every entry is a
 
 | Category | Count | Groups |
 |---|---:|---|
-| Driving control | 112 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
+| Driving control | 111 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
 | Vehicle and hardware | 14 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
 | Display | 37 | Information, path, brightness/on-road view, external HUD |
-| System | 14 | Recording/power, camera, network/map, sound, software |
+| System | 15 | Recording/power, camera, network/map, sound, software |
 
 ## Driving control
 
-These 112 settings can affect vehicle motion. Change one item at a time.
+These 111 settings can affect vehicle motion. Change one item at a time.
 
 <a id="start-auto"></a>
-### Startup and auto — 10 settings
+### Startup and auto — 9 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | Startup | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | Always-on lateral control, automatic engagement, and low-speed steering limits |
-| Auto cruise | `AutoCruiseControl`, `SoftHoldOnCancel`, `Ka4StockSccStandstillRearm`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | Automatic cruise activation, soft hold after cancel, and experimental KA4 stock-SCC behavior |
+| Auto cruise | `AutoCruiseControl`, `SoftHoldOnCancel`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | Automatic cruise activation and soft hold after cancel |
 
 - `AlwaysLateral` permits lateral control even when cruise is not engaged.
 - `AutoEngage`: `0` off, `1` lateral on, `2` lateral on with cruise ready.
 - `AutoCruiseControl` covers Hyundai/Kia auto-cruise and soft-hold behavior.
 - `SoftHoldOnCancel` permits soft hold after stopping while cruise is canceled.
-- `Ka4StockSccStandstillRearm` is documented with its exact topology and interlocks under [KA4 stock-SCC standstill extension](buttons-presets.md#ka4-stock-scc-standstill).
+- The 2023 KA4 stock-SCC standstill behavior is applied automatically by vehicle topology, without a separate switch. Its scope and limits are documented under [KA4 stock-SCC standstill extension](buttons-presets.md#ka4-stock-scc-standstill).
 - `DisableMinSteerSpeed` is vehicle-specific and relates to low-speed steering restrictions on SMDPS-equipped cars.
 
 ### Buttons and presets — 15 settings
@@ -276,18 +276,20 @@ The Replay event timeline also identifies Carrot Navi connection and route-sessi
 <a id="system"></a>
 ## System
 
-The 14 system settings cover recording, power, cameras, network, maps, sound, and software menus.
+The 15 system settings cover recording, power, cameras, network, maps, sound, and software menus.
 
 | Group | Parameters | Purpose |
 |---|---|---|
-| Recording and power | `RecordRoadCam`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | Road-camera storage, Carrot community data sharing, automatic KA4 validation-log upload, and delayed shutdown |
+| Recording and power | `RecordRoadCam`, `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | Road-camera storage, master external log/diagnostic consent, Carrot community data sharing, automatic KA4 validation-log upload, and delayed shutdown |
 | YouTube Live | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | Video streaming, quality, and timestamp |
 | Camera | `UseWideCamera` | Input fallback for a failed wide road camera |
 | Network and map | `HotspotOnBoot`, `MapboxStyle` | Boot hotspot and map background style |
 | Sound | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | Prompt language and volume |
 | Software | `SoftwareMenu` | Software-update menu availability |
 
-`CarrotCommunityDataSharing` is off by default. Explicitly enabling it while parked permits Carrot community services to receive device identifiers, vehicle name, branch/commit, local network address and heartbeat status, all setting values and the catalog, automatic onroad/exception tmux diagnostics, and setting snapshots. It also permits popular-setting downloads, CWP address registration, and bundled Discord notifications for Support Terminal, Vision diagnostics, and manual dashcam-upload completion. Turning it off immediately blocks new community requests and automatic tmux collection/retries, and discards pending automatic exception uploads. A user-configured NAS or Discord URL and an explicitly started manual dashcam upload itself remain independent, but its bundled Discord completion notification is blocked. `CarrotValidationAutoUpload` below is also independent because it has separate consent and a fixed private-NAS receiver. This consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically.
+`DkThirdPartyDataSharing` is the master consent for automatic log and diagnostic transfers to outside third-party services, and is off by default. Confirming it while safely parked permits the comma Athena remote connection; completed cloudlogs and statistics; location, device, and exception details in logs; server-requested rlog/qlog/qcamera and camera files; live messages, snapshots, SIM and nearby-network information; remote SSH; Prime/Firehose status; Sentry; and the stock uploader. Transfers are not reconfirmed file by file, and phone tethering may use mobile data. Turning it off closes Athena, aborts automatic transfers, and discards the old Athena upload queue. Local driving logs and storage cleanup, separately consented KA4 automatic validation to the fixed private NAS, and explicitly started personal-NAS, Discord, or dashcam uploads remain independent. Git updates, online routing/maps, GPS/time assistance, first-time registration, YouTube Live, and a user-started support tunnel are separate internet features. The consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically, and no vehicle-control setting is changed.
+
+`CarrotCommunityDataSharing` is off by default and works only while both it and `DkThirdPartyDataSharing` are enabled. Explicitly enabling it while parked permits Carrot community services to receive device identifiers, vehicle name, branch/commit, local network address and heartbeat status, all setting values and the catalog, automatic onroad/exception tmux diagnostics, and setting snapshots. It also permits popular-setting downloads, CWP address registration, and bundled Discord notifications for Support Terminal, Vision diagnostics, and manual dashcam-upload completion. Turning either setting off immediately blocks new community requests and automatic tmux collection/retries, and discards pending automatic exception uploads. A user-configured NAS or Discord URL and an explicitly started manual dashcam upload itself remain independent, but its bundled Discord completion notification is blocked. `CarrotValidationAutoUpload` below is also independent because it has separate consent and a fixed private-NAS receiver. This consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically.
 
 `CarrotValidationAutoUpload` is off by default, and this experimental campaign arms only on the owner's allowlisted DK device; the branch stores only a one-way hash of its identifier. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It can handle at most 3 full rlogs per event capture and 14 captures / 42 full rlogs per campaign, with at most 5 captures / 750 MiB pending at once. The 750 MiB concurrent-pending cap does not limit cumulative uploads or retry traffic; after the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. Uploads use only the receiver built into the branch or fixed at deployment time; the ordinary Web upload destination cannot redirect them. The setting row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
 

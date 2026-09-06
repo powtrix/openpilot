@@ -186,6 +186,8 @@ procs = [
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", enable_updated, enabled=not PC),
   #PythonProcess("uploader", "openpilot.system.loggerd.uploader", enable_connect),
+  # statsd only aggregates metrics on-device. Athena owns the separate network
+  # upload boundary and is gated by DkThirdPartyDataSharing.
   PythonProcess("statsd", "openpilot.system.statsd", always_run),
   PythonProcess("feedbackd", "openpilot.selfdrive.ui.feedback.feedbackd", only_onroad),
 

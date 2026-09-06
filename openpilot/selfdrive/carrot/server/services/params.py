@@ -67,9 +67,11 @@ QR_BACKUP_WHEEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".
 _qr_dependency_lock = threading.Lock()
 VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
 COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing"
+THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing"
 BACKUP_EXCLUDED_PARAMS = frozenset({
   VALIDATION_AUTO_UPLOAD_PARAM,
   COMMUNITY_DATA_SHARING_PARAM,
+  THIRD_PARTY_DATA_SHARING_PARAM,
 })
 
 
@@ -395,7 +397,8 @@ def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]
 
 def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *,
                     allow_validation_auto_upload_enable: bool = False,
-                    allow_community_data_sharing_enable: bool = False) -> None:
+                    allow_community_data_sharing_enable: bool = False,
+                    allow_third_party_data_sharing_enable: bool = False) -> None:
   if (
     name == VALIDATION_AUTO_UPLOAD_PARAM
     and not _explicit_consent_is_disabled(value)
@@ -408,6 +411,12 @@ def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *
     and not allow_community_data_sharing_enable
   ):
     raise PermissionError("Carrot community data sharing requires explicit consent")
+  if (
+    name == THIRD_PARTY_DATA_SHARING_PARAM
+    and not _explicit_consent_is_disabled(value)
+    and not allow_third_party_data_sharing_enable
+  ):
+    raise PermissionError("automatic third-party data sharing requires explicit consent")
 
   if not HAS_PARAMS:
     _mem_store[name] = str(value)

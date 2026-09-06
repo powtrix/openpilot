@@ -119,6 +119,7 @@ PARAMS_DIR = "/data/params"
 DEFAULT_WEB_UPLOAD_URL = "https://adot.synology.me"
 DEFAULT_TMUX_WEB_UPLOAD_URL = "https://tmux.carrotpilot.app/upload"
 COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing"
+THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing"
 CWP_RECOVERY_BOOT_PARAM = "CwebPushRecoveryBoot"
 CWP_REPORT_URL_KEY = 23
 CWP_REPORT_URL_BYTES = (
@@ -853,7 +854,10 @@ def _read_param(key: str, default: str = "") -> str:
 
 def _community_data_sharing_enabled() -> bool:
   """Fail closed without importing openpilot from the recovery process."""
-  return _read_param(COMMUNITY_DATA_SHARING_PARAM) == "1"
+  return (
+    _read_param(THIRD_PARTY_DATA_SHARING_PARAM) == "1"
+    and _read_param(COMMUNITY_DATA_SHARING_PARAM) == "1"
+  )
 
 
 def _support_webhook_url() -> str:

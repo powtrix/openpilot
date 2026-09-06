@@ -311,11 +311,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"IsLdwsCar", {PERSISTENT, INT, "0"}},
     {"CanfdHDA2", {PERSISTENT, INT, "0"}},
     {"CanfdDebug", {PERSISTENT, INT, "0"}},
-    // Hidden A/B switch for validating the unproven KA4 stock-SCC 30-second re-arm.
-    // Keep this opt-in and persistent so an explicit 0/1 survives release boots.
+    // Automatic exact-topology KA4 stock-SCC standstill behavior. The default
+    // remains zero for other vehicles; the matching controller records one as
+    // route/validation metadata. This is not a user-facing feature switch.
     {"Ka4StockSccStandstillRearm", {PERSISTENT, INT, "0"}},
     // One-time, explicit consent for the bounded KA4 validation-log campaign.
     {"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}},
+    // Master opt-in for automatic diagnostics/telemetry sent to third parties.
+    {"DkThirdPartyDataSharing", {PERSISTENT, BOOL, "0"}},
     // Explicit opt-in for automatic data exchange with Carrot community services.
     {"CarrotCommunityDataSharing", {PERSISTENT, BOOL, "0"}},
 

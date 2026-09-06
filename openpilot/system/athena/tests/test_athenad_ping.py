@@ -5,6 +5,7 @@ import time
 from typing import cast
 
 from openpilot.common.params import Params
+from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.common.timeout import Timeout
 from openpilot.system.athena import athenad
 from openpilot.system.manager.helpers import write_onroad_params
@@ -42,6 +43,7 @@ class TestAthenadPing:
 
   def setup_method(self) -> None:
     self.params = Params()
+    self.params.put_bool(DK_THIRD_PARTY_DATA_SHARING_PARAM, True)
     self.dongle_id = self.params.get("DongleId")
 
     wifi_radio(True)

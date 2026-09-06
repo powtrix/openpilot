@@ -7,6 +7,7 @@ def test_cwp_status_disables_unregistered_device(monkeypatch):
     recovery,
     "_read_param",
     lambda key, default="": "1" if key in {
+      recovery.THIRD_PARTY_DATA_SHARING_PARAM,
       recovery.COMMUNITY_DATA_SHARING_PARAM,
       recovery.CWP_RECOVERY_BOOT_PARAM,
     } else default,
@@ -61,6 +62,7 @@ def test_cwp_boot_sends_recovery_port(monkeypatch):
     recovery,
     "_read_param",
     lambda key, default="": "1" if key in {
+      recovery.THIRD_PARTY_DATA_SHARING_PARAM,
       recovery.COMMUNITY_DATA_SHARING_PARAM,
       recovery.CWP_RECOVERY_BOOT_PARAM,
     } else default,
@@ -98,6 +100,26 @@ def test_recovery_cwp_fails_closed_without_community_consent(monkeypatch):
   direct = recovery._cwp_request("/report", {"deviceId": "device-id"})
   assert direct["ok"] is False
   assert direct["disabled_by_community_sharing"] is True
+
+
+def test_recovery_cwp_fails_closed_without_third_party_master_consent(monkeypatch):
+  monkeypatch.setattr(
+    recovery,
+    "_read_param",
+    lambda key, default="": "1" if key in {
+      recovery.COMMUNITY_DATA_SHARING_PARAM,
+      recovery.CWP_RECOVERY_BOOT_PARAM,
+    } else default,
+  )
+  monkeypatch.setattr(
+    recovery.urllib.request,
+    "urlopen",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network request must be blocked")),
+  )
+
+  status = recovery._cwp_status()
+  assert status["ok"] is False
+  assert status["disabled_by_community_sharing"] is True
 
 
 def test_recovery_page_has_short_cwp_toggle_states():

@@ -29,7 +29,7 @@ carrotpilot의 세부 설정은 **Carrot Web에서 모두 확인하고 변경하
 
 접속 문제와 다른 화면의 설명은 [Carrot Web](https://github.com/ajouatom/openpilot/wiki/Guide-Carrot-Web)을 참고하세요.
 
-Carrot Web에는 사용자 로그인이 없으며 로컬 네트워크의 장치를 신뢰합니다. 강력하고 고유한 암호를 건 개인용 WPA2/WPA3 테더링·핫스팟에서만 사용하고, 7000·6999 포트를 인터넷에 공개하거나 공용 Wi-Fi에서 Carrot Web을 열지 마세요. 두 고위험 데이터 공유 설정을 켜려면 사설 IP의 정확히 같은 출처 요청과 새로 발급한 짧은 유효시간의 일회용 Web 세션이 필요합니다. 브라우저 CSRF와 공개 호스트 DNS 재바인딩을 줄이지만 같은 네트워크에 이미 들어온 다른 클라이언트를 인증하는 기능은 아닙니다. 휴대폰 테더링은 자동 전송 시 모바일 데이터를 사용할 수 있습니다.
+Carrot Web에는 사용자 로그인이 없으며 로컬 네트워크의 장치를 신뢰합니다. 강력하고 고유한 암호를 건 개인용 WPA2/WPA3 테더링·핫스팟에서만 사용하고, 7000·6999 포트를 인터넷에 공개하거나 공용 Wi-Fi에서 Carrot Web을 열지 마세요. `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload` 중 하나를 켜려면 사설 IP의 정확히 같은 출처 요청과 새로 발급한 짧은 유효시간의 일회용 Web 세션이 필요합니다. 브라우저 CSRF와 공개 호스트 DNS 재바인딩을 줄이지만 같은 네트워크에 이미 들어온 다른 클라이언트를 인증하는 기능은 아닙니다. 휴대폰 테더링은 자동 전송 시 모바일 데이터를 사용할 수 있습니다.
 
 ## 설정 화면 사용법
 
@@ -103,28 +103,28 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 | 대분류 | 항목 수 | 중분류 |
 |---|---:|---|
-| 주행 제어 | 112 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
+| 주행 제어 | 111 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
 | 차량·하드웨어 | 14 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
 | 화면 표시 | 37 | 정보 표시, 경로 표시, 밝기·주행화면, 외부 HUD |
-| 시스템 | 14 | 녹화·전원, 카메라, 네트워크·지도, 사운드, 소프트웨어 |
+| 시스템 | 15 | 녹화·전원, 카메라, 네트워크·지도, 사운드, 소프트웨어 |
 
 ## 주행 제어
 
-주행 제어는 차량 움직임에 영향을 줄 수 있는 112개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
+주행 제어는 차량 움직임에 영향을 줄 수 있는 111개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
 
 <a id="start-auto"></a>
-### 시작·오토 — 10개
+### 시작·오토 — 9개
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
 | 시작 동작 | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | 상시 조향, 주행 시작 시 자동 활성화, 저속 조향 제한 |
-| 오토크루즈 | `AutoCruiseControl`, `SoftHoldOnCancel`, `Ka4StockSccStandstillRearm`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | 크루즈 자동 활성화, 취소 후 소프트홀드와 KA4 순정 SCC 시험 동작 |
+| 오토크루즈 | `AutoCruiseControl`, `SoftHoldOnCancel`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | 크루즈 자동 활성화와 취소 후 소프트홀드 |
 
 - `AlwaysLateral`: 크루즈가 켜져 있지 않아도 조향 제어를 허용합니다.
 - `AutoEngage`: `0` 끄기, `1` 조향 ON, `2` 조향 ON과 크루즈 대기입니다.
 - `AutoCruiseControl`: 현대·기아 차량용 오토크루즈와 소프트홀드 관련 설정입니다.
 - `SoftHoldOnCancel`: 크루즈가 취소된 상태에서도 정차 후 소프트홀드를 허용할지 정합니다.
-- `Ka4StockSccStandstillRearm`: 정확한 적용 범위와 인터록은 [버튼·프리셋의 KA4 시험 설명](buttons-presets.md#ka4-stock-scc-standstill)을 확인하세요.
+- 2023년식 KA4 순정 SCC 정차 동작은 별도 스위치 없이 차량 구성에 따라 자동 적용됩니다. 범위와 제한은 [버튼·프리셋의 KA4 시험 설명](buttons-presets.md#ka4-stock-scc-standstill)을 확인하세요.
 - `DisableMinSteerSpeed`: SMDPS 장착 차량의 저속 조향 제한과 관련된 차량별 설정입니다.
 
 ### 버튼·프리셋 — 15개
@@ -287,11 +287,11 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 <a id="system"></a>
 ## 시스템
 
-시스템에는 녹화, 전원, 카메라, 네트워크, 지도, 소리와 소프트웨어 메뉴를 다루는 14개 항목이 있습니다.
+시스템에는 녹화, 전원, 카메라, 네트워크, 지도, 소리와 소프트웨어 메뉴를 다루는 15개 항목이 있습니다.
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
-| 녹화·전원 | `RecordRoadCam`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | 도로 카메라 저장, Carrot 커뮤니티 데이터 공유, KA4 검증 로그 자동 전송과 시동 OFF 후 자동 전원 종료 시간 |
+| 녹화·전원 | `RecordRoadCam`, `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | 도로 카메라 저장, 외부 자동 로그·진단 전체 동의, Carrot 커뮤니티 데이터 공유, KA4 검증 로그 자동 전송과 시동 OFF 후 자동 전원 종료 시간 |
 | YouTube 라이브 | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | 카메라 영상 송출, 품질과 타임스탬프 |
 | 카메라 | `UseWideCamera` | 광각 전방 카메라 고장 시의 입력 대체 |
 | 네트워크·지도 | `HotspotOnBoot`, `MapboxStyle` | 부팅 시 핫스팟과 지도 배경 스타일 |
@@ -299,7 +299,8 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 | 소프트웨어 | `SoftwareMenu` | 소프트웨어 업데이트 메뉴 활성화 |
 
 - `RecordRoadCam`: `0` 녹화 안 함, `1` 일반 카메라, `2` 일반+광각 카메라입니다. 저장 공간 사용량을 확인하세요.
-- `CarrotCommunityDataSharing`: 기본값은 꺼짐입니다. 주차 상태에서 명시적으로 켜면 장치 식별자·차량명·브랜치/커밋·로컬 네트워크 주소와 상태 heartbeat, 전체 설정값과 카탈로그, 자동 onroad/예외 tmux 진단 및 설정 스냅샷을 Carrot 커뮤니티 서버나 내장 Discord로 보낼 수 있고, 인기 설정값 다운로드와 CWP 주소 등록을 허용합니다. 지원 터미널·Vision 진단·수동 대시캠 전송 완료가 내장 Discord 알림을 쓸 때도 필요합니다. 끄면 새 커뮤니티 요청과 자동 tmux 수집·재시도를 즉시 막고 대기 중인 자동 예외 전송을 버립니다. 사용자가 직접 지정한 NAS·Discord 주소와 명시적으로 시작한 수동 대시캠 전송 자체는 별개이지만 내장 Discord 완료 알림은 차단됩니다. 아래 `CarrotValidationAutoUpload`도 고정된 개인 NAS와 별도 동의를 사용하므로 이 설정을 꺼도 독립적으로 동작합니다. 동의 값은 설정 백업·프로필·QR에 저장되지 않으며 이미 전송된 자료는 자동 삭제되지 않습니다.
+- `DkThirdPartyDataSharing`: 외부 제3자 서비스의 자동 로그·진단 전송을 허용하는 상위 동의이며 기본값은 꺼짐입니다. 안전하게 주차한 상태에서 확인 창에 동의해 켜면 comma Athena 원격 연결, 완료된 cloudlog·통계, 로그에 담긴 위치·장치·예외 정보, 서버가 요청하는 rlog/qlog/qcamera·카메라 파일, 실시간 메시지·스냅샷·SIM/주변 네트워크 정보, 원격 SSH, Prime/Firehose 상태, Sentry와 stock uploader를 허용합니다. 파일마다 다시 확인하지 않으며 휴대폰 테더링 데이터를 쓸 수 있습니다. 끄면 Athena 연결과 진행 중인 자동 전송을 중단하고 기존 Athena 업로드 큐를 폐기합니다. 로컬 주행 로그·저장공간 정리, 별도 동의가 필요한 고정 개인 NAS의 KA4 자동 검증, 사용자가 직접 시작한 개인 NAS·Discord·대시캠 전송은 독립적입니다. Git 업데이트, 온라인 길찾기·지도, GPS/시간 보조, 최초 등록, YouTube Live와 직접 시작한 지원 터널도 별도 인터넷 기능입니다. 이 동의는 설정 백업·프로필·QR에 저장되지 않고 이미 보낸 자료를 자동 삭제하지 않으며 차량 제어 설정을 바꾸지 않습니다.
+- `CarrotCommunityDataSharing`: 기본값은 꺼짐이며 `DkThirdPartyDataSharing`과 이 설정이 모두 켜져야 동작합니다. 주차 상태에서 명시적으로 켜면 장치 식별자·차량명·브랜치/커밋·로컬 네트워크 주소와 상태 heartbeat, 전체 설정값과 카탈로그, 자동 onroad/예외 tmux 진단 및 설정 스냅샷을 Carrot 커뮤니티 서버나 내장 Discord로 보낼 수 있고, 인기 설정값 다운로드와 CWP 주소 등록을 허용합니다. 지원 터미널·Vision 진단·수동 대시캠 전송 완료가 내장 Discord 알림을 쓸 때도 필요합니다. 둘 중 하나를 끄면 새 커뮤니티 요청과 자동 tmux 수집·재시도를 즉시 막고 대기 중인 자동 예외 전송을 버립니다. 사용자가 직접 지정한 NAS·Discord 주소와 명시적으로 시작한 수동 대시캠 전송 자체는 별개이지만 내장 Discord 완료 알림은 차단됩니다. 아래 `CarrotValidationAutoUpload`도 고정된 개인 NAS와 별도 동의를 사용하므로 두 공유 설정을 꺼도 독립적으로 동작합니다. 동의 값은 설정 백업·프로필·QR에 저장되지 않으며 이미 전송된 자료는 자동 삭제되지 않습니다.
 - `CarrotValidationAutoUpload`: 기본값은 꺼짐이며 이 시험 캠페인은 소유자의 허용 목록에 등록된 DK 장치에서만 준비되고 브랜치에는 장치 식별자의 단방향 해시만 저장합니다. 주차 중 한 번 동의하면 최대 7일 동안 해당 KA4 시험 조건의 로그 선택과 주행 후 Wi-Fi 전송을 로그별 재확인 없이 자동 처리합니다. 이벤트 캡처당 최대 3개, 캠페인당 최대 14개 캡처/42개 full rlog를 다루며 동시에 대기하는 큐는 최대 5개 캡처/750 MiB입니다. 750 MiB는 동시 대기 한도라 누적 전송량이나 재시도 데이터 사용량은 이를 넘을 수 있고, 서버의 장치별 일일 1 GiB 한도에 도달하면 보존한 로그를 다음 날 재시도할 수 있습니다. 브랜치에 내장되거나 배포 시 고정된 수신 서버만 사용하며 Carrot Web의 일반 전송 목적지로 우회할 수 없습니다. 설정 줄에는 정리된 대기 상태가 표시됩니다. 휴대폰 테더링은 모바일 데이터를 쓸 수 있고 설정을 꺼도 이미 서버에 전송된 자료는 자동 삭제되지 않습니다. 전체 범위와 개인정보는 [분석용 대시캠 로그 전송](dashcam-log-sharing.md#automatic-validation-upload)을 먼저 확인하세요.
 - `MaxTimeOffroadMin`: 시동이 꺼진 뒤 장치가 자동으로 꺼질 때까지의 시간입니다.
 - `UseWideCamera`: 광각 전방 카메라가 고장 난 장치에서만 끄고 장치를 재부팅합니다.

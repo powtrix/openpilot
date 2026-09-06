@@ -177,11 +177,13 @@ def advance_detector(
 
 def test_detector_classifies_bounded_standstill_variants():
   detector = auto_upload.ValidationEventDetector()
+  # A stale compatibility Param value must not turn an exact-topology route
+  # back into one of the legacy OFF classifications.
   settings = {"Ka4StockSccStandstillRearm": 0, "PathOffset": -1, "AdjustLaneOffset": 0}
 
   assert detector.update(sample(0.0, standstill=True, v_ego=0.0), settings) == []
   events = advance_detector(detector, settings, 31.0, steady={"standstill": True, "v_ego": 0.0})
-  assert [event["condition"] for event in events] == ["standstill_off"]
+  assert [event["condition"] for event in events] == ["standstill_on_no_request"]
   assert advance_detector(detector, settings, 32.0, steady={"standstill": True, "v_ego": 0.0}) == []
 
   detector.reset()
@@ -200,18 +202,20 @@ def test_detector_classifies_bounded_standstill_variants():
     steady={"standstill": True, "v_ego": 0.0},
     final={"standstill": False, "v_ego": 1.0},
   )
-  assert [event["condition"] for event in events] == ["standstill_off_physical_res"]
+  assert [event["condition"] for event in events] == ["standstill_on_no_request"]
 
   detector.reset()
   detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
   events = advance_detector(
     detector,
     settings,
-    10.0,
+    2.0,
     steady={"standstill": True, "v_ego": 0.0},
     final={"standstill": False, "v_ego": 1.0, "physical_res_pressed": True},
   )
-  assert [event["condition"] for event in events] == ["standstill_off_physical_res"]
+  assert [event["condition"] for event in events] == ["standstill_on_no_request"]
+  assert events[0]["duration"] < auto_upload.SHORT_STOP_MIN_SECONDS
+  assert events[0]["trigger"] == "stop_ended_before_keepalive_request"
 
   detector.reset()
   detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
@@ -319,11 +323,35 @@ def test_detector_rearms_when_event_was_not_durably_recorded():
   settings = {"Ka4StockSccStandstillRearm": 0, "PathOffset": -1, "AdjustLaneOffset": 0}
   detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
   events = advance_detector(detector, settings, 31.0, steady={"standstill": True, "v_ego": 0.0})
-  assert [event["condition"] for event in events] == ["standstill_off"]
+  assert [event["condition"] for event in events] == ["standstill_on_no_request"]
 
-  detector.nack("standstill_off")
+  detector.nack("standstill_on_no_request")
   retried = detector.update(sample(31.1, standstill=True, v_ego=0.0), settings)
-  assert [event["condition"] for event in retried] == ["standstill_off"]
+  assert [event["condition"] for event in retried] == ["standstill_on_no_request"]
+
+
+def test_campaign_condition_partition_keeps_legacy_ids_restore_only():
+  assert auto_upload.TARGET_CONDITIONS == {
+    "standstill_on",
+    "lane_offset_10",
+    "stock_scc_close_accel",
+  }
+  assert auto_upload.OPTIONAL_CONDITIONS == {
+    "standstill_on_no_request",
+    "lane_offset_0",
+  }
+  assert auto_upload.LEGACY_CONDITIONS == {
+    "standstill_off",
+    "standstill_off_physical_res",
+  }
+  assert auto_upload.TARGET_CONDITIONS.isdisjoint(auto_upload.OPTIONAL_CONDITIONS)
+  assert auto_upload.TARGET_CONDITIONS.isdisjoint(auto_upload.LEGACY_CONDITIONS)
+  assert auto_upload.OPTIONAL_CONDITIONS.isdisjoint(auto_upload.LEGACY_CONDITIONS)
+  assert auto_upload.CAPTURE_CONDITIONS == (
+    auto_upload.TARGET_CONDITIONS
+    | auto_upload.OPTIONAL_CONDITIONS
+    | auto_upload.LEGACY_CONDITIONS
+  )
 
 
 class ActualMessageSubMaster:
@@ -470,6 +498,20 @@ def test_vehicle_gate_accepts_only_ka4_stock_radar_scc_without_longitudinal():
     assert accepted is False
     assert metadata["reason"] == "device_not_allowed"
     assert metadata["deviceAllowed"] is False
+
+
+def test_route_settings_publish_effective_automatic_standstill_metadata():
+  params = FakeParams({
+    "Ka4StockSccStandstillRearm": 0,
+    "PathOffset": 10,
+    "AdjustLaneOffset": 0,
+  })
+
+  assert auto_upload._route_settings(params) == {
+    "Ka4StockSccStandstillRearm": 1,
+    "PathOffset": 10,
+    "AdjustLaneOffset": 0,
+  }
 
 
 def _make_segment(root: Path, route: str, index: int, *, locked=False, size=8) -> str:
@@ -862,14 +904,14 @@ def test_required_capture_can_evict_oldest_optional_without_losing_shared_owner(
   state["queue"] = [
     {
       "id": "optional",
-      "condition": "stock_scc_close_accel",
+      "condition": "standstill_on_no_request",
       "segments": [shared],
       "owned_preserve": [shared],
       "created_at": 1,
     },
     {
       "id": "required",
-      "condition": "standstill_off",
+      "condition": "stock_scc_close_accel",
       "segments": [shared],
       "owned_preserve": [],
       "created_at": 2,
@@ -890,7 +932,7 @@ def test_required_capture_evicts_optional_capture_to_fit_byte_budget(tmp_path, m
   state["campaign"] = {"id": "campaign", "base_url": "https://upload.example"}
   state["queue"] = [{
     "id": "optional",
-    "condition": "stock_scc_close_accel",
+    "condition": "standstill_on_no_request",
     "route": route,
     "segments": [optional_segment],
     "owned_preserve": [optional_segment],
@@ -905,7 +947,7 @@ def test_required_capture_evicts_optional_capture_to_fit_byte_budget(tmp_path, m
     "settings": {},
     "identity": {},
     "events": [{
-      "condition": "standstill_off",
+      "condition": "stock_scc_close_accel",
       "anchor_segment": 1,
       "owned_preserve": [required_anchor],
     }],
@@ -915,7 +957,7 @@ def test_required_capture_evicts_optional_capture_to_fit_byte_budget(tmp_path, m
   result, changed = auto_upload.enqueue_active_route_captures(state, str(tmp_path), now_epoch=100)
 
   assert changed is True
-  assert [capture["condition"] for capture in result["queue"]] == ["standstill_off"]
+  assert [capture["condition"] for capture in result["queue"]] == ["stock_scc_close_accel"]
   assert result["queue"][0]["bytes"] == 16
   assert result["active_route"] is None
 

@@ -17,10 +17,12 @@ password, WebDAV, or shared storage credential is present on the vehicle.
 - The production DSM configuration sets
   `CARROT_LEGACY_UPLOADS_ENABLED=false`. Therefore the unauthenticated legacy
   dashcam/tmux session API is deliberately unavailable on the public endpoint.
-- `CarrotCommunityDataSharing` is a separate default-off switch for Carrot
-  community heartbeat, settings statistics, CWP, automatic tmux diagnostics,
-  and bundled Discord destinations. It does not authorize or redirect the
-  private KA4 validation path.
+- `DkThirdPartyDataSharing` is the default-off master permission for automatic
+  data sent to third-party services. `CarrotCommunityDataSharing` is a separate
+  subordinate permission for Carrot community heartbeat, settings statistics,
+  CWP, automatic tmux diagnostics, and bundled Discord destinations; both must
+  be on for those community paths. Neither permission authorizes or redirects
+  the separately consented private KA4 validation path.
 
 The normal Carrot Web dashcam/tmux client remains useful with an explicitly
 configured private receiver that implements its session API. The public DK

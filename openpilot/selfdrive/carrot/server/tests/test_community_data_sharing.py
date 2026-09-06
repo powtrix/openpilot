@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 import openpilot.common.params as params_module
+from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.selfdrive.carrot import community_data, cweb_push
 from openpilot.selfdrive.carrot.server.features import setting_popular_values
 from openpilot.selfdrive.carrot.server.services import auto_update, heartbeat, popular_values
@@ -12,6 +13,7 @@ class FakeParams:
   def __init__(self, sharing_value, values=None):
     self.sharing_value = sharing_value
     self.values = dict(values or {})
+    self.values.setdefault(DK_THIRD_PARTY_DATA_SHARING_PARAM, True)
 
   def get(self, key, *args, **kwargs):
     del args, kwargs
@@ -76,6 +78,15 @@ def test_community_data_gate_fails_closed_for_missing_malformed_and_errors():
 
   for value in (True, 1, b"1", "1"):
     assert community_data.community_data_sharing_enabled(FakeParams(value))
+
+
+def test_community_data_gate_also_requires_dk_master_consent():
+  for value in (None, False, 0, 2, b"", b"true", "", "true"):
+    params = FakeParams(True, {DK_THIRD_PARTY_DATA_SHARING_PARAM: value})
+    assert not community_data.community_data_sharing_enabled(params)
+
+  params = FakeParams(True, {DK_THIRD_PARTY_DATA_SHARING_PARAM: 1})
+  assert community_data.community_data_sharing_enabled(params)
 
 
 def test_heartbeat_rechecks_consent_before_urlopen(monkeypatch):

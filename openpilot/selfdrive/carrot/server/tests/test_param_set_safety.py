@@ -74,6 +74,7 @@ class FakeRuntimeParams:
     self.values = {
       params_service.VALIDATION_AUTO_UPLOAD_PARAM: 0,
       params_service.COMMUNITY_DATA_SHARING_PARAM: 0,
+      params_service.THIRD_PARTY_DATA_SHARING_PARAM: 0,
       "OrdinarySetting": 0,
     }
 
@@ -108,6 +109,7 @@ def param_runtime(monkeypatch):
   definitions = {
     params_service.VALIDATION_AUTO_UPLOAD_PARAM: {"default": 0, "min": 0, "max": 1},
     params_service.COMMUNITY_DATA_SHARING_PARAM: {"default": 0, "min": 0, "max": 1},
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM: {"default": 0, "min": 0, "max": 1},
     "OrdinarySetting": {"default": 0, "min": 0, "max": 10},
   }
   monkeypatch.setattr(params_service, "HAS_PARAMS", True)
@@ -231,8 +233,11 @@ def test_validation_auto_upload_enable_fails_closed_without_request_params(monke
   assert writes == []
 
 
-def test_community_data_sharing_enable_requires_explicit_offroad_consent(monkeypatch):
-  name = params_feature.COMMUNITY_DATA_SHARING_PARAM
+@pytest.mark.parametrize("name", [
+  params_feature.COMMUNITY_DATA_SHARING_PARAM,
+  params_feature.THIRD_PARTY_DATA_SHARING_PARAM,
+])
+def test_external_data_sharing_enable_requires_explicit_offroad_consent(monkeypatch, name):
   status, payload, writes = call_param_set(
     monkeypatch,
     previous=0,
@@ -257,8 +262,11 @@ def test_community_data_sharing_enable_requires_explicit_offroad_consent(monkeyp
   assert writes == [(name, 1)]
 
 
-def test_community_data_sharing_enable_requires_same_origin_json_marker(monkeypatch):
-  name = params_feature.COMMUNITY_DATA_SHARING_PARAM
+@pytest.mark.parametrize("name", [
+  params_feature.COMMUNITY_DATA_SHARING_PARAM,
+  params_feature.THIRD_PARTY_DATA_SHARING_PARAM,
+])
+def test_external_data_sharing_enable_requires_same_origin_json_marker(monkeypatch, name):
   writes = []
   monkeypatch.setattr(params_feature, "get_settings_cached", lambda: ({}, {}, {
     name: {"default": 0, "min": 0, "max": 1},
@@ -282,6 +290,7 @@ def test_community_data_sharing_enable_requires_same_origin_json_marker(monkeypa
 @pytest.mark.parametrize("name", [
   params_feature.VALIDATION_AUTO_UPLOAD_PARAM,
   params_feature.COMMUNITY_DATA_SHARING_PARAM,
+  params_feature.THIRD_PARTY_DATA_SHARING_PARAM,
 ])
 @pytest.mark.parametrize(("host", "origin", "fetch_site"), [
   ("192.168.50.95:7000", "http://attacker.example", "cross-site"),
@@ -398,6 +407,7 @@ def test_consent_session_endpoint_is_no_store_and_rejects_public_hostnames():
 @pytest.mark.parametrize("name", [
   params_feature.VALIDATION_AUTO_UPLOAD_PARAM,
   params_feature.COMMUNITY_DATA_SHARING_PARAM,
+  params_feature.THIRD_PARTY_DATA_SHARING_PARAM,
 ])
 @pytest.mark.filterwarnings("ignore::aiohttp.web_exceptions.NotAppKeyWarning")
 def test_actual_http_consent_get_then_high_risk_enable_post(monkeypatch, name):
@@ -465,6 +475,7 @@ def test_actual_http_consent_get_then_high_risk_enable_post(monkeypatch, name):
     {
       "allow_validation_auto_upload_enable": name == params_feature.VALIDATION_AUTO_UPLOAD_PARAM,
       "allow_community_data_sharing_enable": name == params_feature.COMMUNITY_DATA_SHARING_PARAM,
+      "allow_third_party_data_sharing_enable": name == params_feature.THIRD_PARTY_DATA_SHARING_PARAM,
     },
   )]
 
@@ -517,6 +528,7 @@ def test_consent_session_accepts_documented_private_ip_origins(host):
 @pytest.mark.parametrize("name", [
   params_feature.VALIDATION_AUTO_UPLOAD_PARAM,
   params_feature.COMMUNITY_DATA_SHARING_PARAM,
+  params_feature.THIRD_PARTY_DATA_SHARING_PARAM,
 ])
 def test_high_risk_disable_remains_available_without_web_consent_proof(monkeypatch, name):
   writes = []
@@ -618,6 +630,7 @@ def test_explicit_non_catalog_device_settings_remain_writable(monkeypatch, name)
 def test_privacy_consents_are_excluded_from_json_and_qr_exports(param_runtime):
   param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] = 1
   param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] = 1
+  param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] = 1
   param_runtime.values["OrdinarySetting"] = 7
 
   backup = params_service.get_all_param_values_for_backup()
@@ -626,20 +639,23 @@ def test_privacy_consents_are_excluded_from_json_and_qr_exports(param_runtime):
   qr = params_service.build_params_qr_payload({
     params_service.VALIDATION_AUTO_UPLOAD_PARAM: 1,
     params_service.COMMUNITY_DATA_SHARING_PARAM: 1,
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM: 1,
     "OrdinarySetting": 7,
   })
   parsed = params_service.parse_params_qr_payload(qr["payload"])
   assert qr["count"] == 1
   assert params_service.VALIDATION_AUTO_UPLOAD_PARAM not in parsed
   assert params_service.COMMUNITY_DATA_SHARING_PARAM not in parsed
+  assert params_service.THIRD_PARTY_DATA_SHARING_PARAM not in parsed
   assert parsed["OrdinarySetting"] == "7"
 
 
-def test_stale_backup_download_strips_validation_consent(tmp_path, monkeypatch):
+def test_stale_backup_download_strips_all_privacy_consents(tmp_path, monkeypatch):
   backup_path = tmp_path / "params_backup.json"
   backup_path.write_text(json.dumps({
     params_service.VALIDATION_AUTO_UPLOAD_PARAM: 1,
     params_service.COMMUNITY_DATA_SHARING_PARAM: 1,
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM: 1,
     "OrdinarySetting": 7,
   }), encoding="utf-8")
   monkeypatch.setattr(params_feature, "PARAMS_BACKUP_PATH", str(backup_path))
@@ -652,27 +668,33 @@ def test_stale_backup_download_strips_validation_consent(tmp_path, monkeypatch):
   assert response.headers["Content-Disposition"] == "attachment; filename=params_backup.json"
 
 
-def test_bulk_restore_cannot_enable_but_can_disable_validation_consent(param_runtime):
+def test_bulk_restore_cannot_enable_but_can_disable_privacy_consents(param_runtime):
   enabled = params_service.restore_param_values_from_backup({
     params_service.VALIDATION_AUTO_UPLOAD_PARAM: 1,
     params_service.COMMUNITY_DATA_SHARING_PARAM: 1,
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM: 1,
     "OrdinarySetting": 7,
   })
 
   assert enabled["ok_cnt"] == 1
   assert param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] == 0
   assert param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] == 0
+  assert param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] == 0
   assert param_runtime.values["OrdinarySetting"] == 7
 
   param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] = 1
+  param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] = 1
+  param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] = 1
   disabled = params_service.restore_param_values_from_backup({
     params_service.VALIDATION_AUTO_UPLOAD_PARAM: 0,
     params_service.COMMUNITY_DATA_SHARING_PARAM: 0,
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM: 0,
   })
 
-  assert disabled["ok_cnt"] == 2
+  assert disabled["ok_cnt"] == 3
   assert param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] == 0
   assert param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] == 0
+  assert param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] == 0
 
 
 class FakeJsonRestoreRequest:
@@ -710,31 +732,41 @@ class FakeMultipartRestoreRequest:
     return self.reader
 
 
-def test_json_restore_marks_enabled_validation_consent_skipped(param_runtime):
+@pytest.mark.parametrize("name", [
+  params_service.VALIDATION_AUTO_UPLOAD_PARAM,
+  params_service.COMMUNITY_DATA_SHARING_PARAM,
+  params_service.THIRD_PARTY_DATA_SHARING_PARAM,
+])
+def test_json_restore_marks_enabled_privacy_consent_skipped(param_runtime, name):
   response = asyncio.run(params_feature.api_params_restore_json(FakeJsonRestoreRequest({
     "values": {
-      params_service.VALIDATION_AUTO_UPLOAD_PARAM: 1,
+      name: 1,
       "OrdinarySetting": 6,
     },
   })))
   payload = json.loads(response.text)
   consent = next(
     entry for entry in payload["preview"]["entries"]
-    if entry["key"] == params_service.VALIDATION_AUTO_UPLOAD_PARAM
+    if entry["key"] == name
   )
 
   assert response.status == 200
   assert consent["status"] == "skipped"
   assert consent["apply"] is False
   assert consent["reason"] == "explicit consent required"
-  assert param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] == 0
+  assert param_runtime.values[name] == 0
   assert param_runtime.values["OrdinarySetting"] == 6
 
 
-def test_json_restore_can_disable_validation_consent(param_runtime):
-  param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] = 1
+@pytest.mark.parametrize("name", [
+  params_service.VALIDATION_AUTO_UPLOAD_PARAM,
+  params_service.COMMUNITY_DATA_SHARING_PARAM,
+  params_service.THIRD_PARTY_DATA_SHARING_PARAM,
+])
+def test_json_restore_can_disable_privacy_consent(param_runtime, name):
+  param_runtime.values[name] = 1
   response = asyncio.run(params_feature.api_params_restore_json(FakeJsonRestoreRequest({
-    "values": {params_service.VALIDATION_AUTO_UPLOAD_PARAM: 0},
+    "values": {name: 0},
   })))
   payload = json.loads(response.text)
   consent = payload["preview"]["entries"][0]
@@ -743,19 +775,24 @@ def test_json_restore_can_disable_validation_consent(param_runtime):
   assert consent["status"] == "changed"
   assert consent["apply"] is True
   assert payload["result"]["ok_cnt"] == 1
-  assert param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] == 0
+  assert param_runtime.values[name] == 0
 
 
-def test_multipart_restore_cannot_enable_validation_consent(param_runtime):
+@pytest.mark.parametrize("name", [
+  params_service.VALIDATION_AUTO_UPLOAD_PARAM,
+  params_service.COMMUNITY_DATA_SHARING_PARAM,
+  params_service.THIRD_PARTY_DATA_SHARING_PARAM,
+])
+def test_multipart_restore_cannot_enable_privacy_consent(param_runtime, name):
   response = asyncio.run(params_feature.api_params_restore(FakeMultipartRestoreRequest({
-    params_service.VALIDATION_AUTO_UPLOAD_PARAM: 1,
+    name: 1,
     "OrdinarySetting": 5,
   })))
   payload = json.loads(response.text)
 
   assert response.status == 200
   assert payload["result"]["ok_cnt"] == 1
-  assert param_runtime.values[params_service.VALIDATION_AUTO_UPLOAD_PARAM] == 0
+  assert param_runtime.values[name] == 0
   assert param_runtime.values["OrdinarySetting"] == 5
 
 
@@ -788,3 +825,17 @@ def test_service_write_requires_explicit_enable_capability(param_runtime):
     allow_community_data_sharing_enable=True,
   )
   assert param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] == 1
+
+  with pytest.raises(PermissionError, match="third-party data sharing"):
+    params_service.set_param_value(params_service.THIRD_PARTY_DATA_SHARING_PARAM, 1, setting)
+
+  params_service.set_param_value(params_service.THIRD_PARTY_DATA_SHARING_PARAM, 0, setting)
+  assert param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] == 0
+
+  params_service.set_param_value(
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM,
+    1,
+    setting,
+    allow_third_party_data_sharing_enable=True,
+  )
+  assert param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] == 1

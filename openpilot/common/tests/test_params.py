@@ -121,7 +121,7 @@ class TestParams:
     assert self.params.get("LiveParameters") is None
     assert self.params.get("LiveParameters", return_default=True) is None
 
-  def test_ka4_stock_scc_rearm_is_opt_in_and_survives_release_cleanup(self):
+  def test_ka4_stock_scc_rearm_metadata_survives_release_cleanup(self):
     key = "Ka4StockSccStandstillRearm"
     self.params.remove(key)
 

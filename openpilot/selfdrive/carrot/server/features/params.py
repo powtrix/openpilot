@@ -30,6 +30,7 @@ from ..services.params import (
   restore_param_values_from_backup,
   set_param_value,
   COMMUNITY_DATA_SHARING_PARAM,
+  THIRD_PARTY_DATA_SHARING_PARAM,
   VALIDATION_AUTO_UPLOAD_PARAM,
 )
 from ..services.settings import get_settings_cached
@@ -210,6 +211,21 @@ async def api_param_set(request: web.Request) -> web.Response:
       }, status=409)
     allow_community_data_sharing_enable = True
 
+  allow_third_party_data_sharing_enable = False
+  if name == THIRD_PARTY_DATA_SHARING_PARAM and _binary_param_value(value) == 1:
+    if not _request_has_web_consent_proof(request):
+      return web.json_response({
+        "ok": False,
+        "error": "automatic third-party data sharing requires an explicit Carrot Web consent request",
+        "error_code": "WEB_CONSENT_PROOF_REQUIRED",
+      }, status=403)
+    if not _request_is_explicitly_offroad(request):
+      return web.json_response({
+        "ok": False,
+        "error": "automatic third-party data sharing can only be enabled while offroad",
+      }, status=409)
+    allow_third_party_data_sharing_enable = True
+
   try:
     set_param_value(
       name,
@@ -217,6 +233,7 @@ async def api_param_set(request: web.Request) -> web.Response:
       p,
       allow_validation_auto_upload_enable=allow_validation_auto_upload_enable,
       allow_community_data_sharing_enable=allow_community_data_sharing_enable,
+      allow_third_party_data_sharing_enable=allow_third_party_data_sharing_enable,
     )
   except Exception as e:
     return web.json_response({"ok": False, "error": str(e)}, status=500)

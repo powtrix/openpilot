@@ -18,6 +18,7 @@ CATALOG = {
   "CruiseSpeed1": {"default": 30, "min": 0, "max": 160},
   "CarrotValidationAutoUpload": {"default": 0, "min": 0, "max": 1},
   "CarrotCommunityDataSharing": {"default": 0, "min": 0, "max": 1},
+  "DkThirdPartyDataSharing": {"default": 0, "min": 0, "max": 1},
 }
 
 
@@ -29,7 +30,7 @@ def profile_store(tmp_path, monkeypatch):
   # by_name is used, as the set of allowed parameter names.
   monkeypatch.setattr(setting_profiles, "get_settings_cached", lambda: (None, None, CATALOG, None))
   # No git and no live params in the test environment.
-  monkeypatch.setattr(setting_profiles, "read_git_profile_meta", lambda: {})
+  monkeypatch.setattr(setting_profiles, "read_git_profile_meta", dict)
   monkeypatch.setattr(setting_profiles, "snapshot_current_setting_values",
                       lambda: {"ApplyModelSpeed": 0, "TFollowDecelBoost": 50})
   return path
@@ -65,6 +66,7 @@ def test_privacy_consents_are_never_stored_or_returned_in_profiles(profile_store
       "ApplyModelSpeed": 5,
       "CarrotValidationAutoUpload": 1,
       "CarrotCommunityDataSharing": 1,
+      "DkThirdPartyDataSharing": 1,
     },
   )
   created = setting_profiles.create_setting_profile("p")
@@ -76,6 +78,7 @@ def test_privacy_consents_are_never_stored_or_returned_in_profiles(profile_store
       "CruiseSpeed1": 45,
       "CarrotValidationAutoUpload": 1,
       "CarrotCommunityDataSharing": 1,
+      "DkThirdPartyDataSharing": 1,
     }},
   )
   assert updated["values"] == {"CruiseSpeed1": 45}
@@ -87,6 +90,7 @@ def test_privacy_consents_are_never_stored_or_returned_in_profiles(profile_store
       "ApplyModelSpeed": 1,
       "CarrotValidationAutoUpload": 1,
       "CarrotCommunityDataSharing": 1,
+      "DkThirdPartyDataSharing": 1,
     },
   }]}), encoding="utf-8")
   assert setting_profiles.read_setting_profiles()["profiles"][0]["values"] == {"ApplyModelSpeed": 1}

@@ -5,6 +5,7 @@ import threading
 import time
 
 from openpilot.common.api import api_get
+from openpilot.common.external_data import third_party_data_sharing_enabled
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.athena.registration import UNREGISTERED_DONGLE_ID
@@ -46,12 +47,18 @@ class PrimeState:
     return PrimeType.UNKNOWN
 
   def _fetch_prime_status(self) -> None:
+    if not third_party_data_sharing_enabled(self._params):
+      return
     dongle_id = self._params.get("DongleId")
     if not dongle_id or dongle_id == UNREGISTERED_DONGLE_ID:
       return
 
     try:
+      if not third_party_data_sharing_enabled(self._params):
+        return
       identity_token = get_token(dongle_id)
+      if not third_party_data_sharing_enabled(self._params):
+        return
       response = api_get(f"v1.1/devices/{dongle_id}", timeout=self.API_TIMEOUT, access_token=identity_token, session=self._session)
       if response.status_code == 200:
         data = response.json()
