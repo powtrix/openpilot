@@ -27,7 +27,9 @@ The report separates a sendcan request from Panda's TX-return echo
 the frame into its transmit path, not that it won arbitration or that an ECU
 accepted or acted on it. The probe also records the raw camera-side and
 host-replacement paths for ADRV_0x161 (including its stock-owned alert, sound,
-DAW, and mute fields) when that message exists, and for LFAHDA_CLUSTER. Public KA4
+DAW, and mute fields) when that message exists, and for LFAHDA_CLUSTER. It
+recognizes only the qualified HDA1 ALERTS_5=5 to 0 display mask as an allowed
+stock-owned-field change. Public KA4
 captures show that 0x161 is not present on every recorded variant. Neither
 ALERTS_5 nor SCC_CONTROL InfoDisplay has been correlated here with the user's
 visible cluster prompt, and neither acknowledges that the SCC ECU reset a
@@ -87,6 +89,7 @@ PANDA_REJECTED_AND_RETURNED_BUS_OFFSET = PANDA_RETURNED_BUS_OFFSET + PANDA_REJEC
 
 BUTTON_NONE = 0
 BUTTON_RES_ACCEL = 1
+BUTTON_CANCEL = 4
 BUTTON_NAMES = {
   0: "NONE",
   1: "RES_ACCEL",
@@ -96,7 +99,7 @@ BUTTON_NAMES = {
   5: "LFA_BUTTON",
 }
 
-REPORT_SCHEMA_VERSION = 6
+REPORT_SCHEMA_VERSION = 7
 TARGET_FINGERPRINT = "KIA_CARNIVAL_4TH_GEN"
 # Older cereal logs serialized the human-readable platform value.
 TARGET_FINGERPRINT_ALIASES = (TARGET_FINGERPRINT, "KIA CARNIVAL 4TH GEN")
@@ -133,6 +136,8 @@ REARM_START_TIMING_TOLERANCE = 0.060
 REARM_CADENCE_TOLERANCE = 0.008
 FINAL_REARM_FRAME_TIME = 27.00
 USE_SWITCH_OR_PEDAL_TO_ACCELERATE = 5
+HIDDEN_ALERT = 0
+KA4_STOCK_SCC_ALERT_MASK_DURATION = 30.0
 CLUSTER_STREAM_MAX_GAP = 0.250
 PROOF_STREAM_MAX_GAP = 0.100
 PROOF_STREAM_EDGE_TOLERANCE = 0.100
@@ -2740,7 +2745,7 @@ class ProbeAnalyzer:
       "exactOneToOneByCounterAndTime": exact_one_to_one,
     }
 
-  def _cluster_episode_evidence(self, start: float, end: float,
+  def _cluster_episode_evidence(self, start: float, end: float, start_observed: bool,
                                 tx_status_by_id: dict[int, str]) -> dict[str, Any]:
     panda_bus_offset = self._configured_panda_bus_offset()
     canfd_hda2 = bool(self.car_params and self.car_params.get("canFdHda2"))
@@ -2925,6 +2930,9 @@ class ProbeAnalyzer:
     adrv_return_pairs, adrv_return_pairing = self._pair_cluster_frames_by_counter(
       raw_adrv, host_returned_adrv, start, coverage_through,
     )
+    _, adrv_episode_request_pairing = self._pair_cluster_frames_by_counter(
+      raw_adrv, host_adrv_requests, start, end,
+    )
     _, adrv_episode_return_pairing = self._pair_cluster_frames_by_counter(
       raw_adrv, host_returned_adrv, start, end,
     )
@@ -3050,7 +3058,7 @@ class ProbeAnalyzer:
     unexpected_hda_returned_frames = hda_episode_return_pairing["unusedOutputFrames"]
     # Check every returned output independently. A one-to-one matcher may
     # legitimately choose the normal return and leave a second, mutated return
-    # unused; that extra output must not evade the ALERTS_5 preservation check.
+    # unused; that extra output must not evade the ALERTS_5 policy check.
     adrv_all_return_value_pairs = []
     for output in host_returned_adrv:
       if not start <= output.t <= end:
@@ -3064,8 +3072,33 @@ class ProbeAnalyzer:
         adrv_all_return_value_pairs.append((raw, output))
     adrv_alert5_mismatches = sum(raw.alert_5 != output.alert_5
                                  for raw, output in adrv_all_return_value_pairs)
+    unexpected_adrv_returned_frames = adrv_episode_return_pairing["unusedOutputFrames"]
+    exact_adrv_episode_pairing = (
+      adrv_episode_request_pairing["exactOneToOneByCounterAndTime"]
+      and adrv_episode_return_pairing["exactOneToOneByCounterAndTime"]
+    )
+    alert_mask_abort_times = [
+      sample.t for sample in self.states
+      if start <= sample.t <= end and (not sample.can_valid or sample.acc_faulted)
+    ] + [
+      sample.t for sample in self.controls
+      if start <= sample.t <= end and sample.cancel
+    ] + [
+      sample.t for sample in self.scc
+      if start <= sample.t <= end and (sample.sys_fail_state != 0 or sample.takeover_request != 0)
+    ] + [
+      sample.t for sample in self.buttons
+      if start <= sample.t <= end and sample.origin == "vehicle_rx"
+      and (sample.button == BUTTON_CANCEL or sample.adaptive_main != 0 or sample.normal_main != 0)
+    ]
+    first_alert_mask_abort = min(alert_mask_abort_times, default=None)
     adrv_stock_owned_field_mismatch_counts: Counter[str] = Counter()
     adrv_stock_owned_mismatch_frames = 0
+    adrv_disallowed_stock_owned_field_mismatch_counts: Counter[str] = Counter()
+    adrv_disallowed_stock_owned_mismatch_frames = 0
+    qualified_alert5_mask_frames = 0
+    disallowed_alert5_mismatch_frames = 0
+    qualified_alert5_mask_samples = []
     for raw, output in adrv_all_return_value_pairs:
       raw_values = dict(raw.adrv_stock_owned_values)
       output_values = dict(output.adrv_stock_owned_values)
@@ -3075,15 +3108,51 @@ class ProbeAnalyzer:
       if mismatched_fields:
         adrv_stock_owned_mismatch_frames += 1
         adrv_stock_owned_field_mismatch_counts.update(mismatched_fields)
+        elapsed = raw.t - start
+        qualified_alert5_mask = (
+          not canfd_hda2
+          and bool(self.car_params and self.car_params.get("ka4StockSccGatePassed"))
+          and start_observed
+          and exact_adrv_episode_pairing
+          and unexpected_adrv_returned_frames == 0
+          and mismatched_fields == ["ALERTS_5"]
+          and raw.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+          and output.alert_5 == HIDDEN_ALERT
+          and 0.0 <= elapsed < KA4_STOCK_SCC_ALERT_MASK_DURATION
+          and (first_alert_mask_abort is None or raw.t < first_alert_mask_abort)
+        )
+        if qualified_alert5_mask:
+          qualified_alert5_mask_frames += 1
+          qualified_alert5_mask_samples.append({
+            "afterStop": round(elapsed, 3),
+            "counter": raw.counter,
+            "raw": raw.alert_5,
+            "returned": output.alert_5,
+          })
+        else:
+          adrv_disallowed_stock_owned_mismatch_frames += 1
+          adrv_disallowed_stock_owned_field_mismatch_counts.update(mismatched_fields)
+          if "ALERTS_5" in mismatched_fields:
+            disallowed_alert5_mismatch_frames += 1
     adrv_alert5_value5_mismatches = sum(
       raw.alert_5 == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
       and output.alert_5 != USE_SWITCH_OR_PEDAL_TO_ACCELERATE
       for raw, output in adrv_all_return_value_pairs
     )
-    unexpected_adrv_returned_frames = adrv_episode_return_pairing["unusedOutputFrames"]
-    if raw_alert5_value5_frames and not canfd_hda2 and adrv_alert5_value5_mismatches:
+    alert5_mask_policy_conformant = (
+      disallowed_alert5_mismatch_frames == 0
+      and unexpected_adrv_returned_frames == 0
+      and adrv_episode_request_pairing["unusedOutputFrames"] == 0
+    )
+    if (raw_alert5_value5_frames and not canfd_hda2 and adrv_alert5_value5_mismatches
+        and qualified_alert5_mask_frames == 0):
       path_preserves_observed_alert5_value5 = False
       alert5_value5_preservation = "CHANGED_OR_UNPAIRED"
+    elif qualified_alert5_mask_frames and alert5_mask_policy_conformant:
+      # Keep the legacy preservation field literal: a qualified mask changes
+      # the value, but is now an explicitly permitted policy exception.
+      path_preserves_observed_alert5_value5 = False
+      alert5_value5_preservation = "QUALIFIED_MASK"
 
     if not raw_alert5_value5_frames:
       alert5_value_path = "alert5Value5NotObserved"
@@ -3093,8 +3162,10 @@ class ProbeAnalyzer:
         if path_preserves_observed_alert5_value5 else
         "hda2UnexpectedHostReplacement"
       )
-    elif adrv_alert5_value5_mismatches:
+    elif disallowed_alert5_mismatch_frames:
       alert5_value_path = "hostReplacementChangedAlert5Value5"
+    elif qualified_alert5_mask_frames:
+      alert5_value_path = "hostReplacementQualifiedAlert5Value5Mask"
     elif unexpected_adrv_returned_frames:
       alert5_value_path = "hostReplacementHasUnexpectedReturnedFrames"
     elif unpaired_alert5_value5_frames:
@@ -3134,8 +3205,8 @@ class ProbeAnalyzer:
           and counter_sequence_integrity["adrvReturned"]["clean"]
           and exact_adrv_replacement_pairing
           and all_adrv_returned
-          and adrv_stock_owned_mismatch_frames == 0
-          and adrv_alert5_mismatches == 0
+          and adrv_disallowed_stock_owned_mismatch_frames == 0
+          and alert5_mask_policy_conformant
           and unexpected_adrv_returned_frames == 0
           and all(request.bus == host_bus for request in adrv_requests)
           and all(sample.bus == host_bus for sample in returned_adrv)
@@ -3185,7 +3256,7 @@ class ProbeAnalyzer:
     hda_path_consistent = (
       adrv_path_consistent
       and lfa_hda_path_consistent
-      and path_preserves_observed_alert5_value5 is not False
+      and alert5_mask_policy_conformant
     )
 
     raw_hda_transitions = []
@@ -3267,7 +3338,28 @@ class ProbeAnalyzer:
         "changedByReturnedFrame": changed_alert5_value5_frames,
         "allReturnedValueMismatches": adrv_alert5_mismatches,
         "allReturnedValue5Mismatches": adrv_alert5_value5_mismatches,
+        "qualifiedMaskFrames": qualified_alert5_mask_frames,
+        "disallowedMismatchFrames": disallowed_alert5_mismatch_frames,
         "preservedByReturnedFrame": preserved_alert5_value5_frames,
+      },
+      "alert5MaskPolicy": {
+        "assessment": (
+          "CONFORMANT_WITH_QUALIFIED_MASK" if qualified_alert5_mask_frames and alert5_mask_policy_conformant else
+          "CONFORMANT_WITHOUT_MASK" if alert5_mask_policy_conformant else
+          "VIOLATION"
+        ),
+        "conformant": alert5_mask_policy_conformant,
+        "requiresHda1": True,
+        "requiresExactKa4Gate": True,
+        "requiresObservedStopStart": True,
+        "windowSeconds": KA4_STOCK_SCC_ALERT_MASK_DURATION,
+        "windowEndExclusive": True,
+        "firstAbortAfterStop": (
+          round(first_alert_mask_abort - start, 3) if first_alert_mask_abort is not None else None
+        ),
+        "qualifiedMaskFrames": qualified_alert5_mask_frames,
+        "qualifiedMaskSamples": qualified_alert5_mask_samples[:100],
+        "disallowedAlert5MismatchFrames": disallowed_alert5_mismatch_frames,
       },
       "alert5ValuePreservation": {
         "assessment": alert5_value5_preservation,
@@ -3294,6 +3386,10 @@ class ProbeAnalyzer:
         "adrvAlert5ValueMismatches": adrv_alert5_mismatches,
         "adrvStockOwnedFieldMismatchFrames": adrv_stock_owned_mismatch_frames,
         "adrvStockOwnedFieldMismatchCounts": dict(sorted(adrv_stock_owned_field_mismatch_counts.items())),
+        "adrvDisallowedStockOwnedFieldMismatchFrames": adrv_disallowed_stock_owned_mismatch_frames,
+        "adrvDisallowedStockOwnedFieldMismatchCounts": dict(
+          sorted(adrv_disallowed_stock_owned_field_mismatch_counts.items())
+        ),
         "unexpectedAdrvReturnedFrames": unexpected_adrv_returned_frames,
         "allAdrvRequestsReturned": all_adrv_returned,
         "allLfaHdaRequestsReturned": all_hda_returned,
@@ -3441,7 +3537,7 @@ class ProbeAnalyzer:
       for sample in raw_alt_stock_bus
     )
     schedule_mode, info_display_4_periods = self._schedule_mode(scc, start)
-    cluster_evidence = self._cluster_episode_evidence(start, end, cluster_tx_status_by_id)
+    cluster_evidence = self._cluster_episode_evidence(start, end, start_observed, cluster_tx_status_by_id)
     first_raw_alert5_value5 = cluster_evidence["firstRawAlert5Value5AfterStop"]
 
     group_times = [group["start"] - start_rel for group in episode_groups]
@@ -3675,12 +3771,13 @@ class ProbeAnalyzer:
       or cluster_evidence["integrity"]["rejectedEchoCount"] > 0
     )
     direct_alert5_value_mutation = (
-      not canfd_hda2
-      and cluster_evidence["hdaReplacementComparison"]["adrvAlert5ValueMismatches"] > 0
+      cluster_evidence["alert5MaskPolicy"]["disallowedAlert5MismatchFrames"] > 0
     )
     direct_adrv_stock_owned_field_mutation = (
-      not canfd_hda2
-      and cluster_evidence["hdaReplacementComparison"]["adrvStockOwnedFieldMismatchFrames"] > 0
+      cluster_evidence["hdaReplacementComparison"]["adrvDisallowedStockOwnedFieldMismatchFrames"] > 0
+    )
+    direct_unpaired_or_extra_adrv_output = (
+      cluster_evidence["hdaReplacementComparison"]["unexpectedAdrvReturnedFrames"] > 0
     )
     direct_hda_control_state_mutation = (
       not canfd_hda2
@@ -3786,6 +3883,7 @@ class ProbeAnalyzer:
         "candidateAlert5Correlation": cluster_evidence["candidateAlert5Correlation"],
         "pathPreservesObservedValue5": cluster_evidence[
           "alert5ValuePreservation"]["pathPreservesObservedValue5"],
+        "pathConformsToDisplayMaskPolicy": cluster_evidence["alert5MaskPolicy"]["conformant"],
       },
     }
 
@@ -3803,14 +3901,18 @@ class ProbeAnalyzer:
     elif direct_alert5_value_mutation:
       verdict = "FAIL"
       can_evidence_verdict = "FAIL"
-      reasons.append("HDA1 returned replacement changed an observed ADRV_0x161 ALERTS_5 value")
+      reasons.append("ADRV_0x161 ALERTS_5 changed outside the qualified HDA1 5-to-0 display-mask window")
     elif direct_adrv_stock_owned_field_mutation:
       verdict = "FAIL"
       can_evidence_verdict = "FAIL"
       changed_fields = ", ".join(
-        cluster_evidence["hdaReplacementComparison"]["adrvStockOwnedFieldMismatchCounts"]
+        cluster_evidence["hdaReplacementComparison"]["adrvDisallowedStockOwnedFieldMismatchCounts"]
       )
-      reasons.append(f"HDA1 returned replacement changed received ADRV fields: {changed_fields}")
+      reasons.append(f"ADRV_0x161 returned replacement changed disallowed stock-owned fields: {changed_fields}")
+    elif direct_unpaired_or_extra_adrv_output:
+      verdict = "FAIL"
+      can_evidence_verdict = "FAIL"
+      reasons.append("ADRV_0x161 contained an extra returned host-replacement frame")
     elif direct_hda_control_state_mutation:
       verdict = "FAIL"
       can_evidence_verdict = "FAIL"
@@ -4045,7 +4147,11 @@ class ProbeAnalyzer:
           "ADRV_0x161 ALERTS_5=5 is only a raw CAN-field observation on variants where 0x161 exists; " +
           "it has no established cluster-display or driver-action correlation here."
         ),
-        "When 0x161 is present on HDA1, a returned replacement must preserve each observed ALERTS_5 value.",
+        (
+          "When 0x161 is present on HDA1, the only permitted stock-owned-field change is ALERTS_5=5 to 0 " +
+          "before 30.00 seconds of an observed exact-gate stop and before any fail-open event; all other " +
+          "changes or extra returned frames fail."
+        ),
         "HDA2 raw-path visibility is inferred from current-branch topology and absence of a host replacement, not a cluster display acknowledgement.",
         "Start the capture before the physical stop and keep recording past 31 seconds.",
         "Use a full rlog when possible; qlogs can omit or downsample CAN/sendcan/state evidence.",
@@ -4123,6 +4229,7 @@ def _demo_car_params(bus_offset: int = 0, hda2: bool = False) -> Any:
 def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
              schedule_mode: str = SCHEDULE_MODE_REGULAR, button_source_phase_frames: int = 0,
              raw_alert5_value5_time: float | None = None, change_hda1_alert5_value: bool = False,
+             mask_hda1_alert5_during_grace: bool = False,
              button_counter_offset: int = 0) -> ProbeAnalyzer:
   """Generate deterministic, real-DBC frames for an offline dry run."""
   from opendbc.can import CANPacker
@@ -4131,6 +4238,8 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
     raise ValueError(f"unsupported demo schedule mode: {schedule_mode}")
   if button_source_phase_frames not in (0, 1):
     raise ValueError("button_source_phase_frames must be 0 or 1")
+  if change_hda1_alert5_value and mask_hda1_alert5_during_grace:
+    raise ValueError("choose either unconditional ALERTS_5 mutation or the qualified grace mask")
 
   analyzer = ProbeAnalyzer("demo", f"{outcome}:{schedule_mode}:phase-{button_source_phase_frames}")
   analyzer.set_car_params(_demo_car_params(bus_offset, hda2), "demo")
@@ -4228,8 +4337,9 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
   # replaces both messages on ECAN while preserving the synthetic source
   # field values used by this demo.
   # HDA2 stock-long does not synthesize these frames, leaving the raw camera
-  # path unmodified. change_hda1_alert5_value generates the explicit field-
-  # mutation regression case.
+  # path unmodified. The analyzer permits only the HDA1 raw ALERTS_5=5 to
+  # returned 0 display mask before 30.00 seconds of an observed exact-gate
+  # stop; all other stock-owned field mutations remain direct failures.
   raw_camera_bus = bus_offset + 2
   for frame in range(round(stop_duration * 20) + 1):
     elapsed = frame / 20.0
@@ -4247,9 +4357,14 @@ def run_demo(outcome: str, bus_offset: int = 0, hda2: bool = False, *,
     analyzer.feed_can("can", t, raw_camera_bus, raw_adrv[0], raw_adrv[1])
     analyzer.feed_can("can", t, raw_camera_bus, raw_hda[0], raw_hda[1])
     if not hda2:
+      qualified_demo_mask = (
+        mask_hda1_alert5_during_grace
+        and raw_alert == USE_SWITCH_OR_PEDAL_TO_ACCELERATE
+        and elapsed < KA4_STOCK_SCC_ALERT_MASK_DURATION
+      )
       host_adrv = packer.make_can_msg("ADRV_0x161", bus_offset, {
         "COUNTER": frame & 0xFF,
-        "ALERTS_5": 0 if change_hda1_alert5_value else raw_alert,
+        "ALERTS_5": 0 if change_hda1_alert5_value or qualified_demo_mask else raw_alert,
       })
       host_hda = packer.make_can_msg("LFAHDA_CLUSTER", bus_offset, {
         "COUNTER": frame & 0xFF,

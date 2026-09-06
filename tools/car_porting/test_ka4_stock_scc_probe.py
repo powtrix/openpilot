@@ -113,7 +113,7 @@ def test_demo_models_exact_supported_schedule_without_claiming_vehicle_acceptanc
     button_source_phase_frames=button_source_phase_frames,
   ).report()
 
-  assert report["schemaVersion"] == 6
+  assert report["schemaVersion"] == 7
   assert report["overallVerdict"] == "INCONCLUSIVE"
   assert report["canEvidenceVerdict"] == "OBSERVED_SCHEDULE_AND_ALERT5_TIMING"
   assert report["vehicleAcceptanceVerdict"] == "REQUIRES_ON_CAR_A_B"
@@ -637,6 +637,27 @@ def test_hda1_host_replacement_preserves_observed_alert5_value_in_returned_dbc_f
   assert max(res_times) < raw_value5["t"]
 
 
+def test_hda1_qualified_alert5_value5_mask_during_display_epoch_is_allowed() -> None:
+  report = run_demo(
+    "pass",
+    raw_alert5_value5_time=3.0,
+    mask_hda1_alert5_during_grace=True,
+  ).report()
+
+  assert report["overallVerdict"] == "INCONCLUSIVE"
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
+  assert evidence["alert5ValuePathObservation"] == "hostReplacementQualifiedAlert5Value5Mask"
+  assert evidence["alert5ValuePairCounts"]["qualifiedMaskFrames"] > 0
+  assert evidence["alert5ValuePairCounts"]["disallowedMismatchFrames"] == 0
+  assert evidence["alert5MaskPolicy"]["assessment"] == "CONFORMANT_WITH_QUALIFIED_MASK"
+  assert evidence["alert5MaskPolicy"]["conformant"]
+  assert evidence["alert5MaskPolicy"]["windowSeconds"] == 30.0
+  assert evidence["hdaReplacementComparison"]["adrvDisallowedStockOwnedFieldMismatchFrames"] == 0
+  assert evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
+  assert episode["signalSpecificChecks"]["adrv0x161"]["pathConformsToDisplayMaskPolicy"]
+
+
 def test_complete_schedule_without_0x161_is_observed_schedule_only() -> None:
   analyzer = run_demo("pass")
   analyzer.cluster_can = [
@@ -815,7 +836,7 @@ def test_sparse_hda1_host_replacement_streams_keep_can_evidence_inconclusive() -
   assert not episode["prerequisites"]["adrvAndLfaHdaPathsConsistentWithObservedVariant"]
 
 
-def test_extra_duplicate_hda1_host_request_and_return_keep_can_evidence_inconclusive() -> None:
+def test_extra_duplicate_hda1_host_request_and_return_is_direct_failure() -> None:
   analyzer = run_demo("pass")
   stop_start = min(sample.t for sample in analyzer.states if sample.standstill)
   request = min(
@@ -836,7 +857,8 @@ def test_extra_duplicate_hda1_host_request_and_return_keep_can_evidence_inconclu
 
   report = analyzer.report()
 
-  assert report["overallVerdict"] == "INCONCLUSIVE"
+  assert report["overallVerdict"] == "FAIL"
+  assert report["canEvidenceVerdict"] == "FAIL"
   episode = report["stopEpisodes"][0]
   evidence = episode["clusterEvidence"]
   request_pairing = evidence["hostReplacementPairing"]["adrvRawToRequest"]
@@ -849,6 +871,7 @@ def test_extra_duplicate_hda1_host_request_and_return_keep_can_evidence_inconclu
   assert not request_pairing["exactOneToOneByCounterAndTime"]
   assert not returned_pairing["exactOneToOneByCounterAndTime"]
   assert not episode["prerequisites"]["adrvAndLfaHdaPathsConsistentWithObservedVariant"]
+  assert "extra returned host-replacement frame" in episode["reasons"][0]
 
 
 def test_pre_stop_raw_cluster_source_cannot_consume_in_window_extra_output() -> None:
@@ -891,7 +914,7 @@ def test_hda1_returned_host_replacement_changing_observed_alert5_value_is_direct
   assert not evidence["alert5ValuePreservation"]["pathPreservesObservedValue5"]
   assert not episode["signalSpecificChecks"]["adrv0x161"]["pathPreservesObservedValue5"]
   assert not episode["prerequisites"]["adrvAndLfaHdaPathsConsistentWithObservedVariant"]
-  assert "changed an observed ADRV_0x161 ALERTS_5 value" in episode["reasons"][0]
+  assert "outside the qualified HDA1 5-to-0 display-mask window" in episode["reasons"][0]
 
 
 def test_hda1_alert5_value_mutation_after_proof_window_is_direct_failure() -> None:
@@ -906,7 +929,65 @@ def test_hda1_alert5_value_mutation_after_proof_window_is_direct_failure() -> No
   evidence = episode["clusterEvidence"]
   assert evidence["alert5ValuePairCounts"]["changedByReturnedFrame"] > 0
   assert evidence["hdaReplacementComparison"]["adrvAlert5ValueMismatches"] > 0
-  assert "changed an observed ADRV_0x161 ALERTS_5 value" in episode["reasons"][0]
+  assert "outside the qualified HDA1 5-to-0 display-mask window" in episode["reasons"][0]
+
+
+def test_hda1_alert5_wrong_mask_value_during_display_epoch_is_direct_failure() -> None:
+  from opendbc.can import CANPacker
+
+  analyzer = run_demo("pass", raw_alert5_value5_time=3.0)
+  raw = next(
+    sample for sample in analyzer.cluster_can
+    if sample.origin == "vehicle_rx"
+    and sample.address == ADRV_0X161_ADDRESS
+    and sample.alert_5 == 5
+  )
+  request_index, request = min(
+    (
+      (index, sample) for index, sample in enumerate(analyzer.cluster_can)
+      if sample.origin == "send_request"
+      and sample.address == ADRV_0X161_ADDRESS
+      and sample.counter == raw.counter
+      and 0.0 <= sample.t - raw.t <= 0.020
+    ),
+    key=lambda item: item[1].t - raw.t,
+  )
+  returned_index, returned = min(
+    (
+      (index, sample) for index, sample in enumerate(analyzer.cluster_can)
+      if sample.origin == "tx_returned"
+      and sample.address == ADRV_0X161_ADDRESS
+      and sample.counter == raw.counter
+      and 0.0 <= sample.t - raw.t <= 0.020
+    ),
+    key=lambda item: item[1].t - raw.t,
+  )
+  values = dict(raw.adrv_stock_owned_values)
+  values.update({"COUNTER": raw.counter, "ALERTS_5": 1})
+  wrong = CANPacker("hyundai_canfd_generated").make_can_msg("ADRV_0x161", 0, values)
+
+  def with_wrong_alert(sample):
+    return replace(
+      sample,
+      data_hex=wrong[1].hex(),
+      alert_5=1,
+      adrv_stock_owned_values=tuple(
+        (name, 1 if name == "ALERTS_5" else value)
+        for name, value in sample.adrv_stock_owned_values
+      ),
+    )
+
+  analyzer.cluster_can[request_index] = with_wrong_alert(request)
+  analyzer.cluster_can[returned_index] = with_wrong_alert(returned)
+  report = analyzer.report()
+
+  assert report["overallVerdict"] == "FAIL"
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
+  assert evidence["alert5ValuePairCounts"]["qualifiedMaskFrames"] == 0
+  assert evidence["alert5ValuePairCounts"]["disallowedMismatchFrames"] == 1
+  assert evidence["alert5MaskPolicy"]["assessment"] == "VIOLATION"
+  assert "outside the qualified HDA1 5-to-0 display-mask window" in episode["reasons"][0]
 
 
 def test_extra_mutated_adrv_return_after_proof_window_is_direct_failure() -> None:
@@ -937,7 +1018,7 @@ def test_extra_mutated_adrv_return_after_proof_window_is_direct_failure() -> Non
   assert evidence["alert5ValuePairCounts"]["allReturnedValue5Mismatches"] == 1
   assert evidence["alert5ValuePathObservation"] == "hostReplacementChangedAlert5Value5"
   assert not evidence["alert5ValuePreservation"]["pathPreservesObservedValue5"]
-  assert "changed an observed ADRV_0x161 ALERTS_5 value" in episode["reasons"][0]
+  assert "outside the qualified HDA1 5-to-0 display-mask window" in episode["reasons"][0]
 
 
 def test_extra_mutated_adrv_stock_owned_field_is_direct_failure() -> None:
@@ -965,7 +1046,7 @@ def test_extra_mutated_adrv_stock_owned_field_is_direct_failure() -> None:
   assert comparison["adrvAlert5ValueMismatches"] == 0
   assert comparison["adrvStockOwnedFieldMismatchFrames"] == 1
   assert comparison["adrvStockOwnedFieldMismatchCounts"] == {"ALERTS_2": 1}
-  assert "changed received ADRV fields: ALERTS_2" in episode["reasons"][0]
+  assert "changed disallowed stock-owned fields: ALERTS_2" in episode["reasons"][0]
 
 
 def test_extra_mutated_lfahda_state_after_proof_window_is_direct_failure() -> None:
@@ -1278,7 +1359,7 @@ def test_late_alert5_value_is_observation_not_failure() -> None:
 
 def test_empty_analyzer_is_inconclusive() -> None:
   report = ProbeAnalyzer("test", "empty").report()
-  assert report["schemaVersion"] == 6
+  assert report["schemaVersion"] == 7
   assert report["overallVerdict"] == "INCONCLUSIVE"
   assert report["stopEpisodes"] == []
   assert report["stateEvidence"]["sampleCount"] == 0
@@ -1845,7 +1926,7 @@ def test_button_tx_return_before_request_is_not_matched() -> None:
   assert not episode["prerequisites"]["buttonRequestsAndReturnedEchoesOneToOne"]
 
 
-def test_cluster_tx_return_before_request_is_not_matched() -> None:
+def test_unpaired_cluster_tx_return_before_request_is_direct_failure() -> None:
   analyzer = run_demo("pass")
   requests = [sample for sample in analyzer.cluster_can if sample.origin == "send_request"]
   moved = []
@@ -1863,11 +1944,13 @@ def test_cluster_tx_return_before_request_is_not_matched() -> None:
 
   report = analyzer.report()
 
-  assert report["canEvidenceVerdict"] == "INCONCLUSIVE"
-  evidence = report["stopEpisodes"][0]["clusterEvidence"]
+  assert report["canEvidenceVerdict"] == "FAIL"
+  episode = report["stopEpisodes"][0]
+  evidence = episode["clusterEvidence"]
   assert not evidence["hdaReplacementComparison"]["allAdrvRequestsReturned"]
   assert not evidence["hdaReplacementComparison"]["allLfaHdaRequestsReturned"]
   assert not evidence["hdaReplacementComparison"]["pathConsistentWithCurrentStockLongTopology"]
+  assert "extra returned host-replacement frame" in episode["reasons"][0]
 
 
 @pytest.mark.parametrize("address", (SCC_CONTROL_ADDRESS, CRUISE_BUTTONS_ALT_ADDRESS))
