@@ -365,14 +365,15 @@ def test_ka4_hda1_full_controller_update_masks_and_restores_real_adrv(monkeypatc
   safety.set_timer(1_070_000)
   assert safety.safety_fwd_hook(libsafety_py.make_CANPacket(raw_adrv[0], raw_adrv[2], raw_adrv[1])) == 0
 
-  # A driver brake interlock restores the exact OEM prompt through the same
-  # full controller and real DBC path.
+  # A driver brake interlock blocks synthetic RES requests but does not leak
+  # the informational prompt during the independent display grace period.
   car_state.brakePressed = True
   CS.out = car_state.as_reader()
   controller.frame = 5
   _, messages = controller.update(CC, CS, 0)
-  _, restored = get_adrv_0x161(messages, dbc)
-  assert restored["ALERTS_5"] == 5
+  _, still_masked = get_adrv_0x161(messages, dbc)
+  assert still_masked["ALERTS_5"] == 0
+  assert not controller.stock_scc_keepalive_pending
 
   # Establish a fresh qualified stop through the full update path, then verify
   # the exclusive 30.00-second boundary on actual packed ADRV frames.
