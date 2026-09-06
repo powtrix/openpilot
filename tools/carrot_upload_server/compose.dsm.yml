@@ -1,6 +1,7 @@
 services:
   dk-upload:
     container_name: dk-upload
+    platform: linux/amd64
     build: .
     image: dk-upload:2.0.0
     restart: unless-stopped
@@ -45,6 +46,8 @@ services:
       CARROT_CLEANUP_INTERVAL_SECONDS: "900"
     ports:
       - "127.0.0.1:18080:8080"
+    networks:
+      - dk-upload-internal
     user: "10001:10001"
     volumes:
       - /volume1/openpilot/.carrot-validation-v1:/data/openpilot/.carrot-validation-v1:rw
@@ -86,3 +89,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  dk-upload-internal:
+    name: dk-upload-internal
+    driver: bridge
+    internal: true
+    labels:
+      dk.openpilot.receiver-network: "true"

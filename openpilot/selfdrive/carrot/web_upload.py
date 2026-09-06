@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import secrets
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
@@ -20,6 +21,7 @@ from openpilot.common.api import get_key_pair
 
 DEFAULT_WEB_UPLOAD_URL = "https://adot.synology.me"
 DEFAULT_TMUX_WEB_UPLOAD_URL = "https://tmux.carrotpilot.app/upload"
+DK_VALIDATION_UPLOAD_ORIGIN = "https://adot.synology.me"
 VALIDATION_DEVICE_AUTH_VERSION = 2
 VALIDATION_DEVICE_PROOF_DOMAIN = b"dk-carrot-validation-device-proof-v2\0"
 VALIDATION_COMPLETION_CONNECT_TIMEOUT_SECONDS = 20
@@ -27,6 +29,78 @@ VALIDATION_COMPLETION_CONNECT_TIMEOUT_SECONDS = 20
 # Bound connection establishment, but allow the authenticated integrity check
 # enough read time on a slow NAS instead of imposing the generic 15 s timeout.
 VALIDATION_COMPLETION_READ_TIMEOUT_SECONDS = 30 * 60
+GUARDED_MULTIPART_CHUNK_SIZE = 64 * 1024
+
+
+def _multipart_token(value: Any) -> str:
+  return str(value).replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
+
+
+class GuardedMultipartBody:
+  """Streaming multipart body that checks an authorization callback per chunk."""
+
+  def __init__(
+    self,
+    fields: Mapping[str, Any],
+    files: Sequence[tuple[str, tuple[str, Any, str]]],
+    request_allowed: Callable[[], bool],
+  ) -> None:
+    self.boundary = f"dk-carrot-{secrets.token_hex(16)}"
+    self.content_type = f"multipart/form-data; boundary={self.boundary}"
+    self._request_allowed = request_allowed
+    self._segments: list[bytes | Any] = []
+
+    for name, value in fields.items():
+      self._segments.append(
+        f'--{self.boundary}\r\nContent-Disposition: form-data; name="{_multipart_token(name)}"\r\n\r\n'
+        .encode()
+      )
+      self._segments.append(str(value).encode("utf-8"))
+      self._segments.append(b"\r\n")
+
+    for name, (filename, content, content_type) in files:
+      disposition = f'--{self.boundary}\r\nContent-Disposition: form-data; name="{_multipart_token(name)}"; '
+      disposition += f'filename="{_multipart_token(filename)}"\r\nContent-Type: {content_type}\r\n\r\n'
+      self._segments.append(disposition.encode())
+      self._segments.append(content)
+      self._segments.append(b"\r\n")
+
+    self._segments.append(f"--{self.boundary}--\r\n".encode("ascii"))
+    self.content_length = sum(self._segment_length(segment) for segment in self._segments)
+
+  @staticmethod
+  def _segment_length(segment: bytes | Any) -> int:
+    if isinstance(segment, bytes):
+      return len(segment)
+    position = int(segment.tell())
+    return max(0, int(os.fstat(segment.fileno()).st_size) - position)
+
+  def __len__(self) -> int:
+    return self.content_length
+
+  def _check(self) -> None:
+    try:
+      allowed = bool(self._request_allowed())
+    except Exception:
+      allowed = False
+    if not allowed:
+      raise PermissionError("upload request is no longer allowed")
+
+  def __iter__(self):
+    for segment in self._segments:
+      if isinstance(segment, bytes):
+        for offset in range(0, len(segment), GUARDED_MULTIPART_CHUNK_SIZE):
+          self._check()
+          yield segment[offset:offset + GUARDED_MULTIPART_CHUNK_SIZE]
+        continue
+
+      while True:
+        self._check()
+        chunk = segment.read(GUARDED_MULTIPART_CHUNK_SIZE)
+        self._check()
+        if not chunk:
+          break
+        yield chunk
 
 
 def normalize_base_url(value: Any, default: str = "") -> str:
@@ -36,6 +110,31 @@ def normalize_base_url(value: Any, default: str = "") -> str:
   if url and not url.startswith(("http://", "https://")):
     raise ValueError("web upload URL must start with http:// or https://")
   return url
+
+
+def is_private_validation_upload_url(value: Any) -> bool:
+  """Allow only the owner's pinned HTTPS origin, standard port, and root path."""
+  raw = str(value or "").strip()
+  # urlsplit() loses the presence of empty query/fragment delimiters. Reject
+  # those delimiters before parsing, and pin the exact accepted netloc forms.
+  if "?" in raw or "#" in raw:
+    return False
+  try:
+    parsed = urllib.parse.urlsplit(raw)
+    port = parsed.port
+  except (TypeError, ValueError):
+    return False
+  return (
+    parsed.scheme.lower() == "https"
+    and str(parsed.hostname or "").lower() == "adot.synology.me"
+    and parsed.netloc.lower() in ("adot.synology.me", "adot.synology.me:443")
+    and port in (None, 443)
+    and parsed.username is None
+    and parsed.password is None
+    and parsed.path in ("", "/")
+    and not parsed.query
+    and not parsed.fragment
+  )
 
 
 def validation_device_proof_message(
@@ -256,6 +355,8 @@ async def create_validation_upload_session(
   should_continue: Callable[[], bool] | None = None,
 ) -> str:
   """Authenticate with a receiver-pinned proof from the device registration key."""
+  if not is_private_validation_upload_url(base_url):
+    raise RuntimeError("validation upload requires the pinned DK HTTPS origin")
   device_id = upload_device_id(metadata)
   if device_id == "unknown":
     raise RuntimeError("registered device id is required for validation upload")
@@ -369,6 +470,19 @@ def post_tmux_web(
       files.append(("files[1]", ("toggle_values.json", settings_file, "application/json")))
     if request_allowed is not None and not request_allowed():
       raise PermissionError("upload request is no longer allowed")
+    if request_allowed is not None:
+      body = GuardedMultipartBody(payload, files, request_allowed)
+      guarded_headers = {
+        **dict(headers),
+        "Content-Type": body.content_type,
+        "Content-Length": str(body.content_length),
+      }
+      return post(
+        url,
+        headers=guarded_headers,
+        data=body,
+        timeout=30,
+      )
     return post(
       url,
       headers=dict(headers),
@@ -525,6 +639,9 @@ async def upload_validation_folder_to_web(
   on_progress: Callable[[str, int, int, int], None] | None = None,
 ) -> bool:
   """Stream an immutable, hash-verified validation capture segment."""
+  if not is_private_validation_upload_url(base_url):
+    raise RuntimeError("validation upload requires the pinned DK HTTPS origin")
+
   def check_cancel() -> None:
     if should_cancel and should_cancel():
       raise RuntimeError("upload canceled")
@@ -653,6 +770,8 @@ async def send_validation_upload_complete(
   payload: dict[str, Any],
   should_continue: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+  if not is_private_validation_upload_url(base_url):
+    return {"ok": False, "error": "validation upload requires the pinned DK HTTPS origin"}
   if not token:
     return {"ok": False, "error": "authenticated validation upload session is not configured"}
   try:

@@ -13,7 +13,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from openpilot.cereal import car, log, messaging
 from openpilot.common.swaglog import cloudlog
@@ -21,7 +20,8 @@ from openpilot.system.hardware import HARDWARE
 from openpilot.system.loggerd.deleter import PRESERVE_ATTR_VALUE, VALIDATION_PRESERVE_ATTR_NAME
 from openpilot.system.loggerd.xattr_cache import getxattr_direct, setxattr
 from openpilot.selfdrive.carrot.web_upload import (
-  DEFAULT_WEB_UPLOAD_URL,
+  DK_VALIDATION_UPLOAD_ORIGIN,
+  is_private_validation_upload_url,
   validation_manifest_sha256,
   validation_receipt_id,
 )
@@ -54,7 +54,10 @@ MAX_ROUTE_NAME_BYTES = 220
 MAX_PENDING_BYTES = 750 * 1024 * 1024
 MAX_CAPTURES_PER_CONDITION = 2
 OFFROAD_STABLE_SECONDS = 10.0
-STOP_CAPTURE_SECONDS = 30.5
+# Capture the beginning of the stopped epoch while the same rlog still holds
+# the stock SCC state transition. This is observation-only and never drives a
+# cruise button or vehicle-control message.
+STOP_CAPTURE_SECONDS = 0.5
 SHORT_STOP_MIN_SECONDS = 8.0
 LANE_CAPTURE_SECONDS = 15.0
 LANE_CAPTURE_MIN_SPEED = 10.0
@@ -86,12 +89,14 @@ NETWORK_GUARD_INITIAL_TIMEOUT_SECONDS = 1.0
 RETRY_DELAYS = (30.0, 120.0, 600.0, 3600.0, 6 * 3600.0)
 
 TARGET_CONDITIONS = frozenset({
-  "standstill_on",
+  "standstill_on_no_request",
   "lane_offset_10",
   "stock_scc_close_accel",
 })
 OPTIONAL_CONDITIONS = frozenset({
-  "standstill_on_no_request",
+  # Retain the superseded controller-request classification for a capture
+  # already in flight while an older build is upgraded.
+  "standstill_on",
   "lane_offset_0",
 })
 # Keep already queued captures from A/B builds readable and uploadable, but do
@@ -101,31 +106,26 @@ LEGACY_CONDITIONS = frozenset({
   "standstill_off",
   "standstill_off_physical_res",
 })
+NEW_CAMPAIGN_CONDITIONS = TARGET_CONDITIONS | OPTIONAL_CONDITIONS
 CAPTURE_CONDITIONS = TARGET_CONDITIONS | OPTIONAL_CONDITIONS | LEGACY_CONDITIONS
-
-
-def _is_https_upload_url(value: Any) -> bool:
-  try:
-    parsed = urlsplit(str(value or "").strip())
-    return parsed.scheme.lower() == "https" and bool(parsed.hostname) and not parsed.username and not parsed.password
-  except ValueError:
-    return False
+MAX_NEW_CAMPAIGN_CAPTURES = len(NEW_CAMPAIGN_CONDITIONS) * MAX_CAPTURES_PER_CONDITION
+MAX_NEW_CAMPAIGN_RLOGS = MAX_NEW_CAMPAIGN_CAPTURES * MAX_SEGMENTS_PER_CAPTURE
+MAX_COMPAT_CAPTURE_RECORDS = len(CAPTURE_CONDITIONS) * MAX_CAPTURES_PER_CONDITION
+MAX_COMPAT_RLOG_RECORDS = MAX_COMPAT_CAPTURE_RECORDS * MAX_SEGMENTS_PER_CAPTURE
 
 
 def _configured_validation_upload_base_url(raw_override: Any) -> str:
   """Resolve the immutable receiver, failing closed on a malformed override."""
   raw = str(raw_override or "").strip()
   if not raw:
-    return DEFAULT_WEB_UPLOAD_URL.rstrip("/")
-  normalized = raw.rstrip("/")
-  return normalized if _is_https_upload_url(normalized) else ""
+    raw = DK_VALIDATION_UPLOAD_ORIGIN
+  return DK_VALIDATION_UPLOAD_ORIGIN if is_private_validation_upload_url(raw) else ""
 
 
 # The validation receiver sees only a challenge-bound signature made with the
 # device registration key while establishing an upload session; it never sees
 # a reusable comma API bearer. Automatic collection still trusts only the
-# operator-controlled built-in receiver (or one immutable deployment-time
-# override), never a Web UI value.
+# operator-controlled pinned receiver, never a Web UI or deployment value.
 # A non-empty malformed override disables the feature instead of silently
 # falling back to a different receiver than the deployer intended.
 VALIDATION_UPLOAD_BASE_URL = _configured_validation_upload_base_url(
@@ -134,10 +134,12 @@ VALIDATION_UPLOAD_BASE_URL = _configured_validation_upload_base_url(
 
 
 def _campaign_uses_trusted_receiver(campaign: Any) -> bool:
+  campaign_base_url = str(campaign.get("base_url") or "").strip() if isinstance(campaign, dict) else ""
   return (
     isinstance(campaign, dict)
-    and _is_https_upload_url(VALIDATION_UPLOAD_BASE_URL)
-    and str(campaign.get("base_url") or "").rstrip("/") == VALIDATION_UPLOAD_BASE_URL
+    and is_private_validation_upload_url(VALIDATION_UPLOAD_BASE_URL)
+    and is_private_validation_upload_url(campaign_base_url)
+    and campaign_base_url == VALIDATION_UPLOAD_BASE_URL
   )
 
 
@@ -429,21 +431,20 @@ class ValidationEventDetector:
       or sample.cancel_requested
     )
 
-  @classmethod
-  def _standstill_active(cls, sample: ValidationSample) -> bool:
+  @staticmethod
+  def _standstill_active(sample: ValidationSample) -> bool:
     return (
       sample.standstill
       and sample.cruise_enabled
       and sample.can_valid
       and sample.engaged
       and abs(sample.v_ego) <= 0.05
-      and not cls._driver_interlock(sample)
     )
 
   @staticmethod
   def _standstill_condition() -> str:
-    # The supported KA4 controller now applies the behavior automatically.
-    # Legacy OFF IDs remain accepted for restored queues only.
+    # Current production control is observation-only: periodic stopped-lead
+    # rearm is quarantined until a target-car capture proves a safe mechanism.
     return "standstill_on_no_request"
 
   @staticmethod
@@ -500,7 +501,7 @@ class ValidationEventDetector:
         events.append({
           "condition": self._standstill_condition(),
           "duration": round(duration, 3),
-          "trigger": "duration_no_keepalive_request",
+          "trigger": "standstill_observed",
           "qualified": bool(sample.ka4_keepalive_qualified),
           "controllerStoppedSec": round(max(0.0, sample.ka4_keepalive_stopped_sec), 3),
         })
@@ -808,7 +809,7 @@ def _sanitize_state(raw: Any) -> dict[str, Any]:
         "id": campaign_id,
         "started_at": started_at,
         "expires_at": expires_at,
-        "base_url": base_url.rstrip("/")[:500],
+        "base_url": base_url[:500],
       }
     else:
       _mark_state_invalid(state, "automatic validation upload campaign is not valid")
@@ -1098,10 +1099,9 @@ def _disable_invalid_state_consent(state: dict[str, Any], params: Any) -> bool:
 
 def _route_settings(params: Any) -> dict[str, int]:
   return {
-    # A route is created only after ka4_stock_scc_gate() proves the exact
-    # automatic-on topology. Do not race the controller's compatibility Param
-    # write or let a stale legacy zero misclassify a current route.
-    "Ka4StockSccStandstillRearm": 1,
+    # This is a legacy diagnostic field. New builds force it to zero because
+    # periodic stopped-lead RES rearming is not enabled in production.
+    "Ka4StockSccStandstillRearm": _param_int(params, "Ka4StockSccStandstillRearm"),
     "PathOffset": _param_int(params, "PathOffset"),
     "AdjustLaneOffset": _param_int(params, "AdjustLaneOffset"),
   }
@@ -1142,15 +1142,22 @@ def _git_identity(params: Any) -> dict[str, Any]:
   }
 
 
-def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
+def validation_owner_device_gate(params: Any) -> tuple[bool, dict[str, Any]]:
+  """Scope the private campaign to the exact registered owner device."""
   device_id = _param_text(params, "DongleId")
   device_id_sha256 = hashlib.sha256(device_id.encode("utf-8")).hexdigest() if device_id else ""
-  if device_id_sha256 not in DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256:
-    return False, {
-      "reason": "device_not_allowed",
-      "deviceId": device_id or "unknown",
-      "deviceAllowed": False,
-    }
+  allowed = device_id_sha256 in DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256
+  return allowed, {
+    "reason": "" if allowed else "device_not_allowed",
+    "deviceId": device_id or "unknown",
+    "deviceAllowed": allowed,
+  }
+
+
+def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
+  owner_allowed, owner = validation_owner_device_gate(params)
+  if not owner_allowed:
+    return False, owner
 
   raw = None
   for key in ("CarParams", "CarParamsPersistent"):
@@ -1172,9 +1179,10 @@ def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
       and bool(flags & int(HyundaiFlags.CANFD))
       and bool(flags & int(HyundaiFlags.RADAR_SCC))
       and not bool(flags & int(HyundaiFlags.CAMERA_SCC))
+      and not bool(flags & int(HyundaiFlags.CANFD_HDA2))
     )
     return gate, {
-      "deviceId": device_id,
+      "deviceId": owner["deviceId"],
       "deviceAllowed": True,
       "carFingerprint": str(cp.carFingerprint),
       "pcmCruise": bool(cp.pcmCruise),
@@ -1880,6 +1888,7 @@ PUBLIC_STATUS_CODES = frozenset({
   "complete",
   "complete_disable_failed",
   "destination_changed",
+  "device_not_allowed",
   "disabled",
   "error",
   "expired",
@@ -1941,6 +1950,9 @@ def _upload_runtime_safety_allows(
   try:
     if not _campaign_uses_trusted_receiver(campaign):
       return False, "automatic upload receiver is not trusted"
+    owner_allowed, _owner = validation_owner_device_gate(params)
+    if not owner_allowed:
+      return False, "automatic upload device is not allowlisted"
     if not device_state_safe():
       return False, "live device state is stale, invalid, or started"
     if not network_state_safe():
@@ -2575,6 +2587,28 @@ async def _validation_auto_upload_worker(
         await asyncio.sleep(max(1.0, poll_interval))
         continue
 
+      owner_allowed, owner = validation_owner_device_gate(params)
+      if not owner_allowed:
+        disabled = _disable_consent(params)
+        last_enabled = False if disabled else enabled
+        if campaign or state.get("queue") or state.get("active_route"):
+          terminal = _terminal_cleanup_state(state, "device_not_allowed")
+          if write_validation_upload_state(terminal, state_path):
+            state = terminal
+            _finish_preserve_cleanup(state, root)
+            write_validation_upload_state(state, state_path)
+          else:
+            state["status"] = "state_write_failed"
+            state["last_error"] = "disallowed-device cleanup could not be journaled"
+        else:
+          state["status"] = "device_not_allowed"
+          state["last_error"] = str(owner.get("reason") or "device is not allowlisted")
+          write_validation_upload_state(state, state_path)
+        detector.reset()
+        physical_res_latched_until = 0.0
+        await asyncio.sleep(max(1.0, poll_interval))
+        continue
+
       if campaign is None:
         if state.get("cleanup_preserve"):
           state["status"] = "cleanup_pending"
@@ -2602,11 +2636,11 @@ async def _validation_auto_upload_worker(
           write_validation_upload_state(state, state_path)
           await asyncio.sleep(max(1.0, poll_interval))
           continue
-        if not _is_https_upload_url(VALIDATION_UPLOAD_BASE_URL):
+        if not is_private_validation_upload_url(VALIDATION_UPLOAD_BASE_URL):
           disabled = _disable_consent(params)
           last_enabled = False if disabled else enabled
           state["status"] = "https_required"
-          state["last_error"] = "automatic validation receiver deployment requires HTTPS"
+          state["last_error"] = "automatic validation requires the pinned DK HTTPS origin"
           write_validation_upload_state(state, state_path)
           await asyncio.sleep(max(1.0, poll_interval))
           continue

@@ -85,8 +85,8 @@ async def api_web_consent_session(request: web.Request) -> web.Response:
   if token is None:
     return web.json_response({
       "ok": False,
-      "error": "Web consent sessions require a trusted local Carrot Web origin",
-      "error_code": "WEB_CONSENT_ORIGIN_REJECTED",
+      "error": "Open Carrot Web on the phone providing the active Wi-Fi tether to enable this consent",
+      "error_code": "WEB_CONSENT_CLIENT_REJECTED",
     }, status=403, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
   return web.json_response({
     "ok": True,

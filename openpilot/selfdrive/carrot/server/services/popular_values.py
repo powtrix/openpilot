@@ -11,7 +11,10 @@ from urllib.parse import urlparse, urlunparse
 
 from aiohttp import ClientSession
 
-from ...community_data import community_data_sharing_enabled
+from ...community_data import (
+  community_data_sharing_generation,
+  community_data_sharing_generation_matches,
+)
 from .params import HAS_PARAMS, Params, get_param_values, infer_type_from_setting
 from .settings import get_settings_cached
 
@@ -356,11 +359,20 @@ async def _post_snapshot(
   timeout_s: float,
   headers: dict[str, str],
   params: Params,
+  consent_generation: str,
 ) -> tuple[bool, int, str]:
-  if not community_data_sharing_enabled(params):
+  if not community_data_sharing_generation_matches(consent_generation, params):
     return False, 0, "community data sharing disabled"
+  encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+  async def guarded_body():
+    if not community_data_sharing_generation_matches(consent_generation, params):
+      raise PermissionError("community data sharing consent changed")
+    yield encoded_payload
+
   try:
-    async with session.post(url, json=payload, timeout=timeout_s, headers=headers) as resp:
+    request_headers = {**headers, "Content-Type": "application/json", "Content-Length": str(len(encoded_payload))}
+    async with session.post(url, data=guarded_body(), timeout=timeout_s, headers=request_headers) as resp:
       text = await resp.text()
       return 200 <= resp.status < 300, int(resp.status), text
   except Exception as exc:
@@ -371,7 +383,8 @@ async def download_popular_values_once(session: ClientSession) -> dict[str, Any]
   if not HAS_PARAMS:
     return None
   params = Params()
-  if not community_data_sharing_enabled(params):
+  consent_generation = community_data_sharing_generation(params)
+  if consent_generation is None:
     return None
   url = _popular_url(params)
   car_key = _param_text(params, "CarSelected3")
@@ -381,7 +394,7 @@ async def download_popular_values_once(session: ClientSession) -> dict[str, Any]
 
   timeout_s = max(1.0, _env_float("CARROT_PARAM_VALUE_TIMEOUT_S", DEFAULT_TIMEOUT_S))
   try:
-    if not community_data_sharing_enabled(params):
+    if not community_data_sharing_generation_matches(consent_generation, params):
       return None
     async with session.get(
       url,
@@ -408,7 +421,8 @@ async def popular_value_upload_once(session: ClientSession) -> bool:
   if not HAS_PARAMS:
     return False
   params = Params()
-  if not community_data_sharing_enabled(params):
+  consent_generation = community_data_sharing_generation(params)
+  if consent_generation is None:
     return False
   url = _snapshot_url(params)
   if not url:
@@ -428,9 +442,17 @@ async def popular_value_upload_once(session: ClientSession) -> bool:
 
   headers = _request_headers(params)
   for attempt in range(1, retry_count + 1):
-    if not community_data_sharing_enabled(params):
+    if not community_data_sharing_generation_matches(consent_generation, params):
       return False
-    ok, status, body = await _post_snapshot(session, url, payload, timeout_s, headers, params)
+    ok, status, body = await _post_snapshot(
+      session,
+      url,
+      payload,
+      timeout_s,
+      headers,
+      params,
+      consent_generation,
+    )
     if ok:
       print(
         f"[carrot_param_value] uploaded car_key={payload.get('car_key')} params={len(payload.get('values') or {})}",
@@ -456,7 +478,7 @@ async def refresh_popular_values_once(session: ClientSession, *, upload: bool = 
 
 def start_popular_value_upload(app: Any) -> asyncio.Task | None:
   session = app.get("http")
-  if session is None or not community_data_sharing_enabled():
+  if session is None or community_data_sharing_generation() is None:
     return None
   return asyncio.create_task(refresh_popular_values_once(session, upload=True))
 
@@ -472,7 +494,7 @@ def schedule_popular_value_refresh(app: Any, min_interval: float | None = None) 
   reflects fleet changes within ~min_interval, without polling or websockets.
   Does NOT re-upload (that only happens once at boot)."""
   global _popular_refresh_last_at, _popular_refresh_task
-  if not community_data_sharing_enabled():
+  if community_data_sharing_generation() is None:
     return
   session = app.get("http")
   if session is None:

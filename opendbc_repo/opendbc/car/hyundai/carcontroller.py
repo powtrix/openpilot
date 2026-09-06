@@ -44,11 +44,14 @@ CANFD_JERK_ERROR_FULL_SCALE = 0.5
 CANFD_JERK_RELEASE_THRESHOLD = 0.1
 KA4_STOCK_SCC_MAX_STANDSTILL_GRACE = 30.0
 KA4_STOCK_SCC_OEM_REARM_INTERVAL = 3.0
-# This validation path treats SCC_CONTROL.InfoDisplay == 4 as a stock
-# standstill/resume-state input. On variants that carry ADRV_0x161,
-# ALERTS_5 == 5 decodes to the reported switch-or-pedal resume prompt, though
-# no synchronized route/cluster capture is available. The synthetic schedule's
-# assumption that an accepted RES changes the OEM timing remains unproven on-car.
+# Periodic RES while a stopped lead is present is kept only as an offline test
+# harness. Public KA4 captures do not contain ADRV_0x161, and an accepted RES
+# has not been shown to reset the stock SCC timer. Never enable this actuator
+# path in a production controller without target-car evidence.
+KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED = False
+# The offline validation path treats SCC_CONTROL.InfoDisplay == 4 as the stock
+# standstill/resume-state input. The synthetic schedule's assumption that an
+# accepted RES changes the OEM timing remains unproven on-car.
 # Stop requesting early enough that the modeled final interval ends near 30 s.
 KA4_STOCK_SCC_REARM_CUTOFF = KA4_STOCK_SCC_MAX_STANDSTILL_GRACE - KA4_STOCK_SCC_OEM_REARM_INTERVAL
 KA4_STOCK_SCC_FIRST_REARM_DELAY = 2.5
@@ -262,11 +265,13 @@ class CarController(CarControllerBase):
     self.camera_scc_params = params.get_int("HyundaiCameraSCC")
     self.is_ldws_car = params.get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
-    self.ka4_stock_scc_standstill_rearm = _ka4_stock_scc_standstill_supported(self.CP)
-    if self.ka4_stock_scc_standstill_rearm:
-      # Keep the legacy Params value as route/validation metadata, but do not
-      # make this owner's requested KA4 behavior depend on a hidden UI toggle.
-      params.put_int_nonblocking("Ka4StockSccStandstillRearm", 1)
+    self.ka4_stock_scc_standstill_rearm = (
+      KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED and _ka4_stock_scc_standstill_supported(self.CP)
+    )
+    # Clear the value written by the earlier automatic experiment. The Param
+    # is retained only so old route metadata remains readable.
+    if params.get_int("Ka4StockSccStandstillRearm") != 0:
+      params.put_int_nonblocking("Ka4StockSccStandstillRearm", 0)
 
     self.stock_scc_stop_start_frame = None
     self.stock_scc_near_zero_frames = 0
@@ -332,9 +337,11 @@ class CarController(CarControllerBase):
       self.canfd_debug = params.get_int("CanfdDebug")
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
-      self.ka4_stock_scc_standstill_rearm = _ka4_stock_scc_standstill_supported(self.CP)
-      if self.ka4_stock_scc_standstill_rearm and params.get_int("Ka4StockSccStandstillRearm") != 1:
-        params.put_int_nonblocking("Ka4StockSccStandstillRearm", 1)
+      self.ka4_stock_scc_standstill_rearm = (
+        KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED and _ka4_stock_scc_standstill_supported(self.CP)
+      )
+      if params.get_int("Ka4StockSccStandstillRearm") != 0:
+        params.put_int_nonblocking("Ka4StockSccStandstillRearm", 0)
       self.paddle_mode = params.get_int("PaddleMode")
 
     actuators = CC.actuators
@@ -556,9 +563,8 @@ class CarController(CarControllerBase):
     if self.CP.flags & HyundaiFlags.CANFD:
       hda2 = self.CP.flags & HyundaiFlags.CANFD_HDA2
       hda2_long = hda2 and self.CP.openpilotLongitudinalControl
-      if not self.CP.openpilotLongitudinalControl:
-        # Compute the current-frame KA4 qualification and alert mask before
-        # replacing the cluster message, avoiding a visible one-frame leak.
+      if not self.CP.openpilotLongitudinalControl and self.ka4_stock_scc_standstill_rearm:
+        # Offline-only actuator harness; production builds keep this gate false.
         self._update_ka4_stock_scc_keepalive(CC, CS)
       # steering control
       if camera_scc:
@@ -934,7 +940,7 @@ class CarController(CarControllerBase):
     fail-open condition.
     """
     self.stock_scc_resume_alert_suppressed = False
-    supported = _ka4_stock_scc_standstill_supported(self.CP)
+    supported = self.ka4_stock_scc_standstill_rearm and _ka4_stock_scc_standstill_supported(self.CP)
     hda2 = bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
     if not supported or hda2:
       self.stock_scc_alert_stop_start_frame = None
@@ -1013,7 +1019,7 @@ class CarController(CarControllerBase):
     # request gates below. It is updated first so a newly received prompt is
     # replaced in the same controller cycle.
     self._update_ka4_stock_scc_resume_alert_mask(CC, CS)
-    supported = _ka4_stock_scc_standstill_supported(self.CP)
+    supported = self.ka4_stock_scc_standstill_rearm and _ka4_stock_scc_standstill_supported(self.CP)
     if not supported:
       self._reset_ka4_stock_scc_keepalive()
       return

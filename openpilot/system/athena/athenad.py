@@ -31,12 +31,17 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.api import Api, get_key_pair
-from openpilot.common.external_data import third_party_data_sharing_enabled
+from openpilot.common.external_data import (
+  third_party_data_sharing_enabled,
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.common.utils import CallbackReader, get_upload_stream
 from openpilot.common.params import Params
 from openpilot.common.realtime import set_core_affinity
 from openpilot.system.hardware import HARDWARE, PC
 from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
+from openpilot.system.athena.consent_artifacts import artifact_is_blocked, prepare_consent_session
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.version import get_build_metadata
 from openpilot.system.hardware.hw import Paths
@@ -131,6 +136,7 @@ upload_queue: Queue[UploadItem] = queue.PriorityQueue()
 low_priority_send_queue: Queue[str] = queue.Queue()
 log_recv_queue: Queue[str] = queue.Queue()
 cancelled_uploads: set[str] = set()
+active_consent_generation: str | None = None
 
 cur_upload_items: dict[int, UploadItem | None] = {}
 
@@ -145,8 +151,17 @@ class AbortTransferException(Exception):
   pass
 
 
-def _require_third_party_data_sharing(params: Params | None = None) -> None:
-  if not third_party_data_sharing_enabled(params):
+def _require_third_party_data_sharing(
+  params: Params | None = None,
+  consent_generation: str | None = None,
+) -> None:
+  expected = consent_generation if consent_generation is not None else active_consent_generation
+  allowed = (
+    third_party_data_sharing_generation_matches(expected, params)
+    if expected is not None
+    else third_party_data_sharing_enabled(params)
+  )
+  if not allowed:
     raise AbortTransferException("automatic third-party data sharing is disabled")
 
 
@@ -172,22 +187,29 @@ class UploadQueueCache:
       cloudlog.exception("athena.UploadQueueCache.cache.exception")
 
 
-def handle_long_poll(ws: WebSocket, exit_event: threading.Event | None) -> None:
+def handle_long_poll(
+  ws: WebSocket,
+  exit_event: threading.Event | None,
+  consent_generation: str | None = None,
+) -> None:
   end_event = threading.Event()
   params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
+  _require_third_party_data_sharing(params, consent_generation)
 
   threads = [
     threading.Thread(target=ws_manage, args=(ws, end_event), name='ws_manage'),
-    threading.Thread(target=ws_recv, args=(ws, end_event), name='ws_recv'),
-    threading.Thread(target=ws_send, args=(ws, end_event), name='ws_send'),
-    threading.Thread(target=upload_handler, args=(end_event,), name='upload_handler'),
-    threading.Thread(target=upload_handler, args=(end_event,), name='upload_handler2'),
-    threading.Thread(target=upload_handler, args=(end_event,), name='upload_handler3'),
-    threading.Thread(target=upload_handler, args=(end_event,), name='upload_handler4'),
-    threading.Thread(target=log_handler, args=(end_event,), name='log_handler'),
-    threading.Thread(target=stat_handler, args=(end_event,), name='stat_handler'),
+    threading.Thread(target=ws_recv, args=(ws, end_event, consent_generation), name='ws_recv'),
+    threading.Thread(target=ws_send, args=(ws, end_event, consent_generation), name='ws_send'),
+    threading.Thread(target=upload_handler, args=(end_event, consent_generation), name='upload_handler'),
+    threading.Thread(target=upload_handler, args=(end_event, consent_generation), name='upload_handler2'),
+    threading.Thread(target=upload_handler, args=(end_event, consent_generation), name='upload_handler3'),
+    threading.Thread(target=upload_handler, args=(end_event, consent_generation), name='upload_handler4'),
+    threading.Thread(target=log_handler, args=(end_event, consent_generation), name='log_handler'),
+    threading.Thread(target=stat_handler, args=(end_event, consent_generation), name='stat_handler'),
   ] + [
-    threading.Thread(target=jsonrpc_handler, args=(end_event,), name=f'worker_{x}')
+    threading.Thread(target=jsonrpc_handler, args=(end_event, consent_generation), name=f'worker_{x}')
     for x in range(HANDLER_THREADS)
   ]
 
@@ -197,7 +219,7 @@ def handle_long_poll(ws: WebSocket, exit_event: threading.Event | None) -> None:
     while not end_event.wait(0.1):
       if (
         (exit_event is not None and exit_event.is_set())
-        or not third_party_data_sharing_enabled(params)
+        or not third_party_data_sharing_generation_matches(consent_generation, params)
       ):
         end_event.set()
   except (KeyboardInterrupt, SystemExit):
@@ -213,24 +235,39 @@ def handle_long_poll(ws: WebSocket, exit_event: threading.Event | None) -> None:
       thread.join()
 
 
-def jsonrpc_handler(end_event: threading.Event) -> None:
-  dispatcher["startLocalProxy"] = partial(startLocalProxy, end_event)
+def jsonrpc_handler(end_event: threading.Event, consent_generation: str | None = None) -> None:
+  params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
+  dispatcher["startLocalProxy"] = partial(startLocalProxy, end_event, consent_generation=consent_generation)
   while not end_event.is_set():
     try:
       data = recv_queue.get(timeout=1)
+      if not third_party_data_sharing_generation_matches(consent_generation, params):
+        end_event.set()
+        continue
       if "method" in data:
         cloudlog.event("athena.jsonrpc_handler.call_method", data=data)
         response = JSONRPCResponseManager.handle(data, dispatcher)
-        send_queue.put_nowait(response.json)
+        if third_party_data_sharing_generation_matches(consent_generation, params):
+          send_queue.put_nowait(response.json)
+        else:
+          end_event.set()
       elif "id" in data and ("result" in data or "error" in data):
-        log_recv_queue.put_nowait(data)
+        if third_party_data_sharing_generation_matches(consent_generation, params):
+          log_recv_queue.put_nowait(data)
+        else:
+          end_event.set()
       else:
         raise Exception("not a valid request or response")
     except queue.Empty:
       pass
     except Exception as e:
       cloudlog.exception("athena jsonrpc handler failed")
-      send_queue.put_nowait(json.dumps({"error": str(e)}))
+      if third_party_data_sharing_generation_matches(consent_generation, params):
+        send_queue.put_nowait(json.dumps({"error": str(e)}))
+      else:
+        end_event.set()
 
 
 def retry_upload(tid: int, end_event: threading.Event, increase_count: bool = True) -> None:
@@ -255,7 +292,7 @@ def retry_upload(tid: int, end_event: threading.Event, increase_count: bool = Tr
         break
 
 
-def cb(sm, item, tid, end_event: threading.Event, sz: int, cur: int) -> None:
+def cb(sm, item, tid, end_event: threading.Event, consent_generation: str | None, sz: int, cur: int) -> None:
   # Abort transfer if connection changed to metered after starting upload
   # or if athenad is shutting down to re-connect the websocket
   if not item.allow_cellular:
@@ -264,19 +301,22 @@ def cb(sm, item, tid, end_event: threading.Event, sz: int, cur: int) -> None:
       if sm['deviceState'].networkMetered:
         raise AbortTransferException
 
-  if end_event.is_set() or not third_party_data_sharing_enabled():
+  if end_event.is_set() or not third_party_data_sharing_generation_matches(consent_generation):
     raise AbortTransferException
 
   cur_upload_items[tid] = replace(item, progress=cur / sz if sz else 1)
 
 
-def upload_handler(end_event: threading.Event) -> None:
+def upload_handler(end_event: threading.Event, consent_generation: str | None = None) -> None:
   sm = messaging.SubMaster(['deviceState'])
   params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
   tid = threading.get_ident()
 
   while not end_event.is_set():
-    if not third_party_data_sharing_enabled(params):
+    if not third_party_data_sharing_generation_matches(consent_generation, params):
+      end_event.set()
       end_event.wait(0.25)
       continue
     cur_upload_items[tid] = None
@@ -303,7 +343,7 @@ def upload_handler(end_event: threading.Event) -> None:
         continue
 
       try:
-        _require_third_party_data_sharing(params)
+        _require_third_party_data_sharing(params, consent_generation)
         fn = item.path
         try:
           sz = os.path.getsize(fn)
@@ -312,7 +352,11 @@ def upload_handler(end_event: threading.Event) -> None:
 
         cloudlog.event("athena.upload_handler.upload_start", fn=fn, sz=sz, network_type=network_type, metered=metered, retry_count=item.retry_count)
 
-        with _do_upload(item, partial(cb, sm, item, tid, end_event)) as response:
+        with _do_upload(
+          item,
+          partial(cb, sm, item, tid, end_event, consent_generation),
+          consent_generation,
+        ) as response:
           if response.status_code not in (200, 201, 401, 403, 412):
             cloudlog.event("athena.upload_handler.retry", status_code=response.status_code, fn=fn, sz=sz, network_type=network_type, metered=metered)
             retry_upload(tid, end_event)
@@ -333,8 +377,12 @@ def upload_handler(end_event: threading.Event) -> None:
       cloudlog.exception("athena.upload_handler.exception")
 
 
-def _do_upload(upload_item: UploadItem, callback: Callable | None = None) -> requests.Response:
-  _require_third_party_data_sharing()
+def _do_upload(
+  upload_item: UploadItem,
+  callback: Callable | None = None,
+  consent_generation: str | None = None,
+) -> requests.Response:
+  _require_third_party_data_sharing(consent_generation=consent_generation)
   path = upload_item.path
   compress = False
 
@@ -342,13 +390,18 @@ def _do_upload(upload_item: UploadItem, callback: Callable | None = None) -> req
   if not os.path.exists(path) and os.path.exists(strip_zst_extension(path)):
     path = strip_zst_extension(path)
     compress = True
+  if artifact_is_blocked(path):
+    raise AbortTransferException("artifact predates the current consent session")
 
   stream = None
   try:
     stream, content_length = get_upload_stream(path, compress)
-    _require_third_party_data_sharing()
+    _require_third_party_data_sharing(consent_generation=consent_generation)
+    guarded_callback = callback or (
+      lambda _size, _current: _require_third_party_data_sharing(consent_generation=consent_generation)
+    )
     response = UPLOAD_SESS.put(upload_item.url,
-                               data=CallbackReader(stream, callback, content_length) if callback else stream,
+                               data=CallbackReader(stream, guarded_callback, content_length),
                                headers={**upload_item.headers, 'Content-Length': str(content_length)},
                                timeout=30)
     return response
@@ -435,7 +488,8 @@ def uploadFilesToUrls(files_data: list[UploadFileDict]) -> UploadFilesToUrlRespo
       continue
 
     path = os.path.join(Paths.log_root(), file.fn)
-    if not os.path.exists(path) and not os.path.exists(strip_zst_extension(path)):
+    resolved_path = path if os.path.exists(path) else strip_zst_extension(path)
+    if not os.path.exists(resolved_path) or artifact_is_blocked(resolved_path):
       failed.append(file.fn)
       continue
 
@@ -503,9 +557,16 @@ def setRouteViewed(route: str) -> dict[str, int | str]:
   return {"success": 1}
 
 
-def startLocalProxy(global_end_event: threading.Event, remote_ws_uri: str, local_port: int) -> dict[str, int]:
+def startLocalProxy(
+  global_end_event: threading.Event,
+  remote_ws_uri: str,
+  local_port: int,
+  consent_generation: str | None = None,
+) -> dict[str, int]:
   try:
-    _require_third_party_data_sharing()
+    if consent_generation is None:
+      consent_generation = third_party_data_sharing_generation()
+    _require_third_party_data_sharing(consent_generation=consent_generation)
     # migration, can be removed once 0.9.8 is out for a while
     if local_port == 8022:
       local_port = 22
@@ -517,9 +578,15 @@ def startLocalProxy(global_end_event: threading.Event, remote_ws_uri: str, local
 
     dongle_id = Params().get("DongleId")
     identity_token = Api(dongle_id).get_token()
+    _require_third_party_data_sharing(consent_generation=consent_generation)
     ws = create_connection(remote_ws_uri,
                            cookie="jwt=" + identity_token,
                            enable_multithread=True)
+    try:
+      _require_third_party_data_sharing(consent_generation=consent_generation)
+    except Exception:
+      ws.close()
+      raise
 
     # Set TOS to keep connection responsive while under load.
     ws.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, SSH_TOS)
@@ -531,8 +598,14 @@ def startLocalProxy(global_end_event: threading.Event, remote_ws_uri: str, local
 
     proxy_end_event = threading.Event()
     threads = [
-      threading.Thread(target=ws_proxy_recv, args=(ws, local_sock, ssock, proxy_end_event, global_end_event)),
-      threading.Thread(target=ws_proxy_send, args=(ws, local_sock, csock, proxy_end_event))
+      threading.Thread(
+        target=ws_proxy_recv,
+        args=(ws, local_sock, ssock, proxy_end_event, global_end_event, consent_generation),
+      ),
+      threading.Thread(
+        target=ws_proxy_send,
+        args=(ws, local_sock, csock, proxy_end_event, global_end_event, consent_generation),
+      ),
     ]
     for thread in threads:
       thread.start()
@@ -604,6 +677,8 @@ def get_logs_to_send_sorted() -> list[str]:
   logs = []
   for log_entry in os.listdir(Paths.swaglog_root()):
     log_path = os.path.join(Paths.swaglog_root(), log_entry)
+    if artifact_is_blocked(log_path):
+      continue
     time_sent = 0
     try:
       value = getxattr(log_path, LOG_ATTR_NAME)
@@ -618,15 +693,18 @@ def get_logs_to_send_sorted() -> list[str]:
   return sorted(logs)[:-1]
 
 
-def log_handler(end_event: threading.Event) -> None:
+def log_handler(end_event: threading.Event, consent_generation: str | None = None) -> None:
   if PC:
     return
 
   log_files = []
   last_scan = 0.
   params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
   while not end_event.is_set():
-    if not third_party_data_sharing_enabled(params):
+    if not third_party_data_sharing_generation_matches(consent_generation, params):
+      end_event.set()
       end_event.wait(0.25)
       continue
     try:
@@ -653,7 +731,7 @@ def log_handler(end_event: threading.Event) -> None:
               "jsonrpc": "2.0",
               "id": log_entry
             }
-            if third_party_data_sharing_enabled(params):
+            if third_party_data_sharing_generation_matches(consent_generation, params):
               low_priority_send_queue.put_nowait(json.dumps(jsonrpc))
               curr_log = log_entry
         except OSError:
@@ -685,19 +763,26 @@ def log_handler(end_event: threading.Event) -> None:
       cloudlog.exception("athena.log_handler.exception")
 
 
-def stat_handler(end_event: threading.Event) -> None:
+def stat_handler(end_event: threading.Event, consent_generation: str | None = None) -> None:
   STATS_DIR = Paths.stats_root()
   last_scan = 0.0
   params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
 
   while not end_event.is_set():
-    if not third_party_data_sharing_enabled(params):
+    if not third_party_data_sharing_generation_matches(consent_generation, params):
+      end_event.set()
       end_event.wait(0.25)
       continue
     curr_scan = time.monotonic()
     try:
       if curr_scan - last_scan > 10:
-        stat_filenames = list(filter(lambda name: not name.startswith(tempfile.gettempprefix()), os.listdir(STATS_DIR)))
+        stat_filenames = [
+          name for name in os.listdir(STATS_DIR)
+          if not name.startswith(tempfile.gettempprefix())
+          and not artifact_is_blocked(os.path.join(STATS_DIR, name))
+        ]
         if len(stat_filenames) > 0:
           stat_path = os.path.join(STATS_DIR, stat_filenames[0])
           with open(stat_path) as f:
@@ -709,7 +794,7 @@ def stat_handler(end_event: threading.Event) -> None:
               "jsonrpc": "2.0",
               "id": stat_filenames[0]
             }
-            if third_party_data_sharing_enabled(params):
+            if third_party_data_sharing_generation_matches(consent_generation, params):
               low_priority_send_queue.put_nowait(json.dumps(jsonrpc))
               os.remove(stat_path)
         last_scan = curr_scan
@@ -718,7 +803,16 @@ def stat_handler(end_event: threading.Event) -> None:
     time.sleep(0.1)
 
 
-def ws_proxy_recv(ws: WebSocket, local_sock: socket.socket, ssock: socket.socket, end_event: threading.Event, global_end_event: threading.Event) -> None:
+def ws_proxy_recv(
+  ws: WebSocket,
+  local_sock: socket.socket,
+  ssock: socket.socket,
+  end_event: threading.Event,
+  global_end_event: threading.Event,
+  consent_generation: str | None = None,
+) -> None:
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation()
   while not (end_event.is_set() or global_end_event.is_set()):
     try:
       r = select.select((ws.sock,), (), (), 30)
@@ -726,6 +820,7 @@ def ws_proxy_recv(ws: WebSocket, local_sock: socket.socket, ssock: socket.socket
         data = ws.recv()
         if isinstance(data, str):
           data = data.encode("utf-8")
+        _require_third_party_data_sharing(consent_generation=consent_generation)
         local_sock.sendall(data)
     except WebSocketTimeoutException:
       pass
@@ -742,8 +837,17 @@ def ws_proxy_recv(ws: WebSocket, local_sock: socket.socket, ssock: socket.socket
   end_event.set()
 
 
-def ws_proxy_send(ws: WebSocket, local_sock: socket.socket, signal_sock: socket.socket, end_event: threading.Event) -> None:
-  while not end_event.is_set():
+def ws_proxy_send(
+  ws: WebSocket,
+  local_sock: socket.socket,
+  signal_sock: socket.socket,
+  end_event: threading.Event,
+  global_end_event: threading.Event | None = None,
+  consent_generation: str | None = None,
+) -> None:
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation()
+  while not end_event.is_set() and not (global_end_event is not None and global_end_event.is_set()):
     try:
       r, _, _ = select.select((local_sock, signal_sock), (), ())
       if r:
@@ -757,6 +861,7 @@ def ws_proxy_send(ws: WebSocket, local_sock: socket.socket, signal_sock: socket.
           end_event.set()
           break
 
+        _require_third_party_data_sharing(consent_generation=consent_generation)
         ws.send(data, ABNF.OPCODE_BINARY)
     except Exception:
       cloudlog.exception("athenad.ws_proxy_send.exception")
@@ -767,7 +872,10 @@ def ws_proxy_send(ws: WebSocket, local_sock: socket.socket, signal_sock: socket.
   cloudlog.debug("athena.ws_proxy_send done closing sockets")
 
 
-def ws_recv(ws: WebSocket, end_event: threading.Event) -> None:
+def ws_recv(ws: WebSocket, end_event: threading.Event, consent_generation: str | None = None) -> None:
+  params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
   last_ping = int(time.monotonic() * 1e9)
   while not end_event.is_set():
     try:
@@ -775,7 +883,10 @@ def ws_recv(ws: WebSocket, end_event: threading.Event) -> None:
       if opcode in (ABNF.OPCODE_TEXT, ABNF.OPCODE_BINARY):
         if opcode == ABNF.OPCODE_TEXT:
           data = data.decode("utf-8")
-        recv_queue.put_nowait(data)
+        if third_party_data_sharing_generation_matches(consent_generation, params):
+          recv_queue.put_nowait(data)
+        else:
+          end_event.set()
       elif opcode == ABNF.OPCODE_PING:
         last_ping = int(time.monotonic() * 1e9)
         Params().put("LastAthenaPingTime", last_ping)
@@ -789,17 +900,20 @@ def ws_recv(ws: WebSocket, end_event: threading.Event) -> None:
       end_event.set()
 
 
-def ws_send(ws: WebSocket, end_event: threading.Event) -> None:
+def ws_send(ws: WebSocket, end_event: threading.Event, consent_generation: str | None = None) -> None:
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation()
   while not end_event.is_set():
     try:
       try:
         data = send_queue.get_nowait()
       except queue.Empty:
         data = low_priority_send_queue.get(timeout=1)
-      if not third_party_data_sharing_enabled():
+      if not third_party_data_sharing_generation_matches(consent_generation):
         end_event.set()
         break
       for i in range(0, len(data), WS_FRAME_SIZE):
+        _require_third_party_data_sharing(consent_generation=consent_generation)
         frame = data[i:i+WS_FRAME_SIZE]
         last = i + WS_FRAME_SIZE >= len(data)
         opcode = ABNF.OPCODE_TEXT if i == 0 else ABNF.OPCODE_CONT
@@ -842,15 +956,23 @@ def backoff(retries: int) -> int:
 
 
 def main(exit_event: threading.Event | None = None):
+  global active_consent_generation
+  active_consent_generation = None
   try:
     set_core_affinity([0, 1, 2, 3])
   except Exception:
     cloudlog.exception("failed to set core affinity")
 
   params = Params()
-  if not third_party_data_sharing_enabled(params):
+  try:
+    consent_generation = prepare_consent_session(params)
+  except Exception:
+    cloudlog.exception("athenad failed to prepare third-party consent session")
+    return
+  if consent_generation is None:
     cloudlog.info("athenad disabled: automatic third-party data sharing is off")
     return
+  active_consent_generation = consent_generation
   dongle_id = params.get("DongleId")
   UploadQueueCache.initialize(upload_queue)
 
@@ -859,17 +981,25 @@ def main(exit_event: threading.Event | None = None):
 
   conn_start = None
   conn_retries = 0
-  while (exit_event is None or not exit_event.is_set()) and third_party_data_sharing_enabled(params):
+  while (
+    (exit_event is None or not exit_event.is_set())
+    and third_party_data_sharing_generation_matches(consent_generation, params)
+  ):
     try:
       if conn_start is None:
         conn_start = time.monotonic()
 
       cloudlog.event("athenad.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries)
-      _require_third_party_data_sharing(params)
+      _require_third_party_data_sharing(params, consent_generation)
       ws = create_connection(ws_uri,
                              cookie="jwt=" + api.get_token(),
                              enable_multithread=True,
                              timeout=30.0)
+      try:
+        _require_third_party_data_sharing(params, consent_generation)
+      except Exception:
+        ws.close()
+        raise
       cloudlog.event("athenad.main.connected_ws", ws_uri=ws_uri, retries=conn_retries,
                      duration=time.monotonic() - conn_start)
       conn_start = None
@@ -877,7 +1007,7 @@ def main(exit_event: threading.Event | None = None):
       conn_retries = 0
       cur_upload_items.clear()
 
-      handle_long_poll(ws, exit_event)
+      handle_long_poll(ws, exit_event, consent_generation)
 
       ws.close()
     except (KeyboardInterrupt, SystemExit):
@@ -893,8 +1023,14 @@ def main(exit_event: threading.Event | None = None):
 
     delay = backoff(conn_retries)
     for _ in range(delay * 2):
-      if (exit_event is not None and exit_event.wait(0.5)) or not third_party_data_sharing_enabled(params):
+      if (
+        (exit_event is not None and exit_event.wait(0.5))
+        or not third_party_data_sharing_generation_matches(consent_generation, params)
+      ):
+        active_consent_generation = None
         return
+
+  active_consent_generation = None
 
 
 if __name__ == "__main__":

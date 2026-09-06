@@ -161,21 +161,19 @@ Scope and exclusions:
 > Values that are too large can flood button messages or make stock SCC miss inputs. Values that are too small can slow or prevent synchronization. Keep the initial Params values `8 / 30 / 1` if there is no problem.
 
 <a id="ka4-stock-scc-standstill"></a>
-### Experimental KA4 stock-SCC standstill extension
+### KA4 stock-SCC standstill diagnosis
 
-This behavior is applied automatically, without a user setting, only when all of the following are identified. `Ka4StockSccStandstillRearm` remains internal state for log classification and compatibility with older installations; it is not shown as a Carrot Web switch.
+The former periodic stopped-lead RES experiment is disabled and has no user setting. `Ka4StockSccStandstillRearm` remains only as legacy route metadata and is forced to `0` by current builds.
 
 - Fourth-generation Kia Carnival KA4 (the current vehicle-validation target is model year 2023)
 - CAN FD, PCM cruise, and stock radar SCC
 - No openpilot longitudinal control and no camera SCC
 
-It attempts short RES groups only after the vehicle is physically near zero speed, SCC is active, and a nearby stopped lead is stable. Raw vehicle speed must be at most `0.03 m/s`, lead distance must be greater than zero and at most `20 m`, absolute relative speed must be at most `0.5 m/s`, and there must be no SCC failure or takeover request. The normal first request is about 2.5 seconds into the qualified stop and subsequent requests are at least about 2.5 seconds apart. If the stock `ALERTS_5=5` resume prompt is already present, a recovery request is advanced to follow the 0.30-second qualification dwell. The last group finishes no later than 27 seconds so the controller does not queue more requests beyond the 30-second boundary.
+Known public KA4 captures carry the stock standstill/resume state in `SCC_CONTROL` (`0x1A0`) and contain no `ADRV_0x161`. The previous branch masked `ADRV_0x161.ALERTS_5=5`, so it could hide neither the observed KA4 state nor extend the stock SCC ECU's resume eligibility. Replacing `SCC_CONTROL` is not used as a workaround because that same safety-critical message also contains acceleration, braking, and stop requests.
 
-On HDA1 vehicles where this branch replaces the cluster message, only the `ALERTS_5=5` resume-prompt field is masked from the start of an SCC-enabled stop (or from the first already-active prompt) until just before 30.00 seconds. This display timer is independent from the lead, brake, and Auto Hold gates for RES requests, so a transient gate change cannot leak the prompt immediately after stopping. Every other OEM alert, sound, DAW, and mute field is preserved, and the prompt is restored at 30.00 seconds. HDA2 does not use this cluster-message replacement path.
+With stock longitudinal control, the OEM SCC still decides how long restart remains available. This branch preserves the received OEM HDA state and retains the normal guarded resume request when the lead actually departs, but it does not synthesize repeated RES presses while the lead remains stopped and does not claim a universal 30-second window. A guaranteed different stop-and-go policy requires either an OEM-supported HDA operating condition or a separately validated openpilot-longitudinal vehicle configuration.
 
-Brake, accelerator, Auto Hold, parking brake, SET/RES/LFA buttons, or an unsafe lead state immediately abort synthetic RES requests, while the display timer remains tied to the same stopped epoch until the vehicle moves. SCC faults, takeover requests, CANCEL/main buttons, software cancel requests, or invalid CAN abort requests and restore the prompt immediately; the display timer cannot restart until the vehicle actually moves. The alert-field masking is deterministic in code, but in-vehicle validation has not yet established that the stock SCC ECU accepts synthetic RES or that the actual auto-resume window is extended. The driver must verify the cluster and road conditions and test only in a controlled environment.
-
-With separate `CarrotValidationAutoUpload` consent, the device can automatically select nearby full rlogs after the drive. Those logs record the experimental RES frame-request count and qualification state. That count means the controller appended a frame to its outgoing CAN list; it does not prove Panda transmission or acceptance by the stock SCC ECU. See [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) for upload scope and privacy details.
+With separate `CarrotValidationAutoUpload` consent, the device marks the beginning of an engaged stock-SCC stop after about 0.5 seconds and can upload the nearby full rlogs after the drive without file selection. This is observation only and does not change vehicle control. See [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) for scope and privacy details.
 
 <a id="speed-presets"></a>
 ## 4. Speed presets

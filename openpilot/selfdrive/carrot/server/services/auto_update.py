@@ -5,7 +5,10 @@ import os
 import re
 import time
 
-from ...community_data import community_data_sharing_enabled
+from ...community_data import (
+  community_data_sharing_generation,
+  community_data_sharing_generation_matches,
+)
 from .git_state import read_auto_update_state, write_auto_update_event, write_git_pull_time
 from .git_status import REPO_DIR, clear_git_status_cache, get_git_status
 from .web_settings import read_web_settings
@@ -261,7 +264,8 @@ async def _notify_cwp(old_head: str) -> None:
   )
 
   params = Params()
-  if not old_head or not community_data_sharing_enabled(params):
+  consent_generation = community_data_sharing_generation(params)
+  if not old_head or consent_generation is None:
     return
 
   rc, new_head = await _git(["rev-parse", "HEAD"], GIT_INFO_TIMEOUT)
@@ -302,9 +306,9 @@ async def _notify_cwp(old_head: str) -> None:
     payload["token"] = token
 
   def post_if_still_allowed() -> tuple[bool, int, str] | None:
-    if not community_data_sharing_enabled(params):
+    if not community_data_sharing_generation_matches(consent_generation, params):
       return None
-    return post_json(notify_url, payload, NOTIFY_TIMEOUT)
+    return post_json(notify_url, payload, NOTIFY_TIMEOUT, params, consent_generation)
 
   result = await asyncio.to_thread(post_if_still_allowed)
   if result is None:

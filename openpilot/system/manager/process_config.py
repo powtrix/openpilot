@@ -3,6 +3,7 @@ import platform
 import importlib.util
 
 from openpilot.cereal import car
+from openpilot.common.external_data import third_party_data_sharing_enabled
 from openpilot.common.params import Params
 from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
 from openpilot.system.hardware import PC, TICI
@@ -87,7 +88,7 @@ def enable_dm(started, params, CP: car.CarParams) -> bool:
 #  return params.get_int("EnableConnect") > 0
 
 def enable_xiaoge_data(started, params, CP: car.CarParams) -> bool:
-  return params.get_bool("ShareData")
+  return params.get_bool("ShareData") and third_party_data_sharing_enabled(params)
 
 def cluster_hud_active(params: Params) -> bool:
   try:

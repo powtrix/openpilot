@@ -10,6 +10,7 @@ from openpilot.system.athena import athenad, manage_athenad
 
 class FakeParams:
   def __init__(self, enabled=False):
+    self._dk_consent_generation = "generation-1"
     self.values = {
       DK_THIRD_PARTY_DATA_SHARING_PARAM: b"1" if enabled else b"0",
       "DongleId": "device",
@@ -22,6 +23,9 @@ class FakeParams:
 
   def remove(self, key):
     self.values.pop(key, None)
+
+  def put(self, key, value):
+    self.values[key] = value
 
 
 def test_athenad_main_off_never_initializes_remote_client(monkeypatch):
@@ -117,10 +121,72 @@ def test_manage_athenad_stops_running_child_when_consent_is_withdrawn(monkeypatc
       raise StopIteration
 
   monkeypatch.setattr(manage_athenad, "Process", FakeProcess)
+  monkeypatch.setattr(
+    manage_athenad,
+    "prepare_consent_session",
+    lambda source: manage_athenad.third_party_data_sharing_generation(source),
+  )
   with pytest.raises(StopIteration):
     manage_athenad.run_athenad_manager(params, sleep=sleep)
 
   assert len(created) == 1
   assert created[0].started
   assert created[0].terminated
+  assert "AthenadUploadQueue" not in params.values
+
+
+def test_manage_athenad_restarts_and_clears_queue_after_missed_off_on_cycle(monkeypatch):
+  params = FakeParams(True)
+  created = []
+
+  class FakeProcess:
+    exitcode = None
+
+    def __init__(self, *args, **kwargs):
+      del args, kwargs
+      self.started = False
+      self.terminated = False
+      created.append(self)
+
+    def start(self):
+      self.started = True
+
+    def is_alive(self):
+      return self.started and not self.terminated
+
+    def terminate(self):
+      self.terminated = True
+      self.exitcode = -15
+
+    def kill(self):
+      self.terminate()
+
+    def join(self, timeout=None):
+      del timeout
+
+  sleeps = 0
+
+  def sleep(_delay):
+    nonlocal sleeps
+    sleeps += 1
+    if sleeps == 1:
+      params.values["AthenadUploadQueue"] = [{"id": "stale"}]
+      params._dk_consent_generation = "generation-2"
+    elif sleeps == 2:
+      raise StopIteration
+
+  monkeypatch.setattr(manage_athenad, "Process", FakeProcess)
+  monkeypatch.setattr(
+    manage_athenad,
+    "prepare_consent_session",
+    lambda source: manage_athenad.third_party_data_sharing_generation(source),
+  )
+
+  with pytest.raises(StopIteration):
+    manage_athenad.run_athenad_manager(params, sleep=sleep)
+
+  assert len(created) == 2
+  assert created[0].terminated
+  assert created[1].started
+  assert created[1].terminated
   assert "AthenadUploadQueue" not in params.values

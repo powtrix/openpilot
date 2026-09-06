@@ -13,7 +13,11 @@ from ipaddress import ip_address
 from typing import Any
 
 from openpilot.common.params import Params
-from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
+from openpilot.selfdrive.carrot.community_data import (
+  CommunityConsentBoundBytes,
+  community_data_sharing_generation,
+  community_data_sharing_generation_matches,
+)
 
 
 _DEFAULT_REPORT_URL_KEY = 23
@@ -131,18 +135,32 @@ def build_payload(params: Params, local_ip: str, port: int) -> dict[str, Any]:
   }
 
 
-def post_json(url: str, payload: dict[str, Any], timeout_s: float) -> tuple[bool, int, str]:
+def post_json(
+  url: str,
+  payload: dict[str, Any],
+  timeout_s: float,
+  params: Params | None = None,
+  consent_generation: str | None = None,
+) -> tuple[bool, int, str]:
+  params = params if params is not None else Params()
+  if consent_generation is None:
+    consent_generation = community_data_sharing_generation(params)
+  if not community_data_sharing_generation_matches(consent_generation, params):
+    return False, 0, "community data sharing disabled"
   data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
   req = urllib.request.Request(
     url=url,
-    data=data,
+    data=CommunityConsentBoundBytes(data, params, consent_generation),
     headers={
       "Content-Type": "application/json",
+      "Content-Length": str(len(data)),
       "User-Agent": "openpilot-cweb-push/1",
     },
     method="POST",
   )
   try:
+    if not community_data_sharing_generation_matches(consent_generation, params):
+      return False, 0, "community data sharing disabled"
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
       body = resp.read().decode("utf-8", errors="replace")
       return 200 <= resp.status < 300, int(resp.status), body
@@ -198,7 +216,8 @@ class CwebPushReporter:
     print(line, flush=True)
 
   def poll_once(self) -> bool:
-    if not community_data_sharing_enabled(self.params):
+    consent_generation = community_data_sharing_generation(self.params)
+    if consent_generation is None:
       self._status("disabled")
       return False
 
@@ -228,10 +247,16 @@ class CwebPushReporter:
         if self.dry_run:
           self._status("heartbeat_dry_run", ip=local_ip, payload=payload)
           return True
-        if not community_data_sharing_enabled(self.params):
+        if not community_data_sharing_generation_matches(consent_generation, self.params):
           self._status("disabled")
           return False
-        ok, status, body = post_json(self.heartbeat_url, payload, self.timeout_s)
+        ok, status, body = post_json(
+          self.heartbeat_url,
+          payload,
+          self.timeout_s,
+          self.params,
+          consent_generation,
+        )
         self._status(
           "heartbeat" if ok else "heartbeat_failed",
           ip=local_ip,
@@ -254,10 +279,16 @@ class CwebPushReporter:
       self._status("dry_run", ip=local_ip, payload=payload)
       return True
 
-    if not community_data_sharing_enabled(self.params):
+    if not community_data_sharing_generation_matches(consent_generation, self.params):
       self._status("disabled")
       return False
-    ok, status, body = post_json(self.report_url, payload, self.timeout_s)
+    ok, status, body = post_json(
+      self.report_url,
+      payload,
+      self.timeout_s,
+      self.params,
+      consent_generation,
+    )
     if ok:
       self.last_success_ip = local_ip
       self.was_down = False

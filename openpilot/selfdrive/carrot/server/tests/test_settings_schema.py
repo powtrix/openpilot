@@ -187,7 +187,7 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
-def test_ka4_stock_scc_standstill_extension_is_automatic_not_user_configurable(settings, params):
+def test_ka4_stock_scc_standstill_experiment_is_not_user_configurable(settings, params):
   by_name = {p["name"]: p for p in params}
   assert "Ka4StockSccStandstillRearm" not in by_name
 
@@ -211,7 +211,10 @@ def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params
   assert "full rlog" in auto_upload["descr"]
   assert "정확한 위치" in auto_upload["descr"]
   assert "로그마다 다시 확인" in auto_upload["descr"]
-  assert "배포 시 고정" in auto_upload["descr"]
+  assert "HDA1(비-HDA2)" in auto_upload["descr"]
+  assert "정확한 `https://adot.synology.me`" in auto_upload["descr"]
+  assert "표준 HTTPS 443" in auto_upload["descr"]
+  assert "배포 환경 변수 우회는 거부" in auto_upload["descr"]
   assert "일반 전송 목적지로 우회할 수 없습니다" in auto_upload["descr"]
   assert "모바일 데이터" in auto_upload["descr"]
   assert "WPA2/WPA3" in auto_upload["descr"]
@@ -222,15 +225,28 @@ def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params
   assert "one-way hash" in auto_upload["edescr"]
   disclosure_fragments = {
     "descr": [
-      "캡처당 주변 full rlog 최대 3개", "최대 14개 캡처/42개 full rlog", "최대 5개 캡처/750 MiB",
-      "누적 전송량이나 재시도", "장치별 일일 한도는 1 GiB", "다음 날",
+      "캡처당 주변 full rlog 최대 3개", "최대 10개 캡처/서로 다른 full rlog 30개",
+      "복원 호환 상한은 14개 캡처/42개", "최대 5개 캡처/750 MiB",
+      "클라이언트 누적 전송량 상한은 없습니다", "최대 7일 동안 다시 전송",
+      "장치별 일일 한도는 1 GiB", "다음 날", "정확한 `https://adot.synology.me`",
+      "배포 환경 변수 우회는 거부",
+      "테더링을 제공하는 휴대폰",
     ],
     "edescr": [
-      "three nearby full rlogs per event capture", "up to 14 captures / 42 full rlogs",
-      "5 captures / 750 MiB pending at once", "cumulative campaign uploads and retry traffic can exceed",
-      "1 GiB per-device daily limit", "next day",
+      "three nearby full rlogs per event capture", "at most 10 captures / 30 distinct full rlogs",
+      "compatibility ceiling including legacy records", "14 captures / 42 rlogs",
+      "5 captures / 750 MiB", "no cumulative transfer cap", "for up to 7 days",
+      "1 GiB per-device daily limit", "next day", "exact root `https://adot.synology.me`",
+      "deployment-environment overrides are rejected", "CAN FD HDA1 (not HDA2)",
+      "phone providing the tether",
     ],
-    "cdescr": ["每个事件捕获", "最多 3 个完整 rlog", "14 个捕获/42 个完整 rlog", "5 个捕获/750 MiB", "累计上传量和重试流量", "每日 1 GiB", "第二天"],
+    "cdescr": [
+      "每个事件捕获", "最多 3 个完整 rlog", "最多选择 10 个捕获/30 个不同的完整 rlog",
+      "兼容上限为 14 个捕获/42 个 rlog", "5 个捕获/750 MiB", "没有累计传输量上限",
+      "最长持续 7 天", "每日 1 GiB", "第二天", "`https://adot.synology.me`",
+      "部署环境变量覆盖", "CAN FD HDA1（非 HDA2）",
+      "提供网络共享的手机",
+    ],
   }
   for field, fragments in disclosure_fragments.items():
     for fragment in fragments:

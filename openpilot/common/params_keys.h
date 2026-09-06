@@ -319,6 +319,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}},
     // Master opt-in for automatic diagnostics/telemetry sent to third parties.
     {"DkThirdPartyDataSharing", {PERSISTENT, BOOL, "0"}},
+    // Internal marker for the consent generation whose pre-existing artifacts
+    // were excluded from future third-party replay.
+    {"DkThirdPartyDataSharingPreparedGeneration", {PERSISTENT, STRING}},
     // Explicit opt-in for automatic data exchange with Carrot community services.
     {"CarrotCommunityDataSharing", {PERSISTENT, BOOL, "0"}},
 

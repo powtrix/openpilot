@@ -32,6 +32,7 @@ _LOCAL_IPV6_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
 @dataclass(frozen=True)
 class _ConsentSession:
   scope: str
+  peer: str
   expires_at: float
 
 
@@ -85,6 +86,109 @@ def _origin_scope(scheme: str, authority: str) -> str | None:
 
 def _request_scope(request: web.Request) -> str | None:
   return _origin_scope(request.scheme, request.headers.get("Host", ""))
+
+
+def _normalized_ip(value: object) -> str | None:
+  raw = str(value or "").strip()
+  if not raw:
+    return None
+  # aiohttp can expose a scoped IPv6 address (for example fe80::1%wlan0).
+  # The interface is already constrained by the kernel route table below.
+  raw = raw.split("%", 1)[0]
+  try:
+    address = ipaddress.ip_address(raw)
+  except ValueError:
+    return None
+  if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+    address = address.ipv4_mapped
+  return str(address)
+
+
+def _request_peer(request: web.Request) -> str | None:
+  """Return the TCP peer only; never trust forwarding headers on this server."""
+  peer: object = None
+  try:
+    transport = request.transport
+    if transport is not None:
+      peer = transport.get_extra_info("peername")
+  except Exception:
+    peer = None
+  if isinstance(peer, (tuple, list)) and peer:
+    peer = peer[0]
+  if peer is None:
+    # Real aiohttp requests resolve remote from the transport. This fallback
+    # also keeps the policy independently testable with a minimal request.
+    try:
+      peer = request.remote
+    except Exception:
+      peer = None
+  return _normalized_ip(peer)
+
+
+def _default_tether_gateway_addresses(
+  ipv4_path: str = "/proc/net/route",
+  ipv6_path: str = "/proc/net/ipv6_route",
+) -> frozenset[str]:
+  """Read active Wi-Fi default gateways without invoking a shell command."""
+  candidates: dict[int, list[tuple[int, str]]] = {4: [], 6: []}
+  try:
+    with open(ipv4_path, encoding="ascii") as route_file:
+      for line in route_file.readlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8 or fields[1] != "00000000" or not fields[0].startswith("wlan"):
+          continue
+        flags = int(fields[3], 16)
+        gateway_hex = fields[2]
+        if (flags & 0x3) != 0x3 or gateway_hex == "00000000":
+          continue
+        gateway = _normalized_ip(ipaddress.IPv4Address(bytes.fromhex(gateway_hex)[::-1]))
+        if gateway is not None:
+          candidates[4].append((int(fields[6]), gateway))
+  except (OSError, ValueError):
+    pass
+
+  try:
+    with open(ipv6_path, encoding="ascii") as route_file:
+      for line in route_file:
+        fields = line.split()
+        if (
+          len(fields) < 10
+          or fields[0] != "0" * 32
+          or fields[1] != "00"
+          or not fields[9].startswith("wlan")
+        ):
+          continue
+        flags = int(fields[8], 16)
+        gateway_hex = fields[4]
+        if (flags & 0x3) != 0x3 or gateway_hex == "0" * 32:
+          continue
+        gateway = _normalized_ip(ipaddress.IPv6Address(int(gateway_hex, 16)))
+        if gateway is not None:
+          candidates[6].append((int(fields[5], 16), gateway))
+  except (OSError, ValueError):
+    pass
+
+  # IPv4 and IPv6 metrics are not comparable. Accept only the lowest-metric
+  # active default gateway in each family, not gateways from dormant routes.
+  gateways: set[str] = set()
+  for family_candidates in candidates.values():
+    if family_candidates:
+      lowest_metric = min(metric for metric, _gateway in family_candidates)
+      gateways.update(gateway for metric, gateway in family_candidates if metric == lowest_metric)
+  return frozenset(gateways)
+
+
+def request_is_tether_owner(request: web.Request) -> bool:
+  """Authenticate consent issuance to the device-local or tether-host peer."""
+  peer = _request_peer(request)
+  if peer is None:
+    return False
+  try:
+    if ipaddress.ip_address(peer).is_loopback:
+      return True
+  except ValueError:
+    return False
+  return peer in _default_tether_gateway_addresses()
 
 
 def _header_origin_scope(request: web.Request, header_name: str) -> str | None:
@@ -143,19 +247,24 @@ def _prune_sessions(
 
 
 def issue_web_consent_session(request: web.Request, *, now: float | None = None) -> str | None:
-  if not request_has_same_origin(request, require_origin=False):
+  if (
+    not request_has_same_origin(request, require_origin=False)
+    or not request_is_tether_owner(request)
+  ):
     return None
   sessions = request.app.get(WEB_CONSENT_SESSIONS_KEY)
   if not isinstance(sessions, dict):
     return None
   scope = _request_scope(request)
-  if scope is None:
+  peer = _request_peer(request)
+  if scope is None or peer is None:
     return None
   issued_at = time.monotonic() if now is None else float(now)
   _prune_sessions(sessions, issued_at, max_entries=WEB_CONSENT_SESSION_LIMIT - 1)
   token = secrets.token_urlsafe(32)
   sessions[token] = _ConsentSession(
     scope=scope,
+    peer=peer,
     expires_at=issued_at + WEB_CONSENT_SESSION_TTL_SECONDS,
   )
   return token
@@ -183,6 +292,7 @@ def consume_web_consent_session(request: web.Request, *, now: float | None = Non
       isinstance(session, _ConsentSession)
       and session.expires_at > checked_at
       and session.scope == _request_scope(request)
+      and session.peer == _request_peer(request)
     )
   except Exception:
     return False

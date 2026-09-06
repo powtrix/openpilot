@@ -54,6 +54,13 @@ conservative.
 
 Automatic validation uses a separate, fail-closed device authentication flow:
 
+The device client is pinned to the exact root origin
+`https://adot.synology.me` on standard HTTPS port 443. It rejects user
+information, another port, a subpath, query or fragment, subdomains, lookalike
+domains, arbitrary HTTPS origins, and any deployment-environment override that
+does not resolve to that exact origin. The ordinary Carrot Web upload setting
+cannot redirect this protocol.
+
 1. The receiver first requires `deviceId` to be present in
    `CARROT_ALLOWED_DEVICE_IDS` and to have an exact pin in
    `CARROT_ALLOWED_DEVICE_PUBLIC_KEY_SHA256`. `POST
@@ -95,8 +102,15 @@ Automatic validation uses a separate, fail-closed device authentication flow:
    contains one to three unique segments and exactly one full `rlog` file per
    segment. Unknown fields, nested shapes, wrong JSON types, out-of-range values, and oversized
    completion/manifest bodies are rejected. The file list and metadata segment
-   set must match the SQLite receipts exactly. The server writes one canonical,
-   immutable manifest and returns deterministic `receiptId`,
+   set must match the SQLite receipts exactly. The receiver also independently
+   rechecks the exact automatic-validation policy: fingerprint
+   `KIA_CARNIVAL_4TH_GEN`, stock longitudinal control (`pcmCruise=true` and
+   `openpilotLongitudinalControl=false`), Hyundai CAN-FD plus radar-SCC flags
+   without camera-SCC or CAN-FD HDA2, a `hyundaiCanfd` safety model, a passed
+   device topology gate. `Ka4StockSccStandstillRearm` is accepted as bounded legacy metadata
+   (`0` or `1`) and does not authorize control behavior. Signed metadata from any other
+   topology is rejected. The server
+   writes one canonical, immutable manifest and returns deterministic `receiptId`,
    `manifestSha256`, `files`, `verifiedDeviceId`, and `captureId` values. Every
    idempotent completion retry rechecks the exact current DB set plus each
    rlog's existence, size, and SHA-256 before returning that receipt.
@@ -150,16 +164,20 @@ For a manual Container Manager deployment:
    `compose.dsm.yml`. The image and container run as `10001:10001`, with no
    DSM administrators group. Only the validation directory and private SQLite
    state directory are mounted; the rest of `/volume1/openpilot` is not visible
-   inside the container. No DSM password or FTP login is passed to it.
+   inside the container. No DSM password or FTP login is passed to it. The
+   project creates the dedicated `dk-upload-internal` bridge with
+   `internal=true`; loopback-published ingress still works, but the receiver
+   has no outbound Internet route.
 5. Confirm the project reports healthy and that the container is named exactly
    `dk-upload` before continuing.
-6. Add a DSM reverse-proxy rule named `dk-upload` from
-   `https://adot.synology.me:443` to
-   `http://127.0.0.1:18080` and assign a trusted certificate for that hostname.
-7. Forward only TCP 443 from the router to DSM. Keep port 18080 bound to
-   loopback, and do not expose DSM management, FTP, SMB, or the upload
-   directory. Test from a genuinely external connection because router NAT
-   loopback behavior varies.
+6. Add the dedicated DSM reverse-proxy rule described below. Its NAS-side
+   source is `https://adot.synology.me:18443`, not DSM's management port 443,
+   and its destination is `http://127.0.0.1:18080`.
+7. Forward router external TCP 443 to NAS `192.168.50.248` internal TCP 18443.
+   Do not create WAN forwards for NAS ports 18443, 18080, 5000, or 5001. This
+   port translation keeps the vehicle URL at standard HTTPS 443 without
+   exposing DSM's own web service. Test from a genuinely external connection
+   because router NAT loopback behavior varies.
 
 For the preferred repeatable deployment, run `deploy_dsm.sh` as a root DSM Task
 Scheduler job with all three private deployment values:
@@ -175,7 +193,8 @@ The wrapper variables intentionally differ from the internal container
 variables. The script rejects an absent, multiple, or malformed device ID and
 any fingerprint that is not exactly 64 lowercase hexadecimal characters. It
 downloads only this receiver's build files from the immutable revision, builds
-`dk-upload`, binds it to loopback, verifies the writable validation store and
+`dk-upload`, creates or verifies its labeled internal bridge, binds it to
+loopback, verifies the no-Internet-route policy, writable validation store, and
 fail-closed API policy, and restores the previous container after any
 pre-commit failure, cancellation, or signal. A process lock prevents concurrent
 deployments, and the next run recovers an interrupted rollback left by a power
@@ -185,8 +204,25 @@ cannot silently change deployed code.
 The production script always keeps `CARROT_LEGACY_UPLOADS_ENABLED=false`, fixes
 `CARROT_VALIDATION_AUDIENCE` to the public DK HTTPS validation API, and passes
 the one private device ID/key pin only through container environment. The
-Python base image is digest-pinned and the Python dependency closure is
-version-locked; updates require a new reviewed Git commit.
+Python base image is digest-pinned. The CPython 3.12 x86_64-manylinux dependency
+closure is version- and wheel-SHA-256-locked, and source distributions are
+refused; updates require newly downloaded and independently verified hashes in
+a reviewed Git commit.
+
+For a Container Manager project, verify the same network and port policy on the
+NAS before exposing the endpoint:
+
+```sh
+docker network inspect dk-upload-internal \
+  --format '{{.Driver}} {{.Internal}} {{index .Labels "dk.openpilot.receiver-network"}}'
+docker inspect dk-upload \
+  --format '{{.HostConfig.NetworkMode}} {{len .NetworkSettings.Networks}} {{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIp}}'
+```
+
+The exact expected lines are `bridge true true` and
+`dk-upload-internal 1 127.0.0.1`. Stop if either differs. Docker internal
+networks block external routes; do not weaken that boundary by attaching any
+other service to `dk-upload-internal`.
 
 Operational hardening knobs are `CARROT_CONCURRENT_PER_DEVICE` and
 `CARROT_CONCURRENT_GLOBAL` (legacy defaults 3/16),
@@ -211,11 +247,79 @@ Operational hardening knobs are `CARROT_CONCURRENT_PER_DEVICE` and
 (7200), `CARROT_STALE_PART_SECONDS` (7200), and
 `CARROT_CLEANUP_INTERVAL_SECONDS` (900).
 
-The DSM reverse proxy must allow a request body larger than the configured
-512 MiB file limit, stream request bodies instead of buffering them, preserve
-the real client in `X-Forwarded-For`, and use read/send timeouts longer than the
-six-hour upload deadline. No outbound identity service is required by the NAS;
-the receiver verifies the challenge proof locally against the private SPKI pin.
+### Dedicated DSM reverse proxy
+
+In DSM 7, open **Control Panel > Login Portal > Advanced > Reverse Proxy** and
+create one rule with these exact general fields:
+
+| Field | Value |
+| --- | --- |
+| Reverse proxy name | `dk-upload` |
+| Source protocol | `HTTPS` |
+| Source hostname | `adot.synology.me` |
+| Source port | `18443` |
+| HSTS | enabled |
+| Destination protocol | `HTTP` |
+| Destination hostname | `127.0.0.1` |
+| Destination port | `18080` |
+
+In **Advanced settings**, set proxy HTTP to 1.1, connect timeout to 60 seconds,
+and send/read timeouts to 21610 seconds. Enable use of the destination server's
+error page so API error status and JSON are retained. In **Custom Header**, set
+`Host` to `$host`, `X-Real-IP` to `$remote_addr`, `X-Forwarded-For` to
+`$proxy_add_x_forwarded_for`, and `X-Forwarded-Proto` to `$scheme`. Do not add a
+redirect: the vehicle deliberately refuses redirects for upload requests.
+
+After creating the rule, open **Control Panel > Security > Certificate >
+Settings** and assign the valid `adot.synology.me` certificate to the
+`dk-upload` reverse-proxy service. Permit inbound TCP 18443 in the DSM firewall,
+but keep 18080, 5000, and 5001 unexposed. The ASUS router rule is deliberately
+asymmetric: external TCP 443 goes to `192.168.50.248` internal TCP 18443. There
+must be no external-port 18443 rule. DDNS only maintains the public address; it
+does not relay traffic or replace this router rule.
+
+The DSM UI officially exposes the source/destination ports, custom headers,
+HTTP version, and proxy timeouts. It does not provide a portable, supported
+raw-nginx import for request-body buffering/size directives. Do not edit DSM's
+generated nginx files: DSM can overwrite them during updates. Instead, treat a
+real authenticated upload/receipt at the largest expected rlog size as the
+required proof that the installed DSM release accepts the body and completes
+within the receiver's 512 MiB and six-hour limits. No outbound identity service
+is required by the NAS; the receiver verifies the challenge proof locally
+against the private SPKI pin.
+
+Before testing the router, prove the DSM rule, SNI, and certificate directly on
+the LAN (replace the address if the NAS reservation changes):
+
+```sh
+curl --fail-with-body \
+  --resolve adot.synology.me:18443:192.168.50.248 \
+  https://adot.synology.me:18443/api/v1/health
+```
+
+This must return receiver JSON with HTTP 200, not a DSM HTML page or redirect.
+It proves only the NAS-side rule. Then disconnect the test computer from the
+home LAN (for example, use phone tethering) and repeat against standard 443:
+
+```sh
+curl --fail-with-body https://adot.synology.me/api/v1/health
+```
+
+`verify_dsm_proxy.sh` performs these health, allowlisted-challenge,
+non-allowlisted rejection, legacy-protocol rejection, and unwanted-port checks
+without following redirects:
+
+```sh
+DK_UPLOAD_VERIFY_MODE=lan \
+DK_UPLOAD_NAS_IP=192.168.50.248 \
+DK_UPLOAD_ALLOWED_DEVICE_ID=<private-dongle-id> \
+./verify_dsm_proxy.sh
+
+DK_UPLOAD_VERIFY_MODE=external \
+DK_UPLOAD_CONFIRM_EXTERNAL=yes \
+DK_UPLOAD_ALLOWED_DEVICE_ID=<private-dongle-id> \
+./verify_dsm_proxy.sh
+```
 
 After every image change, explicitly rebuild and recreate the Container Manager
 project; do not reuse a cached older image. Before enabling collection, verify
