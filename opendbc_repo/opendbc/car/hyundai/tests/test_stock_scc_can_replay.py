@@ -73,6 +73,10 @@ def decode_message(dbc: DBC, message_name: str, data: bytes) -> dict[str, int]:
 def build_full_hda1_ka4_controller(monkeypatch):
   class TestParams:
     @staticmethod
+    def get(key):
+      return "dkcarrot-wip" if key == "GitBranch" else ""
+
+    @staticmethod
     def get_int(key):
       return {
         "MaxAngleFrames": 89,
@@ -196,12 +200,10 @@ class Ka4StockSccReplay:
     self.dbc = DBC(DBC_NAME)
     self.scc_packer = CANPacker(DBC_NAME)
     self.oem_button_packer = CANPacker(DBC_NAME)
-    self.controller = build_controller()
+    self.controller = build_controller(alt_buttons=alt_buttons)
     self.controller.CAN = SimpleNamespace(ECAN=panda_bus_offset + (1 if hda2 else 0), CAM=panda_bus_offset + 2)
     if hda2:
       self.controller.CP.flags |= HyundaiFlags.CANFD_HDA2
-    if alt_buttons:
-      self.controller.CP.flags |= HyundaiFlags.CANFD_ALT_BUTTONS
     self.controller.packer = CANPacker(DBC_NAME)
     self.CC = build_control()
     self.CS = build_state()
@@ -332,9 +334,9 @@ def test_ka4_public_reference_uses_crc_protected_alt_button_payload():
   assert values["CHECKSUM"] == checksum.calc_checksum(message.address, checksum, bytearray(KA4_ALT_BUTTON_PUBLIC_SAMPLE))
 
 
-def test_ka4_hda1_full_controller_update_preserves_adrv_and_disables_periodic_rearm(monkeypatch):
+def test_ka4_hda1_full_controller_update_arms_bounded_rearm_and_preserves_oem_alert(monkeypatch):
   controller, CC, CS, car_state, dbc, raw_adrv = build_full_hda1_ka4_controller(monkeypatch)
-  assert not controller.ka4_stock_scc_standstill_rearm
+  assert controller.ka4_stock_scc_standstill_rearm
   assert controller.CAN.ECAN == 0
   assert controller.CAN.CAM == 2
 
@@ -353,8 +355,9 @@ def test_ka4_hda1_full_controller_update_preserves_adrv_and_disables_periodic_re
     assert replacement[signal] == CS.adrv_0x161[signal]
 
   # The accepted ECAN replacement suppresses the raw camera-side ADRV frame
-  # inside Panda's 20 Hz forwarding timeout. The replacement must preserve the
-  # stock alert rather than pretending to extend SCC eligibility.
+  # inside Panda's 20 Hz forwarding timeout. The experiment must preserve the
+  # stock driver instruction because a transmitted RES does not prove that the
+  # SCC ECU accepted it or reset its timer.
   safety = libsafety_py.libsafety
   assert safety.set_safety_hooks(
     CarParams.SafetyModel.hyundaiCanfd, int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
@@ -369,12 +372,12 @@ def test_ka4_hda1_full_controller_update_preserves_adrv_and_disables_periodic_re
   safety.set_timer(1_070_000)
   assert safety.safety_fwd_hook(libsafety_py.make_CANPacket(raw_adrv[0], raw_adrv[2], raw_adrv[1])) == 0
 
-  # Neither a normal stop nor a driver-brake stop may arm the unproven
-  # periodic RES path.
+  # With no fresh OEM button counter after the first frame, the request must
+  # fail closed instead of reusing an alive counter. A driver-brake stop also
+  # cannot arm or transmit the periodic RES path.
   for _ in range(310):
     controller.update(CC, CS, 0)
-  assert controller.stock_scc_stop_start_frame is None
-  assert not controller.stock_scc_keepalive_pending
+  assert controller.stock_scc_stop_start_frame is not None
   assert controller.stock_scc_keepalive_request_count == 0
 
   car_state.brakePressed = True
@@ -432,27 +435,24 @@ def test_public_ka4_route_shape_selects_stock_long_alt_buttons_and_safety(monkey
 @pytest.mark.parametrize(
   "alt_buttons,panda_bus_offset,button_phase_frames",
   [
-    (False, 0, 0), (True, 0, 0), (False, 4, 0), (True, 4, 0),
-    (False, 0, 1), (True, 0, 1), (False, 4, 1), (True, 4, 1),
+    (True, 0, 0), (True, 4, 0),
+    (True, 0, 1), (True, 4, 1),
   ],
   ids=[
-    "standard-0x1cf-phase-0", "ka4-alt-0x1aa-phase-0",
-    "standard-second-panda-phase-0", "ka4-alt-second-panda-phase-0",
-    "standard-0x1cf-phase-1", "ka4-alt-0x1aa-phase-1",
-    "standard-second-panda-phase-1", "ka4-alt-second-panda-phase-1",
+    "ka4-alt-0x1aa-phase-0", "ka4-alt-second-panda-phase-0",
+    "ka4-alt-0x1aa-phase-1", "ka4-alt-second-panda-phase-1",
   ],
 )
-@pytest.mark.parametrize("hda2", [False, True], ids=["hda1", "hda2"])
 def test_ka4_stock_scc_real_can_replay_emits_schedule_under_synthetic_state_model(
-    alt_buttons, panda_bus_offset, button_phase_frames, hda2,
+    alt_buttons, panda_bus_offset, button_phase_frames,
 ):
   replay = Ka4StockSccReplay(
-    alt_buttons=alt_buttons, hda2=hda2,
+    alt_buttons=alt_buttons, hda2=False,
     panda_bus_offset=panda_bus_offset, button_phase_frames=button_phase_frames,
   )
 
   safety = libsafety_py.libsafety
-  safety_param = HyundaiSafetyFlags.CANFD_LKA_STEERING if hda2 else 0
+  safety_param = 0
   if alt_buttons:
     safety_param |= HyundaiSafetyFlags.CANFD_ALT_BUTTONS
   assert safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(safety_param)) == 0
@@ -480,7 +480,7 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_synthetic_state_mode
     values = decode_message(replay.dbc, replay.button_message_name, message.data)
     if alt_buttons:
       assert message.address == CRUISE_BUTTONS_ALT_ADDRESS
-      assert message.bus == (replay.controller.CAN.ECAN if hda2 else replay.controller.CAN.CAM)
+      assert message.bus == replay.controller.CAN.CAM
       assert len(message.data) == 16
       assert values["COUNTER"] == (message.oem_counter + 1) & 0xFF
       assert values["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
@@ -524,6 +524,30 @@ def test_ka4_stock_scc_real_can_replay_emits_schedule_under_synthetic_state_mode
   assert max(emitted) == (2700 if button_phase_frames == 0 else 2699)
   assert not any(frame > 2700 for frame in emitted)
   assert replay.modeled_state_frames[0] == 3000
+
+
+@pytest.mark.parametrize("panda_bus_offset", [0, 4], ids=["single-panda", "second-panda-offset"])
+@pytest.mark.parametrize("button_phase_frames", [0, 1], ids=["phase-0", "phase-1"])
+def test_standard_0x1cf_ka4_variant_never_emits_owner_rearm_experiment(panda_bus_offset, button_phase_frames):
+  replay = Ka4StockSccReplay(
+    alt_buttons=False, hda2=False,
+    panda_bus_offset=panda_bus_offset, button_phase_frames=button_phase_frames,
+  )
+
+  for frame in range(3051):
+    assert replay.step(frame) == []
+
+  assert replay.injected == []
+
+
+@pytest.mark.parametrize("alt_buttons", [False, True])
+def test_ka4_hda2_replay_never_emits_experimental_rearm(alt_buttons):
+  replay = Ka4StockSccReplay(alt_buttons=alt_buttons, hda2=True)
+
+  for frame in range(3051):
+    replay.step(frame)
+
+  assert replay.injected == []
 
   # SCC_CONTROL uses and passes the Hyundai CAN-FD CRC. The KA4 standard
   # 0x1CF button definition instead names its byte `_CHECKSUM`, which means
@@ -573,23 +597,20 @@ def test_ka4_real_scc_rx_aborts_keepalive_and_panda_rejects_generic_reactivation
 
   # The next 50 Hz SCC frame closes ACC before the second fresh button source.
   # Feed that real RX transition to Panda before running the controller. The
-  # dedicated keepalive aborts. The existing generic cruise-reactivation path
-  # still creates one host RES request while CC.enabled is stale, but Panda has
-  # already closed controls_allowed and must reject that request.
+  # dedicated keepalive aborts. The KA4 physical-stop gate must also suppress
+  # generic cruise reactivation instead of relying on Panda to reject a stale
+  # host RES request.
   assert replay.step(31, safety=safety) == []
   replay.acc_mode = closing_acc_mode
   after_transition = replay.step(32, safety=safety)
-  assert len(after_transition) == 1
-  assert decode_message(
-    replay.dbc, replay.button_message_name, after_transition[0][1],
-  )["CRUISE_BUTTONS"] == Buttons.RES_ACCEL
+  assert after_transition == []
   assert not replay.CS.out.cruiseState.enabled
   assert not replay.controller.stock_scc_keepalive_pending
   assert replay.controller.stock_scc_keepalive_press_frames == 0
   assert not replay.controller.stock_scc_keepalive_requested
   assert not safety.get_controls_allowed()
-  assert replay.last_safety_tx_results == [False]
-  assert [request.frame for request in replay.injected] == [30, 32]
+  assert replay.last_safety_tx_results == []
+  assert [request.frame for request in replay.injected] == [30]
   assert [request.frame for request in replay.safety_accepted] == [30]
   assert replay.modeled_state_deadline == 30 + round(3.0 / DT_CTRL)
 
@@ -712,9 +733,8 @@ def test_ka4_real_can_replay_aborts_if_vehicle_support_gate_changes_mid_press(ga
   assert replay.controller.stock_scc_stop_start_frame is None
 
 
-@pytest.mark.parametrize("alt_buttons", [False, True], ids=["standard-0x1cf", "ka4-alt-0x1aa"])
-def test_ka4_software_cancel_preempts_keepalive_on_the_next_frame(alt_buttons):
-  replay = Ka4StockSccReplay(alt_buttons=alt_buttons)
+def test_ka4_software_cancel_preempts_keepalive_on_the_next_frame():
+  replay = Ka4StockSccReplay(alt_buttons=True)
   for frame in range(30):
     replay.step(frame)
 
@@ -729,16 +749,15 @@ def test_ka4_software_cancel_preempts_keepalive_on_the_next_frame(alt_buttons):
   cancel_messages = replay.step(301)
 
   # CANCEL is safety-critical and must not inherit the 250 ms post-keepalive
-  # quiet period. Preserve each existing encoding policy (20 standard copies,
-  # one ALT copy), with no remaining RES frame.
-  assert len(cancel_messages) == (1 if alt_buttons else 20)
+  # quiet period. The owner's ALT layout emits one fresh-counter copy, with no
+  # remaining RES frame.
+  assert len(cancel_messages) == 1
   assert all(decode_message(replay.dbc, replay.button_message_name, message[1])["CRUISE_BUTTONS"] == Buttons.CANCEL
              for message in cancel_messages)
 
 
-@pytest.mark.parametrize("alt_buttons", [False, True], ids=["standard-0x1cf", "ka4-alt-0x1aa"])
-def test_ka4_movement_reset_cannot_delay_software_cancel(alt_buttons):
-  replay = Ka4StockSccReplay(alt_buttons=alt_buttons)
+def test_ka4_movement_reset_cannot_delay_software_cancel():
+  replay = Ka4StockSccReplay(alt_buttons=True)
   for frame in range(30):
     replay.step(frame)
 
@@ -751,6 +770,6 @@ def test_ka4_movement_reset_cannot_delay_software_cancel(alt_buttons):
   replay.CC.cruiseControl.cancel = True
   cancel_messages = replay.step(301)
 
-  assert len(cancel_messages) == (1 if alt_buttons else 20)
+  assert len(cancel_messages) == 1
   assert all(decode_message(replay.dbc, replay.button_message_name, message[1])["CRUISE_BUTTONS"] == Buttons.CANCEL
              for message in cancel_messages)

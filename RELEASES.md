@@ -3,7 +3,9 @@ dkcarrot-wip (2026-09-06)
 * Keep prepared branch updates installable while Carrot Web checks Git status
 * Focus the device target-branch picker on dkcarrot-wip and compatibility branches
 * Add powered manual updates and passive KA4 stock-SCC validation support
-* Preserve confirmed steering behavior and disable the unproven stopped-lead RES/alert-mask experiment
+* Preserve the user-confirmed 2023 KA4 steering behavior under the remote `dk-ka4-steering-baseline-2026-09-06-r2` recovery tag
+* On `dkcarrot-wip` only, block ordinary set-speed synchronization and automatic cruise-activation button traffic at a physical KA4 stop, while retaining only an interlocked planner-qualified departure RES
+* On `dkcarrot-wip` only, run the owner's CRC-protected alternate-button HDA1 KA4 stock-SCC 30-second resume-retention experiment with bounded short RES presses and fail-closed driver, brake/hold, SCC-fault, CAN, and stopped-lead gates; preserve OEM warnings and verify actual SCC timer retention on-car
 
 carrot (2026-06-22)
 ========================

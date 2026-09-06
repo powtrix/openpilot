@@ -44,11 +44,13 @@ CANFD_JERK_ERROR_FULL_SCALE = 0.5
 CANFD_JERK_RELEASE_THRESHOLD = 0.1
 KA4_STOCK_SCC_MAX_STANDSTILL_GRACE = 30.0
 KA4_STOCK_SCC_OEM_REARM_INTERVAL = 3.0
-# Periodic RES while a stopped lead is present is kept only as an offline test
-# harness. Public KA4 captures do not contain ADRV_0x161, and an accepted RES
-# has not been shown to reset the stock SCC timer. Never enable this actuator
-# path in a production controller without target-car evidence.
-KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED = False
+# The owner's 2023 KA4 uses HDA1 stock radar SCC without openpilot longitudinal.
+# Keep its normal auto-resume eligibility alive for at most 30 seconds with
+# short RES presses while a close lead is stably stopped. This is intentionally
+# narrower than the model-wide CAN-FD/HDA2 feature set and remains guarded by the
+# exact topology check plus the driver, brake/hold, SCC-fault, and lead gates
+# below. The separately copied cluster alert is never the source of authority.
+KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED = True
 # The offline validation path treats SCC_CONTROL.InfoDisplay == 4 as the stock
 # standstill/resume-state input. The synthetic schedule's assumption that an
 # accepted RES changes the OEM timing remains unproven on-car.
@@ -67,6 +69,7 @@ KA4_STOCK_SCC_MAX_ABS_REL_SPEED = 0.5
 KA4_STOCK_SCC_VALID_LEAD_STATES = (2, 3)
 KA4_STOCK_SCC_MAX_NEAR_ZERO_SPEED = 0.03
 KA4_STOCK_SCC_NEAR_ZERO_DWELL = 0.3
+DK_KA4_RUNTIME_BRANCH = "dkcarrot-wip"
 # Some CAN-FD SCC implementations need a higher lower-jerk limit to follow sustained
 # deceleration requests. Keep the historical MPC-jerk limit as the default and blend
 # toward this stock-like feedforward only after measured under-deceleration.
@@ -91,8 +94,17 @@ def _ka4_stock_scc_standstill_supported(CP):
     not CP.openpilotLongitudinalControl and
     bool(CP.flags & HyundaiFlags.CANFD) and
     bool(CP.flags & HyundaiFlags.RADAR_SCC) and
+    bool(CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS) and
+    not bool(CP.flags & HyundaiFlags.CANFD_HDA2) and
     not bool(CP.flags & HyundaiFlags.CAMERA_SCC)
   )
+
+
+def _dk_ka4_runtime_branch(params):
+  branch = params.get("GitBranch")
+  if isinstance(branch, bytes):
+    branch = branch.decode("utf-8", errors="replace")
+  return str(branch or "").strip() == DK_KA4_RUNTIME_BRANCH
 
 def process_hud_alert(enabled, fingerprint, hud_control):
   sys_warning = (hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw))
@@ -265,13 +277,17 @@ class CarController(CarControllerBase):
     self.camera_scc_params = params.get_int("HyundaiCameraSCC")
     self.is_ldws_car = params.get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
+    self.dk_ka4_runtime_branch = _dk_ka4_runtime_branch(params)
     self.ka4_stock_scc_standstill_rearm = (
+      self.dk_ka4_runtime_branch and
       KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED and _ka4_stock_scc_standstill_supported(self.CP)
     )
-    # Clear the value written by the earlier automatic experiment. The Param
-    # is retained only so old route metadata remains readable.
-    if params.get_int("Ka4StockSccStandstillRearm") != 0:
-      params.put_int_nonblocking("Ka4StockSccStandstillRearm", 0)
+    # This is an internal route/validation marker, not a user toggle. Keep it
+    # synchronized with the exact runtime topology so no separate setting is
+    # needed and unsupported cars always publish 0.
+    rearm_marker = int(self.ka4_stock_scc_standstill_rearm)
+    if params.get_int("Ka4StockSccStandstillRearm") != rearm_marker:
+      params.put_int_nonblocking("Ka4StockSccStandstillRearm", rearm_marker)
 
     self.stock_scc_stop_start_frame = None
     self.stock_scc_near_zero_frames = 0
@@ -337,11 +353,14 @@ class CarController(CarControllerBase):
       self.canfd_debug = params.get_int("CanfdDebug")
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
+      self.dk_ka4_runtime_branch = _dk_ka4_runtime_branch(params)
       self.ka4_stock_scc_standstill_rearm = (
+        self.dk_ka4_runtime_branch and
         KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED and _ka4_stock_scc_standstill_supported(self.CP)
       )
-      if params.get_int("Ka4StockSccStandstillRearm") != 0:
-        params.put_int_nonblocking("Ka4StockSccStandstillRearm", 0)
+      rearm_marker = int(self.ka4_stock_scc_standstill_rearm)
+      if params.get_int("Ka4StockSccStandstillRearm") != rearm_marker:
+        params.put_int_nonblocking("Ka4StockSccStandstillRearm", rearm_marker)
       self.paddle_mode = params.get_int("PaddleMode")
 
     actuators = CC.actuators
@@ -564,7 +583,8 @@ class CarController(CarControllerBase):
       hda2 = self.CP.flags & HyundaiFlags.CANFD_HDA2
       hda2_long = hda2 and self.CP.openpilotLongitudinalControl
       if not self.CP.openpilotLongitudinalControl and self.ka4_stock_scc_standstill_rearm:
-        # Offline-only actuator harness; production builds keep this gate false.
+        # Exact KA4 stock-radar topology only; every request remains subject to
+        # the current-frame interlocks in _update_ka4_stock_scc_keepalive().
         self._update_ka4_stock_scc_keepalive(CC, CS)
       # steering control
       if camera_scc:
@@ -827,6 +847,26 @@ class CarController(CarControllerBase):
     return None
 
 
+  def _ka4_stock_scc_interlock_active(self, CC, CS):
+    scc_control = CS.scc_control or {}
+    driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
+    driver_main_button_pressed = bool(getattr(CS, "main_buttons", ()) and CS.main_buttons[-1] != Buttons.NONE)
+    raw_button_input = False
+    if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and CS.cruise_buttons_msg is not None:
+      for signal in ("CRUISE_BUTTONS", "ADAPTIVE_CRUISE_MAIN_BTN", "NORMAL_CRUISE_MAIN_BTN", "LFA_BTN"):
+        value = CS.cruise_buttons_msg.get(signal, 0)
+        if isinstance(value, (list, tuple, deque)):
+          value = value[0] if value else 0
+        raw_button_input |= int(value) != 0
+
+    return (
+      not scc_control or not CS.out.canValid or
+      CS.out.brakePressed or CS.out.gasPressed or CS.out.brakeHoldActive or CS.out.parkingBrake or
+      getattr(CS.out, "accFaulted", False) or driver_button_pressed or driver_main_button_pressed or raw_button_input or
+      scc_control.get("SysFailState", 0) != 0 or scc_control.get("TakeOverReq", 0) != 0 or
+      CC.cruiseControl.cancel
+    )
+
   def make_spam_button(self, CC, CS, *, stock_scc_source_fresh=False):
     self.stock_scc_keepalive_requested = False
     if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
@@ -850,24 +890,52 @@ class CarController(CarControllerBase):
     target = int(set_speed_in_units+0.5)
     current = int(CS.out.cruiseState.speed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH) + 0.5)
     v_ego_kph = CS.out.vEgo * CV.MS_TO_KPH
+    # The KA4's set-speed synchronizer used to keep generating ordinary
+    # SET/RES traffic after the car was already stopped. That traffic is not a
+    # standstill keepalive and can make the stock SCC enter its
+    # switch-or-pedal state immediately. At a physical stop, allow only the
+    # planner-qualified departure RES or the separately bounded keepalive.
+    dk_ka4_supported = self.dk_ka4_runtime_branch and _ka4_stock_scc_standstill_supported(self.CP)
+    ka4_physical_stop = (
+      dk_ka4_supported and CS.out.standstill and
+      abs(getattr(CS.out, "vEgoRaw", CS.out.vEgo)) <= KA4_STOCK_SCC_MAX_NEAR_ZERO_SPEED
+    )
+    # Planner departure and periodic keepalive RES requests can straddle the
+    # transition where wheel speed and SCC standstill state clear on different
+    # frames. Apply the driver/safety interlocks to either request across that
+    # entire boundary, not only while the physical-stop predicate is true.
+    ka4_resume_request = dk_ka4_supported and (CC.cruiseControl.resume or keepalive_pending)
+    if ka4_resume_request and self._ka4_stock_scc_interlock_active(CC, CS):
+      self.activateCruise = 0
+      self.stock_scc_keepalive_pending = False
+      self.stock_scc_keepalive_pending_frame = None
+      self.stock_scc_keepalive_press_frames = 0
+      self.stock_scc_keepalive_warning_recovery = False
+      return 0
 
     send_button = 0
     activate_cruise = False
 
     if CC.enabled:
       if not CS.out.cruiseState.enabled:
-        if (hud_control.leadVisible or v_ego_kph > 10.0) and self.activateCruise == 0:
+        if (
+          not ka4_physical_stop and (hud_control.leadVisible or v_ego_kph > 10.0) and
+          self.activateCruise == 0
+        ):
           send_button = Buttons.RES_ACCEL
           self.activateCruise = 1
           activate_cruise = True
       elif CC.cruiseControl.resume or keepalive_pending:
         send_button = Buttons.RES_ACCEL
-      elif target < current and current>= 31 and self.speed_from_pcm != 1:
+      elif not ka4_physical_stop and target < current and current>= 31 and self.speed_from_pcm != 1:
         send_button = Buttons.SET_DECEL
-      elif target > current and current < 160 and self.speed_from_pcm != 1:
+      elif not ka4_physical_stop and target > current and current < 160 and self.speed_from_pcm != 1:
         send_button = Buttons.RES_ACCEL
     elif CS.out.activateCruise: #CC.cruiseControl.activate:
-      if (hud_control.leadVisible or v_ego_kph > 10.0) and self.activateCruise == 0:
+      if (
+        not ka4_physical_stop and (hud_control.leadVisible or v_ego_kph > 10.0) and
+        self.activateCruise == 0
+      ):
         self.activateCruise = 1
         send_button = Buttons.RES_ACCEL
         activate_cruise = True
@@ -929,75 +997,15 @@ class CarController(CarControllerBase):
     self.stock_scc_last_keepalive_frame = None
 
   def _update_ka4_stock_scc_resume_alert_mask(self, CC, CS):
-    """Mask only the KA4 stock-SCC resume prompt for one 30-second stop epoch.
+    """Preserve the OEM resume warning until ECU rearm is proven on-car.
 
-    The visible prompt and synthetic RES requests have different safety roles.
-    Brake/Auto Hold and raw lead-state gates must still veto every RES request,
-    but coupling those transient gates to the informational prompt caused the
-    prompt to leak immediately at otherwise normal stops. Start the display
-    epoch from an engaged stop (or the prompt itself), retain it through
-    transient SCC/controls state changes, and reset it only on motion or a
-    fail-open condition.
+    A transmitted RES frame does not prove that the SCC accepted it or reset
+    its internal timer. Hiding the warning on that assumption could remove a
+    required driver instruction, so this path deliberately stays fail-open.
     """
     self.stock_scc_resume_alert_suppressed = False
-    supported = self.ka4_stock_scc_standstill_rearm and _ka4_stock_scc_standstill_supported(self.CP)
-    hda2 = bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
-    if not supported or hda2:
-      self.stock_scc_alert_stop_start_frame = None
-      self.stock_scc_alert_abort_latched = False
-      return
-
-    scc_control = CS.scc_control or {}
-    adrv_0x161 = getattr(CS, "adrv_0x161", None) or {}
-    resume_prompt_active = scc_control.get("InfoDisplay", 0) == 4 or adrv_0x161.get("ALERTS_5", 0) == 5
-    v_ego_raw = abs(getattr(CS.out, "vEgoRaw", CS.out.vEgo))
-    physical_near_zero = CS.out.standstill and v_ego_raw <= KA4_STOCK_SCC_MAX_NEAR_ZERO_SPEED
-    stop_evidence = physical_near_zero or (CS.out.standstill and resume_prompt_active)
-    if not CS.out.standstill:
-      self.stock_scc_alert_stop_start_frame = None
-      self.stock_scc_alert_abort_latched = False
-      return
-    if not stop_evidence:
-      self.stock_scc_alert_stop_start_frame = None
-      return
-
-    driver_cancel_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] == Buttons.CANCEL)
-    driver_main_button_pressed = bool(getattr(CS, "main_buttons", ()) and CS.main_buttons[-1] != Buttons.NONE)
-    raw_cancel_or_main_pressed = False
-    if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and CS.cruise_buttons_msg is not None:
-      raw_cruise_button = CS.cruise_buttons_msg.get("CRUISE_BUTTONS", 0)
-      if isinstance(raw_cruise_button, (list, tuple, deque)):
-        raw_cruise_button = raw_cruise_button[0] if raw_cruise_button else 0
-      raw_cancel_or_main_pressed = int(raw_cruise_button) == Buttons.CANCEL
-      for signal in ("ADAPTIVE_CRUISE_MAIN_BTN", "NORMAL_CRUISE_MAIN_BTN"):
-        value = CS.cruise_buttons_msg.get(signal, 0)
-        if isinstance(value, (list, tuple, deque)):
-          value = value[0] if value else 0
-        raw_cancel_or_main_pressed |= int(value) != 0
-    fail_open = (
-      not CS.out.canValid or getattr(CS.out, "accFaulted", False) or
-      scc_control.get("SysFailState", 0) != 0 or scc_control.get("TakeOverReq", 0) != 0 or
-      CC.cruiseControl.cancel or driver_cancel_pressed or driver_main_button_pressed or raw_cancel_or_main_pressed
-    )
-    if fail_open:
-      self.stock_scc_alert_stop_start_frame = None
-      self.stock_scc_alert_abort_latched = True
-      return
-
-    # A cancellation, SCC fault/takeover, or invalid CAN closes this stopped
-    # epoch. A cached prompt on the next healthy tick must not silently grant a
-    # fresh 30 seconds; physical motion is required before rearming.
-    if self.stock_scc_alert_abort_latched:
-      return
-
-    if self.stock_scc_alert_stop_start_frame is None:
-      stop_session_active = CC.enabled or CS.out.cruiseState.enabled or resume_prompt_active
-      if not stop_session_active:
-        return
-      self.stock_scc_alert_stop_start_frame = self.frame
-
-    stopped_time = (self.frame - self.stock_scc_alert_stop_start_frame) * DT_CTRL
-    self.stock_scc_resume_alert_suppressed = stopped_time < KA4_STOCK_SCC_MAX_STANDSTILL_GRACE
+    self.stock_scc_alert_stop_start_frame = None
+    self.stock_scc_alert_abort_latched = False
 
   def _update_ka4_stock_scc_keepalive(self, CC, CS):
     """Keep KA4 radar-SCC auto-resume ready for at most 30 seconds.
@@ -1015,9 +1023,8 @@ class CarController(CarControllerBase):
     accelerator, Auto Hold, parking-brake, driver-button, SCC failure, or
     takeover interlocks.
     """
-    # The display timer is deliberately independent from the stricter RES
-    # request gates below. It is updated first so a newly received prompt is
-    # replaced in the same controller cycle.
+    # Preserve the OEM warning. The timer experiment is allowed to affect only
+    # the bounded button path, never the displayed driver instruction.
     self._update_ka4_stock_scc_resume_alert_mask(CC, CS)
     supported = self.ka4_stock_scc_standstill_rearm and _ka4_stock_scc_standstill_supported(self.CP)
     if not supported:
@@ -1029,20 +1036,7 @@ class CarController(CarControllerBase):
     adrv_0x161 = getattr(CS, "adrv_0x161", None) or {}
     resume_prompt_active = info_display == 4 or adrv_0x161.get("ALERTS_5", 0) == 5
     cruise_session_active = CC.enabled and CS.out.cruiseState.enabled and CS.out.canValid
-    driver_button_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] != Buttons.NONE)
-    driver_main_button_pressed = bool(getattr(CS, "main_buttons", ()) and CS.main_buttons[-1] != Buttons.NONE)
-    raw_button_input = False
-    if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and CS.cruise_buttons_msg is not None:
-      for signal in ("CRUISE_BUTTONS", "ADAPTIVE_CRUISE_MAIN_BTN", "NORMAL_CRUISE_MAIN_BTN", "LFA_BTN"):
-        value = CS.cruise_buttons_msg.get(signal, 0)
-        if isinstance(value, (list, tuple, deque)):
-          value = value[0] if value else 0
-        raw_button_input |= int(value) != 0
-    interlock_active = (
-      CS.out.brakePressed or CS.out.gasPressed or CS.out.brakeHoldActive or CS.out.parkingBrake or
-      getattr(CS.out, "accFaulted", False) or driver_button_pressed or driver_main_button_pressed or raw_button_input or
-      CC.cruiseControl.cancel
-    )
+    interlock_active = self._ka4_stock_scc_interlock_active(CC, CS)
     if not resume_prompt_active:
       self.stock_scc_warning_recovery_requested = False
       if self.stock_scc_keepalive_warning_recovery:

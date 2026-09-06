@@ -12,6 +12,7 @@ from openpilot.common.swaglog import cloudlog
 import numpy as np
 
 from opendbc.car.car_helpers import interfaces
+from opendbc.car.hyundai.values import CAR as HYUNDAI_CAR, HyundaiFlags
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.car.volkswagen.values import MEB_CURVATURE_PID_KP, MEB_CURVATURE_PID_KI, MEB_CURVATURE_PID_KF, MEB_CURVATURE_MAX
 
@@ -35,6 +36,7 @@ LaneChangeDirection = log.LaneChangeDirection
 LAT_CURVATURE_SATURATION_ACCEL = 0.1  # infiniteCable2 LatControlCurvature: 곡률 기반 steer_limited 임계 (m/s^2 환산)
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
+STANDSTILL_RESUME_MIN_PLANNED_SPEED = 0.1
 
 
 def lane_mode_control_enabled(use_lane_lines: bool, v_turn_speed: int, curve_speed_threshold: int) -> bool:
@@ -43,12 +45,43 @@ def lane_mode_control_enabled(use_lane_lines: bool, v_turn_speed: int, curve_spe
   return use_lane_lines and (curve_speed_abs == 0 or curve_speed_abs > curve_speed_threshold)
 
 
+def standstill_resume_requested(enabled: bool, cruise_standstill: bool, speeds, should_stop: bool,
+                                require_departing_plan: bool) -> bool:
+  """Keep existing resume behavior, with an extra departure gate for KA4.
+
+  ``shouldStop`` alone can clear while the model horizon still ends at zero.
+  The stricter check is intentionally limited to the affected KA4 stock-SCC
+  path so other brands retain their established resume semantics.
+  """
+  if not (enabled and cruise_standstill and len(speeds) > 0 and not should_stop):
+    return False
+  if not require_departing_plan:
+    return True
+  final_planned_speed = speeds[-1]
+  return math.isfinite(final_planned_speed) and final_planned_speed > STANDSTILL_RESUME_MIN_PLANNED_SPEED
+
+
+def dk_ka4_stock_scc_resume_gate(branch, CP) -> bool:
+  if isinstance(branch, bytes):
+    branch = branch.decode("utf-8", errors="replace")
+  flags = HyundaiFlags(CP.flags)
+  return (
+    str(branch or "").strip() == "dkcarrot-wip" and
+    CP.carFingerprint == HYUNDAI_CAR.KIA_CARNIVAL_4TH_GEN and
+    CP.pcmCruise and not CP.openpilotLongitudinalControl and
+    bool(flags & HyundaiFlags.CANFD) and bool(flags & HyundaiFlags.RADAR_SCC) and
+    bool(flags & HyundaiFlags.CANFD_ALT_BUTTONS) and
+    not bool(flags & HyundaiFlags.CANFD_HDA2) and not bool(flags & HyundaiFlags.CAMERA_SCC)
+  )
+
+
 class Controls:
   def __init__(self) -> None:
     self.params = Params()
     cloudlog.info("controlsd is waiting for CarParams")
     self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
     cloudlog.info("controlsd got CarParams")
+    self.dk_ka4_stock_scc_resume_gate = dk_ka4_stock_scc_resume_gate(self.params.get("GitBranch"), self.CP)
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
 
@@ -284,7 +317,10 @@ class Controls:
     desired_kph = min(CS.vCruiseCluster, self.sm['carrotMan'].desiredSpeed)
     setSpeed = float(desired_kph * CV.KPH_TO_MS)
     speeds = self.sm['longitudinalPlan'].speeds
-    CC.cruiseControl.resume = CC.enabled and CS.cruiseState.standstill and len(speeds) > 0 and not self.sm['longitudinalPlan'].shouldStop
+    CC.cruiseControl.resume = standstill_resume_requested(
+      CC.enabled, CS.cruiseState.standstill, speeds, self.sm['longitudinalPlan'].shouldStop,
+      self.dk_ka4_stock_scc_resume_gate,
+    )
     if len(speeds):
       vCluRatio = CS.vCluRatio if CS.vCluRatio > 0.5 else 1.0
       setSpeed = speeds[-1] / vCluRatio
