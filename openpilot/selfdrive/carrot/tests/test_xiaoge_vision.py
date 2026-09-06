@@ -241,7 +241,20 @@ def test_vision_service_publishes_the_composite_payload(message_transport):
 
 @pytest.fixture
 def vision_service(message_transport):
-  service = VASMService(v_asm_server.DEFAULT_MODEL_PATH)
+  class ConsentedParams:
+    _dk_consent_generation = "vision-service-generation"
+
+    def get(self, key):
+      return b"1" if key == "DkThirdPartyDataSharing" else None
+
+  params = ConsentedParams()
+  consent_generation = v_asm_server.third_party_data_sharing_generation(params)
+  assert consent_generation is not None
+  service = VASMService(
+    v_asm_server.DEFAULT_MODEL_PATH,
+    params=params,
+    consent_generation=consent_generation,
+  )
   assert service.inference.valid, service.inference.error
   assert service.lane_inference.valid, service.lane_inference.error
   message_transport.publish("carState", vEgo=20.0)
