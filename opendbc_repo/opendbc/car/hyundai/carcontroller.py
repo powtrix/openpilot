@@ -281,6 +281,8 @@ class CarController(CarControllerBase):
     self.stock_scc_keepalive_request_count = 0
     self.stock_scc_last_keepalive_frame = None
     self.stock_scc_button_source_counter = None
+    self.stock_scc_alert_stop_start_frame = None
+    self.stock_scc_alert_abort_latched = False
     self.stock_scc_resume_alert_suppressed = False
     self.paddle_mode = params.get_int("PaddleMode")
 
@@ -919,7 +921,77 @@ class CarController(CarControllerBase):
     self.stock_scc_warning_recovery_requested = False
     self.stock_scc_keepalive_requested = False
     self.stock_scc_last_keepalive_frame = None
+
+  def _update_ka4_stock_scc_resume_alert_mask(self, CC, CS):
+    """Mask only the KA4 stock-SCC resume prompt for one 30-second stop epoch.
+
+    The visible prompt and synthetic RES requests have different safety roles.
+    Brake/Auto Hold and raw lead-state gates must still veto every RES request,
+    but coupling those transient gates to the informational prompt caused the
+    prompt to leak immediately at otherwise normal stops. Start the display
+    epoch from an engaged stop (or the prompt itself), retain it through
+    transient SCC/controls state changes, and reset it only on motion or a
+    fail-open condition.
+    """
     self.stock_scc_resume_alert_suppressed = False
+    supported = _ka4_stock_scc_standstill_supported(self.CP)
+    hda2 = bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
+    if not supported or hda2:
+      self.stock_scc_alert_stop_start_frame = None
+      self.stock_scc_alert_abort_latched = False
+      return
+
+    scc_control = CS.scc_control or {}
+    adrv_0x161 = getattr(CS, "adrv_0x161", None) or {}
+    resume_prompt_active = scc_control.get("InfoDisplay", 0) == 4 or adrv_0x161.get("ALERTS_5", 0) == 5
+    v_ego_raw = abs(getattr(CS.out, "vEgoRaw", CS.out.vEgo))
+    physical_near_zero = CS.out.standstill and v_ego_raw <= KA4_STOCK_SCC_MAX_NEAR_ZERO_SPEED
+    stop_evidence = physical_near_zero or (CS.out.standstill and resume_prompt_active)
+    if not CS.out.standstill:
+      self.stock_scc_alert_stop_start_frame = None
+      self.stock_scc_alert_abort_latched = False
+      return
+    if not stop_evidence:
+      self.stock_scc_alert_stop_start_frame = None
+      return
+
+    driver_cancel_pressed = bool(CS.cruise_buttons and CS.cruise_buttons[-1] == Buttons.CANCEL)
+    driver_main_button_pressed = bool(getattr(CS, "main_buttons", ()) and CS.main_buttons[-1] != Buttons.NONE)
+    raw_cancel_or_main_pressed = False
+    if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and CS.cruise_buttons_msg is not None:
+      raw_cruise_button = CS.cruise_buttons_msg.get("CRUISE_BUTTONS", 0)
+      if isinstance(raw_cruise_button, (list, tuple, deque)):
+        raw_cruise_button = raw_cruise_button[0] if raw_cruise_button else 0
+      raw_cancel_or_main_pressed = int(raw_cruise_button) == Buttons.CANCEL
+      for signal in ("ADAPTIVE_CRUISE_MAIN_BTN", "NORMAL_CRUISE_MAIN_BTN"):
+        value = CS.cruise_buttons_msg.get(signal, 0)
+        if isinstance(value, (list, tuple, deque)):
+          value = value[0] if value else 0
+        raw_cancel_or_main_pressed |= int(value) != 0
+    fail_open = (
+      not CS.out.canValid or getattr(CS.out, "accFaulted", False) or
+      scc_control.get("SysFailState", 0) != 0 or scc_control.get("TakeOverReq", 0) != 0 or
+      CC.cruiseControl.cancel or driver_cancel_pressed or driver_main_button_pressed or raw_cancel_or_main_pressed
+    )
+    if fail_open:
+      self.stock_scc_alert_stop_start_frame = None
+      self.stock_scc_alert_abort_latched = True
+      return
+
+    # A cancellation, SCC fault/takeover, or invalid CAN closes this stopped
+    # epoch. A cached prompt on the next healthy tick must not silently grant a
+    # fresh 30 seconds; physical motion is required before rearming.
+    if self.stock_scc_alert_abort_latched:
+      return
+
+    if self.stock_scc_alert_stop_start_frame is None:
+      stop_session_active = CC.enabled or CS.out.cruiseState.enabled or resume_prompt_active
+      if not stop_session_active:
+        return
+      self.stock_scc_alert_stop_start_frame = self.frame
+
+    stopped_time = (self.frame - self.stock_scc_alert_stop_start_frame) * DT_CTRL
+    self.stock_scc_resume_alert_suppressed = stopped_time < KA4_STOCK_SCC_MAX_STANDSTILL_GRACE
 
   def _update_ka4_stock_scc_keepalive(self, CC, CS):
     """Keep KA4 radar-SCC auto-resume ready for at most 30 seconds.
@@ -937,7 +1009,10 @@ class CarController(CarControllerBase):
     accelerator, Auto Hold, parking-brake, driver-button, SCC failure, or
     takeover interlocks.
     """
-    self.stock_scc_resume_alert_suppressed = False
+    # The display timer is deliberately independent from the stricter RES
+    # request gates below. It is updated first so a newly received prompt is
+    # replaced in the same controller cycle.
+    self._update_ka4_stock_scc_resume_alert_mask(CC, CS)
     supported = _ka4_stock_scc_standstill_supported(self.CP)
     if not supported:
       self._reset_ka4_stock_scc_keepalive()
@@ -1011,9 +1086,6 @@ class CarController(CarControllerBase):
         self.stock_scc_near_zero_start_frame = self.frame
       self.stock_scc_near_zero_frames += 1
       self.stock_scc_stopped_lead_frames += 1
-      # Hide only the exact stock resume prompt while all current-frame safety
-      # gates are valid. Other OEM alerts and sounds remain untouched.
-      self.stock_scc_resume_alert_suppressed = not bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
       if self.stock_scc_near_zero_frames <= round(KA4_STOCK_SCC_NEAR_ZERO_DWELL / DT_CTRL):
         return
 
@@ -1043,11 +1115,6 @@ class CarController(CarControllerBase):
       self.stock_scc_keepalive_press_frames = 0
       self.stock_scc_keepalive_warning_recovery = False
       return
-
-    self.stock_scc_resume_alert_suppressed = (
-      stopped_time < KA4_STOCK_SCC_MAX_STANDSTILL_GRACE and
-      not bool(self.CP.flags & HyundaiFlags.CANFD_HDA2)
-    )
 
     cutoff_frames = round(KA4_STOCK_SCC_REARM_CUTOFF / DT_CTRL)
     if stopped_frames > cutoff_frames:
