@@ -161,19 +161,25 @@ Scope and exclusions:
 > Values that are too large can flood button messages or make stock SCC miss inputs. Values that are too small can slow or prevent synchronization. Keep the initial Params values `8 / 30 / 1` if there is no problem.
 
 <a id="ka4-stock-scc-standstill"></a>
-### KA4 stock-SCC standstill diagnosis
+### KA4 stock-SCC 30-second resume-retention experiment
 
-The former periodic stopped-lead RES experiment is disabled and has no user setting. `Ka4StockSccStandstillRearm` remains only as legacy route metadata and is forced to `0` by current builds.
+This behavior is applied automatically, without a user setting, only when all of the following conditions match. It stays inactive on the comparison/recovery `carrot-wip` and `carrot` branches and turns on only when the installed runtime branch is exactly `dkcarrot-wip`. `Ka4StockSccStandstillRearm` is not a screen setting; it is internal metadata recording whether the behavior is active for the current vehicle.
 
 - Fourth-generation Kia Carnival KA4 (the current vehicle-validation target is model year 2023)
-- CAN FD, PCM cruise, and stock radar SCC
+- CAN FD HDA1 hardware, PCM cruise, stock radar SCC, and the owner's CRC-protected alternate `0x1AA` steering-wheel-button layout
 - No openpilot longitudinal control and no camera SCC
 
-Known public KA4 captures carry the stock standstill/resume state in `SCC_CONTROL` (`0x1A0`) and contain no `ADRV_0x161`. The previous branch masked `ADRV_0x161.ALERTS_5=5`, so it could hide neither the observed KA4 state nor extend the stock SCC ECU's resume eligibility. Replacing `SCC_CONTROL` is not used as a workaround because that same safety-critical message also contains acceleration, braking, and stop requests.
+At the instant of a physical stop, ordinary set-speed synchronization SET/RES traffic and automatic cruise-activation presses are blocked. Only a planner-qualified departure RES and the bounded keepalive below remain eligible, removing the path where unrelated speed synchronization could change the stock SCC state immediately after stopping. Both RES paths must pass the current frame's pedal, Auto Hold, parking-brake, driver-button, CAN, and SCC fault/takeover interlocks.
 
-With stock longitudinal control, the OEM SCC still decides how long restart remains available. This branch preserves the received OEM HDA state and retains the normal guarded resume request when the lead actually departs, but it does not synthesize repeated RES presses while the lead remains stopped and does not claim a universal 30-second window. A guaranteed different stop-and-go policy requires either an OEM-supported HDA operating condition or a separately validated openpilot-longitudinal vehicle configuration.
+Short keepalive RES presses are requested only when the vehicle is physically nearly stopped, SCC is active, and a close lead has been stably stationary. Raw vehicle speed must be at most `0.03 m/s`, lead distance must be greater than `0 m` and at most `20 m`, absolute relative speed must be at most `0.5 m/s`, and SCC must report no fault or takeover request. The first request is around 2.5 seconds into the qualified stop, subsequent requests are at least about 2.5 seconds apart, and the final short press completes by 27 seconds. This schedule aims to retain the stock three-second resume window until roughly 30 seconds if the SCC ECU accepts the inputs. HDA1 here describes the CAN hardware topology; it does not depend on whether the HDA indicator is active during a drive.
 
-With separate `CarrotValidationAutoUpload` consent, the device marks the beginning of an engaged stock-SCC stop after about 0.5 seconds and can upload the nearby full rlogs after the drive without file selection. This is observation only and does not change vehicle control. See [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) for scope and privacy details.
+The normal lead-departure RES path requires **both `longitudinalPlan.shouldStop=false` and an end-of-horizon planned speed above `0.1 m/s`**. It therefore cannot open early while the planned speed still ends at zero.
+
+Any brake or accelerator input, Auto Hold, parking brake, driver cruise/main/LFA button, SCC fault or takeover request, or invalid CAN aborts both RES paths immediately. Loss of the stationary-lead qualification aborts only the periodic keepalive; a planner-qualified RES remains available for the intended moment when the lead departs. The implementation does not overwrite `SCC_CONTROL` (`0x1A0`), which also carries acceleration, braking, and stop requests. It also does not hide the OEM driver warning because transmission of a synthetic RES cannot prove ECU acceptance. The meaningful result is therefore whether SCC resumes when the lead departs without an additional pedal press, even if the prompt remains visible.
+
+The schedule passes code, DBC, and Panda safety checks, but whether the stock SCC ECU accepts a synthetic RES while stopped and actually restarts its internal window must still be confirmed on the owner's 2023 KA4. Brake immediately and return to the `dk-ka4-steering-baseline-2026-09-06-r2` recovery tag if there is unexpected movement, a warning, or abnormal button behavior. That tag preserves the currently satisfactory steering behavior together with the pre-experiment stop/resume code.
+
+With separate `CarrotValidationAutoUpload` consent, the device marks the beginning of an engaged stock-SCC stop after about 0.5 seconds and can upload the nearby full rlogs after the drive without file selection. Turning that logging setting on or off does not change the resume behavior above. See [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) for scope and privacy details.
 
 <a id="speed-presets"></a>
 ## 4. Speed presets
