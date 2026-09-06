@@ -361,6 +361,20 @@ def parse_remote_urls(remote_urls_out: str) -> dict[str, str]:
   return remote_urls
 
 
+def parse_ls_remote_heads(remote: str, ls_remote_out: str) -> list[str]:
+  """Convert `git ls-remote --heads` output into short remote refs."""
+  refs: list[str] = []
+  prefix = "refs/heads/"
+  for line in (ls_remote_out or "").splitlines():
+    parts = line.split(None, 1)
+    if len(parts) != 2 or not parts[1].startswith(prefix):
+      continue
+    name = parts[1][len(prefix):].strip()
+    if name:
+      refs.append(f"{remote}/{name}")
+  return refs
+
+
 def match_remote_ref(ref: str, remotes: list[str]) -> Optional[tuple[str, str]]:
   for remote in sorted(remotes, key=len, reverse=True):
     prefix = f"{remote}/"
