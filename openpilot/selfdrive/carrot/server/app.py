@@ -29,6 +29,7 @@ from .services.popular_values import start_popular_value_upload
 from .services.settings import get_settings_cached
 from .services.static_assets import create_static_cache_middleware, start_precompress
 from .services.validation_auto_upload import validation_auto_upload_loop
+from .services.web_consent import initialize_web_consent_sessions
 
 VISION_DIAG_UPLOAD_MAX_BYTES = 16 * 1024 * 1024
 
@@ -238,6 +239,7 @@ def make_app() -> web.Application:
     middlewares=[log_mw, create_static_cache_middleware(str(WEB_DIR))],
     client_max_size=VISION_DIAG_UPLOAD_MAX_BYTES,
   )
+  initialize_web_consent_sessions(app)
   app.on_startup.append(on_startup)
   app.on_cleanup.append(on_cleanup)
 

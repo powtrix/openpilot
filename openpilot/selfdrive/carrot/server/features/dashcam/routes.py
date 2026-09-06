@@ -7,7 +7,12 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-from openpilot.selfdrive.carrot.web_upload import check_web_upload_health, create_web_upload_session
+from openpilot.selfdrive.carrot.web_upload import (
+  VALIDATION_DEVICE_AUTH_VERSION,
+  check_web_upload_health,
+  create_web_upload_session,
+  validation_device_key_fingerprint,
+)
 
 from ...config import DASHCAM_ROOT
 from . import upload, upload_jobs
@@ -534,9 +539,13 @@ async def api_dashcam_upload_test(request: web.Request) -> web.Response:
   try:
     base_url, token = upload.upload_target_settings()
     result = await check_web_upload_health(base_url, token)
-    if result.get("ok") and not token:
-      await create_web_upload_session(base_url, upload.current_upload_metadata(), "test")
-      result["session"] = "automatic"
+    if result.get("ok"):
+      if result.get("legacyUploadsEnabled") is False:
+        result["mode"] = "validation-only"
+        result["session"] = "disabled"
+      elif not token:
+        await create_web_upload_session(base_url, upload.current_upload_metadata(), "test")
+        result["session"] = "automatic"
     status = 200 if result.get("ok") else 502
     return web.json_response({"target": "web", "url": base_url, **result}, status=status)
   except Exception as e:
@@ -611,11 +620,23 @@ async def api_validation_auto_upload_status(request: web.Request) -> web.Respons
   return response
 
 
+async def api_validation_device_key(request: web.Request) -> web.Response:
+  """Expose only the public enrollment fingerprint needed by the private NAS."""
+  try:
+    result = await asyncio.to_thread(validation_device_key_fingerprint)
+    response = web.json_response({"ok": True, **result, "deviceAuthVersion": VALIDATION_DEVICE_AUTH_VERSION})
+  except Exception:
+    response = web.json_response({"ok": False, "error": "device signing key is unavailable"}, status=503)
+  response.headers["Cache-Control"] = "no-store"
+  return response
+
+
 def register(app: web.Application) -> None:
   app.router.add_get("/api/dashcam/routes", api_dashcam_routes)
   app.router.add_get("/api/dashcam/read-state", api_dashcam_read_state)
   app.router.add_post("/api/dashcam/read-state", api_dashcam_read_state_update)
   app.router.add_get("/api/dashcam/validation-upload/status", api_validation_auto_upload_status)
+  app.router.add_get("/api/dashcam/validation-upload/device-key", api_validation_device_key)
   app.router.add_get("/api/dashcam/segments/{route}", api_dashcam_segments)
   app.router.add_get("/api/dashcam/report/{route}", api_dashcam_report)
   app.router.add_get("/api/dashcam/summary-source/{route}", api_dashcam_summary_source)

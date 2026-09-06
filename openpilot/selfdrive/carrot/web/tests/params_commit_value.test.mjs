@@ -36,6 +36,24 @@ test("a commit posts the name, value and source together", async () => {
   }]);
 });
 
+test("an explicitly confirmed high-risk write requests a consent-bound POST", async () => {
+  const requests = [];
+  const committer = createSettingCommitter({
+    postJson: async (url, body, requestOptions) => {
+      requests.push({ url, body, requestOptions });
+      return { ok: true, name: body.name, value: body.value };
+    },
+  });
+
+  await committer.commit("CarrotValidationAutoUpload", 1, { webConsent: true });
+
+  assert.deepEqual(requests, [{
+    url: "/api/param_set",
+    body: { name: "CarrotValidationAutoUpload", value: 1, source: "web_ui" },
+    requestOptions: { webConsent: true },
+  }]);
+});
+
 test("an empty name is rejected before any request is made", async () => {
   const { committer, requests } = createHarness();
   await assert.rejects(() => committer.commit("", 1), TypeError);

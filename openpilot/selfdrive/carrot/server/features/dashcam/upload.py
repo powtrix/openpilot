@@ -5,6 +5,7 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout
 
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
 from openpilot.system.hardware import HARDWARE
 from openpilot.selfdrive.carrot.web_upload import web_upload_settings
 
@@ -111,6 +112,8 @@ def discord_webhook_url(params: Any) -> str:
       return value
   if os.environ.get("CARROT_DISCORD_WEBHOOK_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
     return ""
+  if not community_data_sharing_enabled(params):
+    return ""
   return decode_obfuscated(DASHCAM_DEFAULT_DISCORD_WEBHOOK, DASHCAM_DEFAULT_DISCORD_KEY)
 
 
@@ -120,6 +123,14 @@ async def send_discord_webhook(url: str, payload: dict[str, Any]) -> dict[str, A
     return {"configured": False, "ok": False, "skipped": True}
   if not url.startswith(("http://", "https://")):
     return {"configured": True, "ok": False, "error": "invalid webhook url"}
+  default_url = decode_obfuscated(DASHCAM_DEFAULT_DISCORD_WEBHOOK, DASHCAM_DEFAULT_DISCORD_KEY)
+  if url == default_url and not community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+    }
   body = {
     "username": "Carrot Dashcam",
     "content": discord_content(payload),
@@ -129,6 +140,13 @@ async def send_discord_webhook(url: str, payload: dict[str, Any]) -> dict[str, A
   try:
     timeout = ClientTimeout(total=12)
     async with ClientSession(timeout=timeout) as session:
+      if url == default_url and not community_data_sharing_enabled():
+        return {
+          "configured": True,
+          "ok": False,
+          "skipped": True,
+          "disabled_by_community_sharing": True,
+        }
       async with session.post(url, json=body) as resp:
         text = await resp.text()
         if 200 <= resp.status < 300:

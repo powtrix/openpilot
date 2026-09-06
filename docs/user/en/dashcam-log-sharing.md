@@ -7,6 +7,12 @@ When you ask a Carrot support specialist to analyze abnormal behavior, use `Logs
 > [!WARNING]
 > Operate Carrot Web only after parking safely. While driving, do not search for or select logs; remember the occurrence time and symptom instead.
 
+## Automatic community sharing versus manual log upload
+
+`System > Record & Power > Carrot Community Data Sharing` is a separate consent setting that is off by default. Enabling it allows Carrot community servers or bundled Discord webhooks to receive device/network status, setting values, automatic onroad/exception tmux diagnostics, and support metadata without per-file confirmation. It also permits popular-setting downloads and CWP address registration. Turning it off blocks new community requests, stops all automatic tmux capture/retries, and discards pending automatic exception transfers.
+
+Turning this setting off does not change a manual upload itself after it is explicitly started from selected segments in `Logs > Dashcam`, a user-configured NAS or Discord URL, or the separate KA4 automatic-validation consent below. However, the default `adot.synology.me` DK receiver is restricted to automatic KA4 validation and rejects manual dashcam/tmux uploads with HTTP 403; manual upload requires a separately authenticated private receiver. The post-upload report to the bundled default Discord is also blocked, so copy the completion result and send it manually. In particular, if `CarrotValidationAutoUpload` is enabled, its full-rlog upload to the fixed private-NAS receiver can continue while community sharing is off. Neither consent value is included in backups, profiles, or QR transfer, so a new installation or another device cannot inherit it automatically.
+
 <a id="automatic-validation-upload"></a>
 ## Automatic KA4 validation upload (experimental)
 
@@ -14,6 +20,7 @@ When you ask a Carrot support specialist to analyze abnormal behavior, use `Logs
 
 The collector arms only when all of this vehicle topology is confirmed:
 
+- The owner's allowlisted DK device only; its raw identifier is not published in the branch
 - Fourth-generation Kia Carnival KA4 (the current vehicle-validation target is model year 2023)
 - CAN FD stock radar SCC and PCM cruise
 - No openpilot longitudinal control and no camera SCC
@@ -24,7 +31,7 @@ When a condition is detected, the triggering segment and up to two contiguous pr
 
 Each event capture sends **at most three full rlogs only**. A campaign can collect each of seven conditions up to twice, for **at most 14 captures / 42 full rlogs**. At most 5 captures / 750 MiB can wait locally at once, but this is a concurrent pending-data cap, not a cap on cumulative campaign uploads or retry traffic. The collector does not separately send `qcamera`, driver-camera, tmux data, or a Discord notification. A full rlog can nevertheless contain precise location, vehicle CAN and control state, device identifiers, branch, commit and working-tree modification status, Params captured at route start, and low-resolution road thumbnails sampled at roughly one-minute intervals. It does not photograph the Kia cluster or its exact alert text, so the text itself cannot be proven from an rlog alone.
 
-For upload, the device signs a one-time challenge with its existing registration key, and the receiver verifies that device identity with the official comma device API. The user does not enter a token or password. Automatic validation uploads go only to the trusted HTTPS receiver built into the branch, or to an immutable receiver fixed by the system administrator at deployment time. The ordinary Carrot Web upload destination cannot redirect them. The receiver recomputes every file's size and SHA-256, and the device removes a local queue entry only after the capture ID, verified device ID, complete file list, and final manifest hash all match the completion receipt. If the receiver does not support this authenticated protocol or identity verification is temporarily unavailable, the logs remain retained locally and retry automatically.
+For upload, the device signs a purpose-specific value bound only to that request's one-time challenge with its existing registration key. The receiver verifies the signature locally against a privately pre-enrolled public-key fingerprint; it neither receives a general comma API bearer nor contacts the official comma device API. The user does not enter a token or password. Automatic validation uploads go only to the trusted HTTPS receiver built into the branch, or to an immutable receiver fixed by the system administrator at deployment time. The ordinary Carrot Web upload destination cannot redirect them. The receiver recomputes every file's size and SHA-256, and the device removes a local queue entry only after the capture ID, verified device ID, complete file list, and final manifest hash all match the completion receipt. If the receiver does not support this authenticated protocol or identity verification is temporarily unavailable, the logs remain retained locally and retry automatically.
 
 The queue survives a reboot. Failures retry after approximately 30 seconds, 2 minutes, 10 minutes, 1 hour, and 6 hours, with small timing jitter. Collection is limited to two captures per condition, five concurrently pending captures overall, and about 750 MiB pending. The receiver has a 1 GiB per-device daily limit, so retained local logs may retry automatically the next day after the limit is reached. The setting row shows only a sanitized state, pending count, expiry, and last-upload time; it never shows a route, receiver URL, device ID, capture ID, or raw error. The setting turns itself off after all five required conditions upload or after seven days. Turning it off manually discards pending entries and releases retention markers created by this feature. Consent is excluded from settings backups, restores, and QR transfer; if the saved campaign state is unavailable after a reinstall, explicitly toggle the setting off and on again while parked.
 
@@ -81,7 +88,7 @@ If the completion screen shows the same `uploaded/total` number, all selected fi
 
 The result generated by `Copy` can include device, branch, commit, and per-segment upload information. Each successful segment is shown as a public Synology viewer link. Opening it provides web playback, public files, and ready-to-copy Cabana, PlotJuggler, and JotPluggler commands. Consecutively numbered segments from the same route also receive one combined link that opens the full range.
 
-When the upload job finishes, the device sends the same result report directly to the configured Discord webhook. A Discord notification failure does not undo an already completed log upload; if no notification appears, post the completion screen's `Copy` result to the channel manually.
+When the upload job finishes, the device sends the same result report directly to the configured Discord webhook. If the user has not supplied a custom webhook and the bundled default Discord is used, `CarrotCommunityDataSharing=1` is required. Disabled consent or a Discord notification failure does not undo an already completed log upload; post the completion screen's `Copy` result to the channel manually.
 
 Public viewer links do not require a login. Anyone who receives a link can open or forward it. Confirm the selected segments and the Discord channel where the report will be posted, then add the following details when requesting analysis:
 

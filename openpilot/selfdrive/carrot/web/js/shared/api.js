@@ -67,13 +67,30 @@ async function requestJson(url, options = {}) {
   return payload;
 }
 
-async function postJson(url, bodyObj) {
+async function getWebConsentSessionToken() {
+  const payload = await requestJson("/api/web-consent/session", {
+    cache: "no-store",
+    credentials: "same-origin",
+  });
+  const token = String(payload?.token || "").trim();
+  if (!token) throw new Error("Web consent session is unavailable");
+  return token;
+}
+
+async function postJson(url, bodyObj, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Carrot-Web-Request": "1",
+  };
+  // Fetch only after the user accepts one of the two high-risk dialogs. The
+  // server binds this short-lived, one-use token to the exact local origin.
+  if (options.webConsent === true) {
+    headers["X-Carrot-Web-Consent"] = await getWebConsentSessionToken();
+  }
   return requestJson(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Carrot-Web-Request": "1",
-    },
+    headers,
+    credentials: "same-origin",
     body: JSON.stringify(bodyObj || {})
   });
 }
