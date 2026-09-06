@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 import pytest
 
+from opendbc.car.hyundai.values import CAR, HyundaiFlags
+
 from .. import server as receiver_server
 from ..server import (
   DEVICE_AUTH_VERSION,
@@ -201,7 +203,7 @@ def _capture_metadata(
     "detectedAt": 1_800_000_000,
     "settingsEpoch": 0,
     "routeSettings": {
-      "Ka4StockSccStandstillRearm": 1 if condition == "standstill_on" else 0,
+      "Ka4StockSccStandstillRearm": 1,
       "PathOffset": 10 if condition == "lane_offset_10" else 0,
       "AdjustLaneOffset": 0,
     },
@@ -210,10 +212,10 @@ def _capture_metadata(
       "commit": "b" * 40,
       "dirty": False,
       "topology": {
-        "carFingerprint": "KIA CARNIVAL 4TH GEN",
+        "carFingerprint": "KIA_CARNIVAL_4TH_GEN",
         "pcmCruise": True,
         "openpilotLongitudinalControl": False,
-        "flags": 1,
+        "flags": (1 << 13) | (1 << 14),
         "alternativeExperience": 0,
         "safetyConfigs": [{"model": "hyundaiCanfd", "param": 0}],
         "gatePassed": True,
@@ -228,6 +230,14 @@ def _capture_metadata(
     route=route,
     segments=segments,
   )
+
+
+def test_receiver_ka4_topology_wire_constants_match_the_vehicle_gate():
+  assert receiver_server.KA4_STOCK_SCC_CAR_FINGERPRINT == str(CAR.KIA_CARNIVAL_4TH_GEN)
+  assert receiver_server.HYUNDAI_FLAG_CANFD_HDA2 == int(HyundaiFlags.CANFD_HDA2)
+  assert receiver_server.HYUNDAI_FLAG_CAMERA_SCC == int(HyundaiFlags.CAMERA_SCC)
+  assert receiver_server.HYUNDAI_FLAG_CANFD == int(HyundaiFlags.CANFD)
+  assert receiver_server.HYUNDAI_FLAG_RADAR_SCC == int(HyundaiFlags.RADAR_SCC)
 
 
 def _completion_body(files: list[dict[str, Any]]) -> dict[str, Any]:
@@ -550,6 +560,10 @@ def test_actual_client_v2_proof_upload_and_manifest_contract(
     "get_key_pair",
     lambda: (algorithm, private_pem, public_pem),
   )
+  # The production client now requires private HTTPS. This contract test owns
+  # an in-process loopback HTTP server, so bypass only the destination-policy
+  # predicate while exercising the real proof/upload/receipt implementation.
+  monkeypatch.setattr(client_web_upload, "is_private_validation_upload_url", lambda _: True)
 
   async def run():
     cfg = replace(
@@ -1404,6 +1418,66 @@ def test_validation_capture_rejects_wrong_types_bounds_and_nested_shape(tmp_path
           headers={**_auth(token), "Content-Type": "application/json"},
         )
         assert response.status == 400, await response.text()
+
+    with sqlite3.connect(cfg.db_path) as connection:
+      assert connection.execute(
+        "SELECT committed_bytes FROM daily_usage ORDER BY scope",
+      ).fetchall() == [(charged,), (charged,)]
+
+  asyncio.run(run())
+
+
+def test_validation_capture_rejects_every_non_ka4_stock_scc_gate_variant(tmp_path: Path):
+  async def run():
+    content = b"not-uploaded"
+    files = [{
+      "segment": "route--0",
+      "name": "rlog.zst",
+      "size": len(content),
+      "sha256": hashlib.sha256(content).hexdigest(),
+    }]
+    base = _completion_body(files)
+
+    invalid_variants: list[tuple[str, tuple[str, ...], Any]] = [
+      ("different fingerprint", ("git", "topology", "carFingerprint"), "KIA CARNIVAL 4TH GEN"),
+      ("pcmCruise false", ("git", "topology", "pcmCruise"), False),
+      ("openpilot longitudinal enabled", ("git", "topology", "openpilotLongitudinalControl"), True),
+      ("CAN-FD missing", ("git", "topology", "flags"), 1 << 14),
+      ("radar SCC missing", ("git", "topology", "flags"), 1 << 13),
+      ("camera SCC present", ("git", "topology", "flags"), (1 << 3) | (1 << 13) | (1 << 14)),
+      ("HDA2 present", ("git", "topology", "flags"), (1 << 0) | (1 << 13) | (1 << 14)),
+      ("topology gate false", ("git", "topology", "gatePassed"), False),
+      (
+        "Hyundai CAN-FD safety missing",
+        ("git", "topology", "safetyConfigs"),
+        [{"model": "noOutput", "param": 0}],
+      ),
+      ("automatic rearm off", ("routeSettings", "Ka4StockSccStandstillRearm"), 0),
+    ]
+    invalid_bodies: list[tuple[str, dict[str, Any]]] = []
+    for name, path, value in invalid_variants:
+      body = json.loads(json.dumps(base))
+      target = body["validationCapture"]
+      for key in path[:-1]:
+        target = target[key]
+      target[path[-1]] = value
+      invalid_bodies.append((name, body))
+
+    cfg = config(tmp_path)
+    charged = 0
+    async with TestClient(TestServer(create_app(
+      cfg, start_cleanup=False, validation_verifier=FakeVerifier(),
+    ))) as client:
+      token = await _token(client)
+      for name, body in invalid_bodies:
+        encoded = _json_bytes(body)
+        charged += len(encoded)
+        response = await client.post(
+          "/api/v1/validation/complete",
+          data=encoded,
+          headers={**_auth(token), "Content-Type": "application/json"},
+        )
+        assert response.status == 400, f"{name}: {await response.text()}"
 
     with sqlite3.connect(cfg.db_path) as connection:
       assert connection.execute(

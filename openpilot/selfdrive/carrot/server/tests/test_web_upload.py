@@ -23,6 +23,56 @@ def clear_upload_env(monkeypatch):
     monkeypatch.delenv(key, raising=False)
 
 
+@pytest.mark.parametrize("base_url", [
+  "https://example.com",
+  "https://api.commadotai.com",
+  "https://connect.comma.ai/validation",
+  "https://tmux.carrotpilot.app",
+  "https://sub.carrotpilot.app/validation",
+  "https://shind0.synology.me",
+  "https://upload.shind0.synology.me",
+  "https://op.wjcloud.kr",
+  "http://adot.synology.me",
+  "https://user:password@adot.synology.me",
+  "https://sub.adot.synology.me",
+  "https://adot.synology.me.example",
+  "https://adot-synology.me",
+  "https://adot.synology.me:444",
+  "https://adot.synology.me:",
+  "https://adot.synology.me:0443",
+  "https://adot.synology.me/api/v1/validation",
+  "https://adot.synology.me/?",
+  "https://adot.synology.me/#",
+  "https://adot.synology.me/?receiver=other",
+  "https://adot.synology.me/#other",
+])
+def test_validation_network_edges_reject_every_unpinned_destination(base_url):
+  assert web_upload.is_private_validation_upload_url(base_url) is False
+
+  with pytest.raises(RuntimeError, match="pinned DK HTTPS origin"):
+    asyncio.run(web_upload.create_validation_upload_session(base_url, {"dongleId": "device"}))
+  with pytest.raises(RuntimeError, match="pinned DK HTTPS origin"):
+    asyncio.run(web_upload.upload_validation_folder_to_web(
+      "/does/not/matter", "route--0", "capture", base_url, "token", [],
+    ))
+  completion = asyncio.run(web_upload.send_validation_upload_complete(
+    base_url, "token", {"deviceId": "device", "captureId": "capture", "files": []},
+  ))
+  assert completion == {
+    "ok": False,
+    "error": "validation upload requires the pinned DK HTTPS origin",
+  }
+
+
+@pytest.mark.parametrize("base_url", [
+  "https://adot.synology.me",
+  "https://ADOT.SYNOLOGY.ME/",
+  "https://adot.synology.me:443/",
+])
+def test_validation_network_edges_keep_only_pinned_private_nas_origin(base_url):
+  assert web_upload.is_private_validation_upload_url(base_url) is True
+
+
 class FakeUploadTask:
   def __init__(self, *, done=False):
     self._done = done
@@ -205,10 +255,11 @@ def test_carrot_runtime_contains_no_legacy_ftp_code():
 
 def test_carrot_man_sends_diagnostics_to_dsm_and_carrot_logs():
   carrot_man = (Path(__file__).resolve().parents[2] / "carrot_man.py").read_text(encoding="utf-8")
+  normalized = " ".join(carrot_man.split())
   assert "def send_tmux_web(" in carrot_man
   assert "def send_tmux_carrot_logs(" in carrot_man
-  assert 'self.send_tmux_carrot_logs("onroad", send_settings = True)' in carrot_man
-  assert "self.send_tmux_carrot_logs(pending_tmux_reason, send_settings = False)" in carrot_man
+  assert 'self.send_tmux_carrot_logs( "onroad", send_settings=True, consent_generation=onroad_tmux_generation' in normalized
+  assert "self.send_tmux_carrot_logs( pending_tmux_reason, send_settings=False, consent_generation=pending_tmux_generation" in normalized
   assert 'self.send_tmux_carrot_logs("tmux_send")' in carrot_man
   assert "using tmux web fallback" not in carrot_man
 
@@ -750,6 +801,35 @@ def test_tmux_web_guard_blocks_revoked_request_and_closes_files(tmp_path: Path):
     )
 
 
+def test_tmux_web_guard_stops_stream_after_mid_file_revocation(tmp_path: Path):
+  tmux_path = tmp_path / "tmux.log"
+  tmux_path.write_bytes(b"x" * (web_upload.GUARDED_MULTIPART_CHUNK_SIZE * 2))
+  state = {"allowed": True}
+  opened_files = []
+
+  def fake_post(url, *, headers, data, timeout):
+    del url, headers, timeout
+    opened_files.extend(segment for segment in data._segments if hasattr(segment, "read"))
+    sent_file_chunks = 0
+    for chunk in data:
+      if chunk == b"x" * web_upload.GUARDED_MULTIPART_CHUNK_SIZE:
+        sent_file_chunks += 1
+        state["allowed"] = False
+    raise AssertionError(f"stream completed after revoke ({sent_file_chunks=})")
+
+  with pytest.raises(PermissionError, match="no longer allowed"):
+    web_upload.post_tmux_web(
+      "https://upload.example/api/v1/tmux/upload",
+      {},
+      {"tmux_why": "exception"},
+      str(tmux_path),
+      post=fake_post,
+      request_allowed=lambda: state["allowed"],
+    )
+
+  assert opened_files and all(fileobj.closed for fileobj in opened_files)
+
+
 def test_web_settings_migrate_previous_upload_keys():
   settings = web_settings.sanitize_web_settings({
     "toss_upload_url": "https://legacy.example/",
@@ -1263,20 +1343,20 @@ def test_validation_session_uses_receiver_pinned_device_proof_contract(monkeypat
   monkeypatch.setattr(web_upload, "create_validation_device_proof", RecordingDeviceProof.create)
 
   token = asyncio.run(web_upload.create_validation_upload_session(
-    "https://upload.example",
+    web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
     {"dongleId": "device-123", "carName": "KA4", "branch": "carrot-wip"},
   ))
 
   assert token == "validation-session-token"
   assert ScriptedJsonSession.requests == [
     {
-      "url": "https://upload.example/api/v1/validation/challenge",
+      "url": f"{web_upload.DK_VALIDATION_UPLOAD_ORIGIN}/api/v1/validation/challenge",
       "json": {"deviceId": "device-123"},
       "headers": None,
       "allow_redirects": False,
     },
     {
-      "url": "https://upload.example/api/v1/validation/session",
+      "url": f"{web_upload.DK_VALIDATION_UPLOAD_ORIGIN}/api/v1/validation/session",
       "json": {
         "dongleId": "device-123",
         "carName": "KA4",
@@ -1355,7 +1435,7 @@ def test_validation_session_rejects_unknown_protocol_capability_versions(monkeyp
 
   with pytest.raises(RuntimeError, match=r"validation (challenge|session) HTTP 200"):
     asyncio.run(web_upload.create_validation_upload_session(
-      "https://upload.example", {"dongleId": "device-123"},
+      web_upload.DK_VALIDATION_UPLOAD_ORIGIN, {"dongleId": "device-123"},
     ))
 
 
@@ -1376,7 +1456,7 @@ def test_validation_session_rechecks_live_safety_before_second_request(monkeypat
 
   with pytest.raises(RuntimeError, match="safety policy changed"):
     asyncio.run(web_upload.create_validation_upload_session(
-      "https://upload.example",
+      web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
       {"dongleId": "device-123"},
       should_continue=safety_check,
     ))
@@ -1456,7 +1536,7 @@ def test_validation_file_upload_sends_and_verifies_size_and_sha256(tmp_path, mon
     str(tmp_path),
     segment,
     "capture-123",
-    "https://upload.example",
+    web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
     "validation-token",
     validation_file_manifest(segment, data),
   ))
@@ -1467,7 +1547,7 @@ def test_validation_file_upload_sends_and_verifies_size_and_sha256(tmp_path, mon
     "Content-Type": "application/octet-stream",
   }
   assert session.requests == [{
-    "url": "https://upload.example/api/v1/validation/upload/capture-123/2026-09-05--12-34-56--0/rlog.zst",
+    "url": f"{web_upload.DK_VALIDATION_UPLOAD_ORIGIN}/api/v1/validation/upload/capture-123/2026-09-05--12-34-56--0/rlog.zst",
     "content": data,
     "headers": {
       "X-File-Size": str(len(data)),
@@ -1498,7 +1578,7 @@ def test_validation_file_upload_rejects_mismatched_server_receipt(
       str(tmp_path),
       segment,
       "capture-123",
-      "https://upload.example",
+      web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
       "validation-token",
       validation_file_manifest(segment, data),
     ))
@@ -1525,7 +1605,7 @@ def test_validation_file_upload_checks_live_safety_between_chunks(tmp_path, monk
       str(tmp_path),
       segment,
       "capture-123",
-      "https://upload.example",
+      web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
       "validation-token",
       validation_file_manifest(segment, data),
       should_cancel,
@@ -1569,14 +1649,14 @@ def test_validation_completion_requires_and_preserves_durable_receipt(monkeypatc
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
 
   result = asyncio.run(web_upload.send_validation_upload_complete(
-    "https://upload.example",
+    web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
     "validation-token",
     payload,
   ))
 
   assert result == {**receipt, "status": 201}
   assert ScriptedJsonSession.requests == [{
-    "url": "https://upload.example/api/v1/validation/complete",
+    "url": f"{web_upload.DK_VALIDATION_UPLOAD_ORIGIN}/api/v1/validation/complete",
     "json": {
       "deviceId": "device-123",
       "captureId": "capture-123",
@@ -1599,7 +1679,7 @@ def test_validation_completion_checks_live_safety_before_request(monkeypatch):
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
 
   result = asyncio.run(web_upload.send_validation_upload_complete(
-    "https://upload.example",
+    web_upload.DK_VALIDATION_UPLOAD_ORIGIN,
     "validation-token",
     payload,
     should_continue=lambda: False,
@@ -1626,7 +1706,7 @@ def test_validation_completion_rejects_incomplete_durable_receipt(monkeypatch, m
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
 
   result = asyncio.run(web_upload.send_validation_upload_complete(
-    "https://upload.example", "validation-token", payload,
+    web_upload.DK_VALIDATION_UPLOAD_ORIGIN, "validation-token", payload,
   ))
 
   assert result["ok"] is False
@@ -1651,7 +1731,7 @@ def test_validation_completion_rejects_mismatched_receipt_identity(
   monkeypatch.setattr(web_upload, "ClientSession", ScriptedJsonSession)
 
   result = asyncio.run(web_upload.send_validation_upload_complete(
-    "https://upload.example", "validation-token", payload,
+    web_upload.DK_VALIDATION_UPLOAD_ORIGIN, "validation-token", payload,
   ))
 
   assert result["ok"] is False

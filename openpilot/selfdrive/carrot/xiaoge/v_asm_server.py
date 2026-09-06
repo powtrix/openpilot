@@ -20,6 +20,11 @@ if __package__ in (None, ""):
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
+from openpilot.common.params import Params
 from openpilot.selfdrive.carrot.xiaoge.lane_inference import DEFAULT_LANE_MODEL_PATH, LaneInference, prepare_lane_image
 from openpilot.selfdrive.carrot.xiaoge.v_asm_inference import DEFAULT_MODEL_PATH, VASMInference
 
@@ -105,7 +110,18 @@ def normalize_config(config: object) -> dict:
 
 
 class VASMService:
-  def __init__(self, model_path: Path):
+  def __init__(
+    self,
+    model_path: Path,
+    params: Params | None = None,
+    consent_generation: str | None = None,
+  ):
+    self.params = params if params is not None else Params()
+    self.consent_generation = (
+      consent_generation
+      if consent_generation is not None
+      else third_party_data_sharing_generation(self.params)
+    )
     self.lock = threading.Lock()
     self.snapshot_condition = threading.Condition(self.lock)
     self.snapshot_requests = {"wide": 0, "road": 0}
@@ -167,6 +183,9 @@ class VASMService:
       "error": "",
       "updatedMonoTimeNanos": 0,
     }
+
+  def data_sharing_allowed(self) -> bool:
+    return third_party_data_sharing_generation_matches(self.consent_generation, self.params)
 
   def _read_config(self) -> dict:
     try:
@@ -363,7 +382,7 @@ class VASMService:
     from msgq.visionipc import VisionIpcClient, VisionStreamType
 
     client = None
-    while self.running:
+    while self.running and self.data_sharing_allowed():
       try:
         if client is None or not client.is_connected():
           client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, True)
@@ -434,7 +453,7 @@ class VASMService:
     from msgq.visionipc import VisionIpcClient, VisionStreamType
 
     client = None
-    while self.running:
+    while self.running and self.data_sharing_allowed():
       try:
         if client is None or not client.is_connected():
           client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_ROAD, True)
@@ -497,16 +516,38 @@ class Handler(BaseHTTPRequestHandler):
     except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
       return
 
+  def end_headers(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self._headers_buffer = []
+      self.close_connection = True
+      return
+    super().end_headers()
+
+  def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
+    super().send_error(code, message, explain)
+
   def _json(self, status: HTTPStatus, payload: object) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     body = json.dumps(payload).encode()
     self.send_response(status)
     self.send_header("Content-Type", "application/json")
     self.send_header("Content-Length", str(len(body)))
     self.send_header("Cache-Control", "no-store")
     self.end_headers()
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     self.wfile.write(body)
 
   def do_GET(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     path = urlparse(self.path).path
     if path == "/":
       body = self.index_path.read_bytes()
@@ -514,6 +555,9 @@ class Handler(BaseHTTPRequestHandler):
       self.send_header("Content-Type", "text/html; charset=utf-8")
       self.send_header("Content-Length", str(len(body)))
       self.end_headers()
+      if not self.service.data_sharing_allowed():
+        self.close_connection = True
+        return
       self.wfile.write(body)
     elif path == "/api/status":
       self._json(HTTPStatus.OK, self.service.status())
@@ -533,11 +577,17 @@ class Handler(BaseHTTPRequestHandler):
       self.send_header("Content-Length", str(len(jpeg)))
       self.send_header("Cache-Control", "no-store")
       self.end_headers()
+      if not self.service.data_sharing_allowed():
+        self.close_connection = True
+        return
       self.wfile.write(jpeg)
     else:
       self.send_error(HTTPStatus.NOT_FOUND)
 
   def do_POST(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     path = urlparse(self.path).path
     try:
       length = int(self.headers.get("Content-Length", "0"))
@@ -554,6 +604,9 @@ class Handler(BaseHTTPRequestHandler):
       self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
   def do_DELETE(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     if urlparse(self.path).path != "/api/config":
       self.send_error(HTTPStatus.NOT_FOUND)
       return
@@ -574,6 +627,11 @@ def main() -> None:
     parser.error("port must be 1 through 65535")
 
   service, server = create_server(args.host, args.port, args.model)
+  if not service.data_sharing_allowed():
+    server.server_close()
+    service.running = False
+    print("Xiaoge vision server disabled: automatic third-party data sharing is off")
+    return
   print(f"Xiaoge vision server: http://{args.host}:{args.port}")
   try:
     server.serve_forever()
@@ -584,8 +642,14 @@ def main() -> None:
     service.running = False
 
 
-def create_server(host: str = HOST, port: int = PORT, model_path: Path = DEFAULT_MODEL_PATH) -> tuple[VASMService, ThreadingHTTPServer]:
-  service = VASMService(model_path)
+def create_server(
+  host: str = HOST,
+  port: int = PORT,
+  model_path: Path = DEFAULT_MODEL_PATH,
+  params: Params | None = None,
+  consent_generation: str | None = None,
+) -> tuple[VASMService, ThreadingHTTPServer]:
+  service = VASMService(model_path, params, consent_generation)
   Handler.service = service
   server = ThreadingHTTPServer((host, port), Handler)
   threading.Thread(target=service.run_camera, daemon=True).start()

@@ -7,7 +7,11 @@ import urllib.request
 
 from aiohttp import web
 
-from ...community_data import community_data_sharing_enabled
+from ...community_data import (
+  CommunityConsentBoundBytes,
+  community_data_sharing_generation,
+  community_data_sharing_generation_matches,
+)
 from .params import HAS_PARAMS, Params
 
 
@@ -28,7 +32,8 @@ def register_my_ip_sync(params: "Params") -> tuple[bool, str]:
   """
   기존 carrot_man.py의 register_my_ip()를 그대로 옮긴 버전 (동기)
   """
-  if not community_data_sharing_enabled(params):
+  consent_generation = community_data_sharing_generation(params)
+  if consent_generation is None:
     return False, "Community data sharing disabled"
 
   try:
@@ -54,12 +59,12 @@ def register_my_ip_sync(params: "Params") -> tuple[bool, str]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
       url=url,
-      data=data,
-      headers={"Content-Type": "application/json"},
+      data=CommunityConsentBoundBytes(data, params, consent_generation),
+      headers={"Content-Type": "application/json", "Content-Length": str(len(data))},
       method="POST",
     )
 
-    if not community_data_sharing_enabled(params):
+    if not community_data_sharing_generation_matches(consent_generation, params):
       return False, "Community data sharing disabled"
 
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:

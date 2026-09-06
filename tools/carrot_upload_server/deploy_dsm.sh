@@ -18,6 +18,7 @@ DEPLOY_ROOT="${DK_UPLOAD_DEPLOY_ROOT:-/volume1/docker/dk-upload}"
 OPENPILOT_ROOT="${DK_UPLOAD_OPENPILOT_ROOT:-/volume1/openpilot}"
 RUN_UID="${DK_UPLOAD_UID:-10001}"
 RUN_GID="${DK_UPLOAD_GID:-10001}"
+NETWORK=dk-upload-internal
 
 case "$REVISION" in
   *[!0-9a-f]*|"") echo "DK_UPLOAD_GITHUB_REF must be an exact 40-character lowercase commit SHA" >&2; exit 2 ;;
@@ -164,6 +165,23 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# The receiver has no reason to initiate Internet connections. An internal
+# bridge preserves Docker's loopback-published ingress path while omitting an
+# external gateway. Refuse a pre-existing network unless its policy and owner
+# label are exactly what this deployment expects.
+if ! "$DOCKER" network inspect "$NETWORK" >/dev/null 2>&1; then
+  "$DOCKER" network create \
+    --driver bridge \
+    --internal \
+    --label dk.openpilot.receiver-network=true \
+    "$NETWORK" >/dev/null
+fi
+NETWORK_POLICY="$("$DOCKER" network inspect --format '{{.Driver}}|{{.Internal}}|{{index .Labels "dk.openpilot.receiver-network"}}' "$NETWORK")"
+if [ "$NETWORK_POLICY" != "bridge|true|true" ]; then
+  echo "dk-upload network is not the dedicated internal bridge" >&2
+  exit 1
+fi
+
 # Recover a previous deployment interrupted after the old container was
 # renamed. If both names exist, keep a healthy current container; otherwise
 # restore the last-known-good rollback before doing any new work.
@@ -195,11 +213,16 @@ for name in Dockerfile requirements.txt server.py __init__.py .dockerignore; do
 done
 
 IMAGE="dk-upload:$REVISION"
-"$DOCKER" build --pull \
+"$DOCKER" build --pull --platform linux/amd64 \
   --label "dk.openpilot.receiver=true" \
   --label "dk.openpilot.commit=$REVISION" \
   --tag "$IMAGE" \
   "$STAGE"
+IMAGE_ARCHITECTURE="$("$DOCKER" image inspect --format '{{.Architecture}}' "$IMAGE")"
+if [ "$IMAGE_ARCHITECTURE" != "amd64" ]; then
+  echo "dk-upload image architecture is not the hash-locked linux/amd64 target" >&2
+  exit 1
+fi
 
 OLD_IMAGE=""
 if container_exists dk-upload; then
@@ -213,6 +236,7 @@ fi
 NEW_ATTEMPTED=1
 "$DOCKER" run -d \
   --name dk-upload \
+  --platform linux/amd64 \
   --restart unless-stopped \
   --init \
   --user "$RUN_UID:$RUN_GID" \
@@ -228,6 +252,7 @@ NEW_ATTEMPTED=1
   --log-driver json-file \
   --log-opt max-size=10m \
   --log-opt max-file=3 \
+  --network "$NETWORK" \
   --publish 127.0.0.1:18080:8080 \
   --volume "$VALIDATION_ROOT:/data/openpilot/.carrot-validation-v1:rw" \
   --volume "$STATE_ROOT:/data/state:rw" \
@@ -296,13 +321,22 @@ LABEL_REVISION="$("$DOCKER" inspect --format '{{index .Config.Labels "dk.openpil
 PORT_BINDING="$("$DOCKER" inspect --format '{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIp}}:{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostPort}}' dk-upload)"
 ROOT_READ_ONLY="$("$DOCKER" inspect --format '{{.HostConfig.ReadonlyRootfs}}' dk-upload)"
 RUN_AS="$("$DOCKER" inspect --format '{{.Config.User}}' dk-upload)"
+NETWORK_MODE="$("$DOCKER" inspect --format '{{.HostConfig.NetworkMode}}' dk-upload)"
+NETWORK_COUNT="$("$DOCKER" inspect --format '{{len .NetworkSettings.Networks}}' dk-upload)"
 MOUNTS="$("$DOCKER" inspect --format '{{range .Mounts}}{{printf "%s|%s|%t\n" .Source .Destination .RW}}{{end}}' dk-upload)"
 CONTAINER_ENV="$("$DOCKER" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' dk-upload)"
 if [ "$LABEL_REVISION" != "$REVISION" ] \
   || [ "$PORT_BINDING" != "127.0.0.1:18080" ] \
   || [ "$ROOT_READ_ONLY" != "true" ] \
-  || [ "$RUN_AS" != "$RUN_UID:$RUN_GID" ]; then
+  || [ "$RUN_AS" != "$RUN_UID:$RUN_GID" ] \
+  || [ "$NETWORK_MODE" != "$NETWORK" ] \
+  || [ "$NETWORK_COUNT" != "1" ]; then
   echo "dk-upload container identity or isolation policy mismatch" >&2
+  exit 1
+fi
+NETWORK_POLICY="$("$DOCKER" network inspect --format '{{.Driver}}|{{.Internal}}|{{index .Labels "dk.openpilot.receiver-network"}}' "$NETWORK")"
+if [ "$NETWORK_POLICY" != "bridge|true|true" ]; then
+  echo "dk-upload container lost its no-egress network policy" >&2
   exit 1
 fi
 if [ "$(printf '%s\n' "$MOUNTS" | sed '/^$/d' | wc -l | tr -d ' ')" -ne 2 ] \
@@ -338,6 +372,24 @@ LEGACY_STATUS="$("$CURL" -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 
   http://127.0.0.1:18080/api/v1/session)"
 if [ "$DISALLOWED_STATUS" != "403" ] || [ "$LEGACY_STATUS" != "403" ]; then
   echo "dk-upload fail-closed protocol smoke test failed" >&2
+  exit 1
+fi
+
+# Inspecting Internal=true above is the policy proof. This connection attempt
+# is a second runtime guard against a daemon/platform regression that
+# accidentally gives an internal bridge a usable public route; it sends no
+# application data.
+if ! "$DOCKER" exec dk-upload python -c '
+import socket
+try:
+  connection = socket.create_connection(("1.1.1.1", 443), timeout=2)
+except OSError:
+  raise SystemExit(0)
+else:
+  connection.close()
+  raise SystemExit(1)
+' >/dev/null 2>&1; then
+  echo "dk-upload unexpectedly has outbound Internet connectivity" >&2
   exit 1
 fi
 

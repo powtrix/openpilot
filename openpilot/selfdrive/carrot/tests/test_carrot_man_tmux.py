@@ -63,6 +63,7 @@ def test_can_error_ignores_stale_previous_onroad_state():
 class _FakeParams:
   def __init__(self, values=None):
     self.values = dict(values or {})
+    self._dk_consent_generation = "g1"
 
   def get(self, key):
     return self.values.get(key)
@@ -128,3 +129,37 @@ def test_custom_exception_discord_remains_independent(monkeypatch):
   monkeypatch.setenv("CARROT_EXCEPTION_DISCORD_WEBHOOK_URL", "https://operator.example/webhook")
 
   assert instance._tmux_discord_webhook_url() == "https://operator.example/webhook"
+
+
+def test_automatic_discord_multipart_stops_after_mid_file_revocation(monkeypatch, tmp_path):
+  chunk_size = 64 * 1024
+  tmux = tmp_path / "tmux.log"
+  tmux.write_bytes(b"x" * (chunk_size * 2))
+  params = _FakeParams({
+    "DkThirdPartyDataSharing": "1",
+    "CarrotCommunityDataSharing": "1",
+  })
+  instance = object.__new__(carrot_man.CarrotMan)
+  instance.params = params
+  monkeypatch.setattr(instance, "_tmux_discord_webhook_url", lambda: "https://operator.example/webhook")
+  monkeypatch.setattr(instance, "_decode_tmux_discord_webhook_url", lambda: "https://bundled.example/webhook")
+  monkeypatch.setattr(instance, "_tmux_discord_content", lambda *_args: "diagnostic")
+  monkeypatch.setattr(instance, "_param_text", lambda _key, default="": default)
+  monkeypatch.setattr(carrot_man.os.path, "exists", lambda path: path == "/data/media/tmux.log")
+  monkeypatch.setattr(carrot_man.os.path, "getsize", lambda _path: tmux.stat().st_size)
+  monkeypatch.setattr(carrot_man, "open", lambda _path, mode: tmux.open(mode), raising=False)
+
+  sent_file_chunks = []
+
+  def fake_post(_url, *, data, headers, timeout):
+    del headers, timeout
+    for chunk in data:
+      if chunk == b"x" * chunk_size:
+        sent_file_chunks.append(chunk)
+        params._dk_consent_generation = "g2"
+    raise AssertionError("multipart stream completed after revoke")
+
+  monkeypatch.setattr(carrot_man.requests, "post", fake_post)
+
+  assert not instance.send_tmux_discord("exception")
+  assert len(sent_file_chunks) == 1

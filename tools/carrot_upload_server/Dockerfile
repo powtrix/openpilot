@@ -8,7 +8,7 @@ RUN useradd --create-home --uid 10001 carrot \
     && chown -R carrot:carrot /data
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --requirement requirements.txt
+RUN pip install --no-cache-dir --only-binary=:all: --require-hashes --requirement requirements.txt
 COPY --chown=carrot:carrot __init__.py server.py ./
 RUN chmod 0755 /app \
     && chmod 0644 /app/__init__.py /app/server.py

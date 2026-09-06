@@ -67,6 +67,16 @@ VALIDATION_TRIGGERS = frozenset({
   "stable_lane_control",
   "accelerating_while_closing",
 })
+# Protocol-v1 automatic validation is intentionally scoped to one exact KA4
+# stock-SCC topology. Keep these wire values explicit here: the receiver is a
+# standalone service and must not gain the vehicle stack's runtime dependency
+# closure merely to validate signed capture metadata.
+KA4_STOCK_SCC_CAR_FINGERPRINT = "KIA_CARNIVAL_4TH_GEN"
+HYUNDAI_FLAG_CANFD_HDA2 = 1 << 0
+HYUNDAI_FLAG_CAMERA_SCC = 1 << 3
+HYUNDAI_FLAG_CANFD = 1 << 13
+HYUNDAI_FLAG_RADAR_SCC = 1 << 14
+HYUNDAI_CANFD_SAFETY_MODEL = "hyundaiCanfd"
 VALIDATION_CAPTURE_KEYS = frozenset({
   "schemaVersion",
   "campaignId",
@@ -2308,12 +2318,14 @@ class UploadService:
       "Ka4StockSccStandstillRearm", "PathOffset", "AdjustLaneOffset",
     }:
       raise web.HTTPBadRequest(text="invalid validationCapture routeSettings")
-    self._protocol_int(
+    rearm_enabled = self._protocol_int(
       route_settings.get("Ka4StockSccStandstillRearm"),
       "routeSettings.Ka4StockSccStandstillRearm",
       low=0,
       high=1,
     )
+    if rearm_enabled != 1:
+      raise web.HTTPBadRequest(text="validationCapture KA4 stock-SCC rearm gate did not pass")
     self._protocol_int(route_settings.get("PathOffset"), "routeSettings.PathOffset", low=-150, high=150)
     self._protocol_int(
       route_settings.get("AdjustLaneOffset"), "routeSettings.AdjustLaneOffset", low=0, high=500,
@@ -2333,10 +2345,23 @@ class UploadService:
     }
     if not isinstance(topology, dict) or set(topology) != topology_keys:
       raise web.HTTPBadRequest(text="invalid validationCapture git.topology")
-    self._protocol_text(topology.get("carFingerprint"), "git.topology.carFingerprint", maximum=128)
+    car_fingerprint = self._protocol_text(
+      topology.get("carFingerprint"), "git.topology.carFingerprint", maximum=128,
+    )
+    if car_fingerprint != KA4_STOCK_SCC_CAR_FINGERPRINT:
+      raise web.HTTPBadRequest(text="validationCapture topology is outside the KA4 gate")
     if topology.get("pcmCruise") is not True or topology.get("openpilotLongitudinalControl") is not False:
       raise web.HTTPBadRequest(text="validationCapture topology is outside the stock-SCC gate")
-    self._protocol_int(topology.get("flags"), "git.topology.flags", low=0, high=0xFFFFFFFFFFFFFFFF)
+    flags = self._protocol_int(
+      topology.get("flags"), "git.topology.flags", low=0, high=0xFFFFFFFFFFFFFFFF,
+    )
+    required_flags = HYUNDAI_FLAG_CANFD | HYUNDAI_FLAG_RADAR_SCC
+    if (
+      flags & required_flags != required_flags
+      or flags & HYUNDAI_FLAG_CAMERA_SCC
+      or flags & HYUNDAI_FLAG_CANFD_HDA2
+    ):
+      raise web.HTTPBadRequest(text="validationCapture topology is outside the KA4 stock-SCC flag gate")
     self._protocol_int(
       topology.get("alternativeExperience"), "git.topology.alternativeExperience", low=0, high=0xFFFFFFFF,
     )
@@ -2345,13 +2370,18 @@ class UploadService:
     safety_configs = topology.get("safetyConfigs")
     if not isinstance(safety_configs, list) or not 1 <= len(safety_configs) <= 8:
       raise web.HTTPBadRequest(text="invalid validationCapture safetyConfigs")
+    safety_models: set[str] = set()
     for safety_config in safety_configs:
       if not isinstance(safety_config, dict) or set(safety_config) != {"model", "param"}:
         raise web.HTTPBadRequest(text="invalid validationCapture safetyConfig")
-      self._protocol_text(safety_config.get("model"), "git.topology.safetyConfig.model", maximum=64)
+      safety_models.add(self._protocol_text(
+        safety_config.get("model"), "git.topology.safetyConfig.model", maximum=64,
+      ))
       self._protocol_int(
         safety_config.get("param"), "git.topology.safetyConfig.param", low=0, high=0xFFFFFFFF,
       )
+    if HYUNDAI_CANFD_SAFETY_MODEL not in safety_models:
+      raise web.HTTPBadRequest(text="validationCapture topology lacks Hyundai CAN-FD safety")
     return value
 
   def _validation_manifest_files(self, value: Any) -> list[dict[str, Any]]:

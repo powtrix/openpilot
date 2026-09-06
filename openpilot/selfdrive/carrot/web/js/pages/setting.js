@@ -118,7 +118,7 @@ function confirmValidationUploadEnable() {
   return appConfirm(
     getUIText(
       "validation_upload_enable_confirm",
-      "Enable automatic KA4 validation upload? Up to 3 full rlogs per event capture and up to 14 captures / 42 full rlogs per campaign may be selected. At most 5 captures / 750 MiB wait at once; that pending cap does not limit cumulative uploads or retry traffic. The 1 GiB per-device daily server limit can defer retained logs for retry the next day. Logs are uploaded without asking again for each one.",
+      "Enable automatic KA4 HDA1 validation upload? HDA2 is rejected. A new campaign selects at most 10 captures / 30 distinct full rlogs; the compatibility ceiling including already-retained legacy records is 14 / 42. These are selected-item limits, not transfer-count or byte limits. At most 5 captures / 750 MiB wait at once, and failed files or captures may be resent for up to 7 days. Upload is pinned to the root https://adot.synology.me on standard HTTPS port 443. Consent can be enabled only from the tether-host phone or a device-local connection.",
     ),
     {
       title: getUIText("validation_upload_enable_title", "Automatic validation upload consent"),

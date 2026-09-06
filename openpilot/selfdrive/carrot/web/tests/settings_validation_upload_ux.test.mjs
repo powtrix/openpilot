@@ -65,9 +65,9 @@ test("an authoritative live refresh makes an automatic disable the next consent 
 
 test("all supported languages carry the complete one-time consent warning", async () => {
   const requiredFragments = {
-    en: ["up to 3 full rlogs per event capture", "14 captures / 42 full rlogs", "5 captures / 750 MiB", "cumulative campaign uploads and retry traffic can exceed", "1 GiB per-device daily limit", "next day", "precise location", "not be asked again for each log", "WPA2/WPA3", "mobile data", "not deleted automatically"],
-    ko: ["이벤트 캡처마다 full rlog 최대 3개", "14개 캡처/42개 full rlog", "5개 캡처/750 MiB", "누적 전송량이나 재시도 데이터 사용량", "장치별 일일 한도는 1 GiB", "다음 날", "정확한 위치", "로그마다 다시 확인하지 않습니다", "WPA2/WPA3", "모바일 데이터", "자동 삭제되지 않습니다"],
-    zh: ["每个符合条件的事件捕获", "最多 3 个完整 rlog", "14 个捕获/42 个完整 rlog", "5 个捕获/750 MiB", "累计上传量和重试流量", "每日 1 GiB", "第二天", "精确位置", "不会逐个日志再次询问", "WPA2/WPA3", "移动数据", "不会自动删除"],
+    en: ["KA4 HDA1", "HDA2 flag is not collected", "up to 3 full rlogs per event capture", "10 captures / 30 distinct full rlogs", "14 captures / 42 rlogs", "selected-item limits", "no cumulative transfer cap", "for up to 7 days", "1 GiB per-device daily limit", "next day", "exact root `https://adot.synology.me`", "standard HTTPS port 443", "deployment-environment overrides are rejected", "phone providing the tether", "precise location", "not be asked again for each log", "WPA2/WPA3", "mobile data", "not deleted automatically"],
+    ko: ["KA4 HDA1", "HDA2 플래그가 있으면 수집하지 않습니다", "이벤트 캡처마다 full rlog 최대 3개", "10개 캡처/서로 다른 full rlog 30개", "14개 캡처/42개", "선택 항목 수 상한", "클라이언트 누적 전송량 상한은 없습니다", "최대 7일 동안 다시 전송", "장치별 일일 한도는 1 GiB", "다음 날", "정확한 `https://adot.synology.me`", "표준 HTTPS 443", "배포 환경 변수 우회는 코드에서 거부", "테더링을 제공하는 휴대폰", "정확한 위치", "로그마다 다시 확인하지 않습니다", "WPA2/WPA3", "모바일 데이터", "자동 삭제되지 않습니다"],
+    zh: ["KA4 HDA1", "HDA2 标志的拓扑不会被收集", "每个符合条件的事件捕获", "最多 3 个完整 rlog", "10 个捕获/30 个不同的完整 rlog", "14 个捕获/42 个 rlog", "所选项目数量上限", "没有累计传输量上限", "最长持续 7 天", "每日 1 GiB", "第二天", "`https://adot.synology.me`", "标准 HTTPS 443", "部署环境变量覆盖", "提供网络共享的手机", "精确位置", "不会逐个日志再次询问", "WPA2/WPA3", "移动数据", "不会自动删除"],
   };
 
   for (const [language, fragments] of Object.entries(requiredFragments)) {
