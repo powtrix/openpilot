@@ -8,6 +8,7 @@ import openpilot.system.loggerd.uploader as uploader
 from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.common.params import Params
 from openpilot.system.hardware.hw import Paths
+from openpilot.system.athena.consent_artifacts import prepare_consent_session
 from openpilot.system.loggerd.xattr_cache import setxattr
 
 
@@ -80,6 +81,11 @@ class UploaderTestCase:
     self.params.put("IsOffroad", True)
     self.params.put("DongleId", "0000000000000000")
     self.params.put_bool(DK_THIRD_PARTY_DATA_SHARING_PARAM, True)
+    # Production prepares the consent session before newly recorded artifacts
+    # become upload candidates. Mirror that ordering so files created by each
+    # test exercise the enabled path instead of being quarantined as legacy
+    # pre-consent data when the uploader thread starts.
+    assert prepare_consent_session(self.params) is not None
 
   def make_file_with_data(self, f_dir: str, fn: str, size_mb: float = .1, lock: bool = False,
                           upload_xattr: bytes | None = None, preserve_xattr: bytes | None = None) -> Path:

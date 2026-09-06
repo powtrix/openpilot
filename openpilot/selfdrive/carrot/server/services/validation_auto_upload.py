@@ -443,8 +443,8 @@ class ValidationEventDetector:
 
   @staticmethod
   def _standstill_condition() -> str:
-    # The supported KA4 controller now applies the behavior automatically.
-    # Legacy OFF IDs remain accepted for restored queues only.
+    # Current production control is observation-only: periodic stopped-lead
+    # rearm is quarantined until a target-car capture proves a safe mechanism.
     return "standstill_on_no_request"
 
   @staticmethod
