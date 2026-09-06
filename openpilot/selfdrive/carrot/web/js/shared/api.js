@@ -83,7 +83,8 @@ async function postJson(url, bodyObj, options = {}) {
     "X-Carrot-Web-Request": "1",
   };
   // Fetch only after the user accepts one of the two high-risk dialogs. The
-  // server binds this short-lived, one-use token to the exact local origin.
+  // server issues it only to the active tether-host peer and binds the
+  // short-lived, one-use token to both that TCP peer and the exact origin.
   if (options.webConsent === true) {
     headers["X-Carrot-Web-Consent"] = await getWebConsentSessionToken();
   }

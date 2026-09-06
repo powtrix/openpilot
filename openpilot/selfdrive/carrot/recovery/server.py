@@ -860,6 +860,47 @@ def _community_data_sharing_enabled() -> bool:
   )
 
 
+def _consent_param_generation(key: str) -> str | None:
+  if _read_param(key) != "1":
+    return None
+  path = os.path.join(PARAMS_DIR, "d", key)
+  try:
+    stat = os.stat(path, follow_symlinks=False)
+  except Exception:
+    return None
+  material = f"{key}\0{stat.st_dev}\0{stat.st_ino}\0{stat.st_mtime_ns}\0{stat.st_ctime_ns}\0{stat.st_size}"
+  return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _community_data_sharing_generation() -> str | None:
+  master = _consent_param_generation(THIRD_PARTY_DATA_SHARING_PARAM)
+  community = _consent_param_generation(COMMUNITY_DATA_SHARING_PARAM)
+  if master is None or community is None:
+    return None
+  return f"{master}:{community}"
+
+
+def _community_data_sharing_generation_matches(expected: str | None) -> bool:
+  return expected is not None and _community_data_sharing_generation() == expected
+
+
+class _CommunityConsentBoundBytes:
+  def __init__(self, payload: bytes, consent_generation: str) -> None:
+    self.payload = payload
+    self.consent_generation = consent_generation
+    self.offset = 0
+
+  def read(self, size: int = -1) -> bytes:
+    if not _community_data_sharing_generation_matches(self.consent_generation):
+      raise PermissionError("community data sharing consent changed")
+    if self.offset >= len(self.payload):
+      return b""
+    end = len(self.payload) if size is None or size < 0 else min(len(self.payload), self.offset + size)
+    chunk = self.payload[self.offset:end]
+    self.offset = end
+    return chunk
+
+
 def _support_webhook_url() -> str:
   for key in ("CARROT_SUPPORT_DISCORD_WEBHOOK_URL", "CARROT_DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL"):
     value = os.environ.get(key, "").strip()
@@ -919,8 +960,15 @@ def _cwp_url(path: str) -> str:
   return base + path
 
 
-def _cwp_request(path: str, payload: dict, timeout: int = 4) -> dict:
-  if not _community_data_sharing_enabled():
+def _cwp_request(
+  path: str,
+  payload: dict,
+  timeout: int = 4,
+  consent_generation: str | None = None,
+) -> dict:
+  if consent_generation is None:
+    consent_generation = _community_data_sharing_generation()
+  if not _community_data_sharing_generation_matches(consent_generation):
     return {
       "ok": False,
       "skipped": True,
@@ -935,10 +983,26 @@ def _cwp_request(path: str, payload: dict, timeout: int = 4) -> dict:
   token = os.environ.get("CWP_REPORT_TOKEN", "").strip()
   if token:
     headers["Authorization"] = f"Bearer {token}"
+  encoded_payload = json.dumps(payload).encode("utf-8")
+  headers["Content-Length"] = str(len(encoded_payload))
   request = urllib.request.Request(
-    _cwp_url(path), data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST",
+    _cwp_url(path),
+    data=_CommunityConsentBoundBytes(encoded_payload, consent_generation),
+    headers=headers,
+    method="POST",
   )
-  return _request_result(request, timeout)
+  if not _community_data_sharing_generation_matches(consent_generation):
+    return {
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+      "error": "Carrot community data sharing is disabled",
+    }
+  return _request_result(
+    request,
+    timeout,
+    request_allowed=lambda: _community_data_sharing_generation_matches(consent_generation),
+  )
 
 
 def _cwp_status() -> dict:
@@ -986,21 +1050,28 @@ def _cwp_set_enabled(enabled: bool) -> dict:
 
 
 def _cwp_boot_worker(port: int = DEFAULT_PORT) -> None:
-  if not _community_data_sharing_enabled() or _read_param(CWP_RECOVERY_BOOT_PARAM) != "1":
+  consent_generation = _community_data_sharing_generation()
+  if consent_generation is None or _read_param(CWP_RECOVERY_BOOT_PARAM) != "1":
     return
   deadline = time.monotonic() + 120.0
   candidate = ""
   while time.monotonic() < deadline:
+    if not _community_data_sharing_generation_matches(consent_generation):
+      return
     local_ip = _local_ip()
     if not local_ip or local_ip != candidate:
       candidate = local_ip
       time.sleep(2.0)
       continue
-    result = _cwp_request("/recovery/boot", {
-      "deviceId": _cwp_device_id(),
-      "ip": local_ip,
-      "port": int(port),
-    })
+    result = _cwp_request(
+      "/recovery/boot",
+      {
+        "deviceId": _cwp_device_id(),
+        "ip": local_ip,
+        "port": int(port),
+      },
+      consent_generation=consent_generation,
+    )
     body = result.get("body") if isinstance(result.get("body"), dict) else {}
     if result.get("ok") and body.get("ok"):
       pushed = int(body.get("pushed") or 0)
@@ -1164,8 +1235,14 @@ def _discord_multipart(payload: dict, filename: str, file_data: bytes) -> tuple[
   )
 
 
-def _request_result(request: urllib.request.Request, timeout: int) -> dict:
+def _request_result(
+  request: urllib.request.Request,
+  timeout: int,
+  request_allowed: Callable[[], bool] | None = None,
+) -> dict:
   try:
+    if request_allowed is not None and not request_allowed():
+      raise PermissionError("upload request is no longer allowed")
     with urllib.request.urlopen(request, timeout=timeout) as response:
       status = int(response.status)
       response_data = response.read(1024 * 1024)

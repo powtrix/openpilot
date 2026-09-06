@@ -3,8 +3,9 @@
 import time
 from multiprocessing import Process
 
-from openpilot.common.external_data import third_party_data_sharing_enabled
+from openpilot.common.external_data import third_party_data_sharing_generation
 from openpilot.common.params import Params
+from openpilot.system.athena.consent_artifacts import prepare_consent_session
 from openpilot.system.manager.process import launcher
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.hardware import HARDWARE
@@ -33,12 +34,13 @@ def _stop_athenad(proc: Process | None) -> None:
 def run_athenad_manager(params: Params, *, sleep=time.sleep) -> None:
   """Keep athenad running only while explicit third-party consent is on."""
   proc: Process | None = None
+  active_generation: str | None = None
   restart_after = 0.0
   disabled_state_cleaned = False
   try:
     while True:
-      enabled = third_party_data_sharing_enabled(params)
-      if not enabled:
+      generation = third_party_data_sharing_generation(params)
+      if generation is None:
         if proc is not None:
           cloudlog.info("stopping athena daemon: third-party data sharing disabled")
           _stop_athenad(proc)
@@ -48,11 +50,33 @@ def run_athenad_manager(params: Params, *, sleep=time.sleep) -> None:
           # withdrawn if the user later opts in again.
           params.remove(ATHENA_UPLOAD_QUEUE_PARAM)
           disabled_state_cleaned = True
+        active_generation = None
         restart_after = 0.0
         sleep(PRIVACY_POLL_INTERVAL_S)
         continue
 
       disabled_state_cleaned = False
+
+      if active_generation != generation:
+        if proc is not None:
+          cloudlog.info("stopping athena daemon: third-party consent generation changed")
+          _stop_athenad(proc)
+          proc = None
+        # A disable/re-enable can be shorter than this manager's polling
+        # interval. A changed Params-file generation still invalidates queued
+        # work and forces a fresh pre-consent artifact snapshot.
+        params.remove(ATHENA_UPLOAD_QUEUE_PARAM)
+        try:
+          prepared_generation = prepare_consent_session(params)
+        except Exception:
+          cloudlog.exception("failed to prepare third-party consent session")
+          prepared_generation = None
+        if prepared_generation != generation:
+          active_generation = None
+          restart_after = 0.0
+          sleep(PRIVACY_POLL_INTERVAL_S)
+          continue
+        active_generation = generation
 
       if proc is not None and not proc.is_alive():
         proc.join()

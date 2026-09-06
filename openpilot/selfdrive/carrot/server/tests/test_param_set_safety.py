@@ -41,6 +41,7 @@ class FakeRequest:
     headers=None,
     app=None,
     scheme="http",
+    remote="127.0.0.1",
   ):
     self._body = {
       "name": name or params_feature.VALIDATION_AUTO_UPLOAD_PARAM,
@@ -50,6 +51,8 @@ class FakeRequest:
     self.app = app if app is not None else {"params": params}
     self.app.setdefault("params", params)
     self.scheme = scheme
+    self.remote = remote
+    self.transport = None
     self.content_type = content_type
     if headers is None:
       self.headers = {
@@ -366,6 +369,77 @@ def test_consent_session_is_short_lived_one_use_and_origin_bound():
   ) is False
 
 
+def test_consent_session_is_tether_gateway_authenticated_and_peer_bound(monkeypatch):
+  app = {"params": FakeParams(is_offroad=True, is_onroad=False)}
+  web_consent.initialize_web_consent_sessions(app)
+  monkeypatch.setattr(
+    web_consent,
+    "_default_tether_gateway_addresses",
+    lambda: frozenset({"192.168.50.1"}),
+  )
+  headers = {
+    "Host": "192.168.50.95:7000",
+    "Origin": "http://192.168.50.95:7000",
+    "Sec-Fetch-Site": "same-origin",
+    "X-Carrot-Web-Request": "1",
+  }
+
+  lan_peer = FakeRequest(
+    1, app["params"], app=app, headers=dict(headers), remote="192.168.50.20",
+  )
+  assert web_consent.issue_web_consent_session(lan_peer) is None
+
+  tether_owner = FakeRequest(
+    1, app["params"], app=app, headers=dict(headers), remote="192.168.50.1",
+  )
+  token = web_consent.issue_web_consent_session(tether_owner, now=100.0)
+  assert token is not None
+  tether_owner.headers[web_consent.WEB_CONSENT_TOKEN_HEADER] = token
+
+  # Even a valid token cannot move to another same-origin LAN peer.
+  stolen = FakeRequest(
+    1, app["params"], app=app, headers=dict(tether_owner.headers), remote="192.168.50.20",
+  )
+  assert web_consent.consume_web_consent_session(stolen, now=100.1) is False
+
+  # The tether host itself retains the intended positive path with a fresh
+  # one-use token after the rejected transfer attempt consumed the first one.
+  token = web_consent.issue_web_consent_session(tether_owner, now=101.0)
+  assert token is not None
+  tether_owner.headers[web_consent.WEB_CONSENT_TOKEN_HEADER] = token
+  assert web_consent.consume_web_consent_session(tether_owner, now=101.1) is True
+
+
+def test_default_tether_gateway_parser_uses_lowest_metric_wifi_routes(tmp_path):
+  ipv4 = tmp_path / "route"
+  ipv4.write_text(
+    "".join([
+      "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n",
+      "rmnet0 00000000 0101A8C0 0003 0 0 10 00000000 0 0 0\n",
+      "wlan0 00000000 010014AC 0003 0 0 600 00000000 0 0 0\n",
+      "wlan0 00000000 020014AC 0003 0 0 700 00000000 0 0 0\n",
+    ]),
+    encoding="ascii",
+  )
+  ipv6 = tmp_path / "ipv6_route"
+  ipv6.write_text(
+    "".join([
+      "00000000000000000000000000000000 00 ",
+      "00000000000000000000000000000000 00 ",
+      "fe800000000000000000000000000001 00000258 00000000 00000000 00000003 wlan0\n",
+      "00000000000000000000000000000000 00 ",
+      "00000000000000000000000000000000 00 ",
+      "fe800000000000000000000000000002 000002bc 00000000 00000000 00000003 wlan0\n",
+    ]),
+    encoding="ascii",
+  )
+
+  assert web_consent._default_tether_gateway_addresses(str(ipv4), str(ipv6)) == {
+    "172.20.0.1",
+    "fe80::1",
+  }
+
+
 def test_consent_session_endpoint_is_no_store_and_rejects_public_hostnames():
   private_app = {"params": FakeParams(is_offroad=True, is_onroad=False)}
   web_consent.initialize_web_consent_sessions(private_app)
@@ -401,7 +475,7 @@ def test_consent_session_endpoint_is_no_store_and_rejects_public_hostnames():
   )
   response = asyncio.run(params_feature.api_web_consent_session(public_request))
   assert response.status == 403
-  assert json.loads(response.text)["error_code"] == "WEB_CONSENT_ORIGIN_REJECTED"
+  assert json.loads(response.text)["error_code"] == "WEB_CONSENT_CLIENT_REJECTED"
 
 
 @pytest.mark.parametrize("name", [

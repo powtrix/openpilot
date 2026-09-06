@@ -79,6 +79,8 @@ def build_full_hda1_ka4_controller(monkeypatch):
         "CruiseButtonTest1": 8,
         "CruiseButtonTest2": 30,
         "CruiseButtonTest3": 1,
+        # Simulate the stale value written by the superseded automatic build.
+        "Ka4StockSccStandstillRearm": 1,
       }.get(key, 0)
 
     @staticmethod
@@ -330,67 +332,58 @@ def test_ka4_public_reference_uses_crc_protected_alt_button_payload():
   assert values["CHECKSUM"] == checksum.calc_checksum(message.address, checksum, bytearray(KA4_ALT_BUTTON_PUBLIC_SAMPLE))
 
 
-def test_ka4_hda1_full_controller_update_masks_and_restores_real_adrv(monkeypatch):
+def test_ka4_hda1_full_controller_update_preserves_adrv_and_disables_periodic_rearm(monkeypatch):
   controller, CC, CS, car_state, dbc, raw_adrv = build_full_hda1_ka4_controller(monkeypatch)
-  assert controller.ka4_stock_scc_standstill_rearm
+  assert not controller.ka4_stock_scc_standstill_rearm
   assert controller.CAN.ECAN == 0
   assert controller.CAN.CAM == 2
 
   _, messages = controller.update(CC, CS, 0)
-  masked_message, masked = get_adrv_0x161(messages, dbc)
-  assert masked["ALERTS_5"] == 0
-  assert masked["COUNTER"] == 18
+  replacement_message, replacement = get_adrv_0x161(messages, dbc)
+  assert replacement["ALERTS_5"] == 5
+  assert replacement["COUNTER"] == 18
   checksum = dbc.name_to_msg["ADRV_0x161"].sigs["CHECKSUM"]
-  assert masked["CHECKSUM"] == checksum.calc_checksum(
-    masked_message[0], checksum, bytearray(masked_message[1]),
+  assert replacement["CHECKSUM"] == checksum.calc_checksum(
+    replacement_message[0], checksum, bytearray(replacement_message[1]),
   )
   for signal in (
     "ALERTS_1", "ALERTS_2", "ALERTS_3", "MUTE", "DAW_ICON",
     "SOUNDS_1", "SOUNDS_2", "SOUNDS_3", "SOUNDS_4",
   ):
-    assert masked[signal] == CS.adrv_0x161[signal]
+    assert replacement[signal] == CS.adrv_0x161[signal]
 
   # The accepted ECAN replacement suppresses the raw camera-side ADRV frame
-  # inside Panda's 20 Hz forwarding timeout, so the masked payload is the one
-  # that reaches the vehicle side of the HDA1 harness.
+  # inside Panda's 20 Hz forwarding timeout. The replacement must preserve the
+  # stock alert rather than pretending to extend SCC eligibility.
   safety = libsafety_py.libsafety
   assert safety.set_safety_hooks(
     CarParams.SafetyModel.hyundaiCanfd, int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
   ) == 0
   safety.init_tests()
   safety.set_timer(1_000_000)
-  assert safety.safety_tx_hook(libsafety_py.make_CANPacket(masked_message[0], masked_message[2], masked_message[1]))
+  assert safety.safety_tx_hook(libsafety_py.make_CANPacket(
+    replacement_message[0], replacement_message[2], replacement_message[1],
+  ))
   safety.set_timer(1_069_999)
   assert safety.safety_fwd_hook(libsafety_py.make_CANPacket(raw_adrv[0], raw_adrv[2], raw_adrv[1])) == -1
   safety.set_timer(1_070_000)
   assert safety.safety_fwd_hook(libsafety_py.make_CANPacket(raw_adrv[0], raw_adrv[2], raw_adrv[1])) == 0
 
-  # A driver brake interlock blocks synthetic RES requests but does not leak
-  # the informational prompt during the independent display grace period.
+  # Neither a normal stop nor a driver-brake stop may arm the unproven
+  # periodic RES path.
+  for _ in range(310):
+    controller.update(CC, CS, 0)
+  assert controller.stock_scc_stop_start_frame is None
+  assert not controller.stock_scc_keepalive_pending
+  assert controller.stock_scc_keepalive_request_count == 0
+
   car_state.brakePressed = True
   CS.out = car_state.as_reader()
-  controller.frame = 5
+  controller.frame = 315
   _, messages = controller.update(CC, CS, 0)
-  _, still_masked = get_adrv_0x161(messages, dbc)
-  assert still_masked["ALERTS_5"] == 0
+  _, braking = get_adrv_0x161(messages, dbc)
+  assert braking["ALERTS_5"] == 5
   assert not controller.stock_scc_keepalive_pending
-
-  # Establish a fresh qualified stop through the full update path, then verify
-  # the exclusive 30.00-second boundary on actual packed ADRV frames.
-  controller, CC, CS, _, dbc, _ = build_full_hda1_ka4_controller(monkeypatch)
-  for _ in range(31):
-    controller.update(CC, CS, 0)
-  assert controller.stock_scc_stop_start_frame == 0
-
-  controller.frame = 2995
-  _, messages = controller.update(CC, CS, 0)
-  _, before_boundary = get_adrv_0x161(messages, dbc)
-  assert before_boundary["ALERTS_5"] == 0
-
-  controller.frame = 3000
-  _, messages = controller.update(CC, CS, 0)
-  _, at_boundary = get_adrv_0x161(messages, dbc)
-  assert at_boundary["ALERTS_5"] == 5
 
 
 @pytest.mark.parametrize("ecan_bus", [0, 4], ids=["single-panda", "second-panda-offset"])

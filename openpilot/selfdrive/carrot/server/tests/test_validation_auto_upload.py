@@ -25,7 +25,7 @@ TEST_DONGLE_ID = "test-dk-validation-device"
 
 class FakeParams:
   def __init__(self, values=None):
-    self.values = dict(values or {})
+    self.values = {"DongleId": TEST_DONGLE_ID, **dict(values or {})}
 
   def get(self, key):
     return self.values.get(key)
@@ -42,7 +42,7 @@ class FakeParams:
 
 @pytest.fixture(autouse=True)
 def trusted_validation_receiver(monkeypatch):
-  monkeypatch.setattr(auto_upload, "VALIDATION_UPLOAD_BASE_URL", "https://upload.example")
+  monkeypatch.setattr(auto_upload, "VALIDATION_UPLOAD_BASE_URL", auto_upload.DK_VALIDATION_UPLOAD_ORIGIN)
   monkeypatch.setattr(
     auto_upload,
     "DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256",
@@ -79,23 +79,48 @@ def validation_receipt(
   }
 
 
-def test_validation_receiver_defaults_only_when_override_is_empty(monkeypatch):
-  monkeypatch.setattr(auto_upload, "DEFAULT_WEB_UPLOAD_URL", "https://upload.default/")
-
-  assert auto_upload._configured_validation_upload_base_url("") == "https://upload.default"
-  assert auto_upload._configured_validation_upload_base_url("  ") == "https://upload.default"
-  assert auto_upload._configured_validation_upload_base_url("https://trusted.example/path/") == (
-    "https://trusted.example/path"
-  )
+def test_validation_receiver_defaults_and_canonicalizes_only_to_pinned_origin():
+  expected = auto_upload.DK_VALIDATION_UPLOAD_ORIGIN
+  assert auto_upload._configured_validation_upload_base_url("") == expected
+  assert auto_upload._configured_validation_upload_base_url("  ") == expected
+  assert auto_upload._configured_validation_upload_base_url("https://ADOT.SYNOLOGY.ME/") == expected
+  assert auto_upload._configured_validation_upload_base_url("https://adot.synology.me:443/") == expected
 
 
 @pytest.mark.parametrize("override", [
   "http://trusted.example",
   "https://user:password@trusted.example",
   "not-a-url",
+  "https://example.com",
+  "https://api.commadotai.com",
+  "https://connect.comma.ai/validation",
+  "https://tmux.carrotpilot.app",
+  "https://subdomain.carrotpilot.app/validation",
+  "https://shind0.synology.me",
+  "https://upload.shind0.synology.me/validation",
+  "https://op.wjcloud.kr",
+  "http://adot.synology.me",
+  "https://user:password@adot.synology.me",
+  "https://sub.adot.synology.me",
+  "https://adot.synology.me.example",
+  "https://adot-synology.me",
+  "https://adot.synology.me:444",
+  "https://adot.synology.me:",
+  "https://adot.synology.me:0443",
+  "https://adot.synology.me/api/v1/validation",
+  "https://adot.synology.me/?",
+  "https://adot.synology.me/#",
+  "https://adot.synology.me/?receiver=other",
+  "https://adot.synology.me/#other",
 ])
-def test_malformed_validation_receiver_override_fails_closed(override):
+def test_every_unpinned_validation_receiver_override_fails_closed(override):
   assert auto_upload._configured_validation_upload_base_url(override) == ""
+
+
+def test_private_nas_remains_a_valid_validation_receiver():
+  assert auto_upload._configured_validation_upload_base_url("https://adot.synology.me/") == (
+    "https://adot.synology.me"
+  )
 
 
 def test_empty_trusted_receiver_can_never_validate_campaign(monkeypatch):
@@ -175,70 +200,30 @@ def advance_detector(
   return events
 
 
-def test_detector_classifies_bounded_standstill_variants():
+def test_detector_captures_standstill_start_without_control_intervention():
   detector = auto_upload.ValidationEventDetector()
-  # A stale compatibility Param value must not turn an exact-topology route
-  # back into one of the legacy OFF classifications.
   settings = {"Ka4StockSccStandstillRearm": 0, "PathOffset": -1, "AdjustLaneOffset": 0}
 
   assert detector.update(sample(0.0, standstill=True, v_ego=0.0), settings) == []
-  events = advance_detector(detector, settings, 31.0, steady={"standstill": True, "v_ego": 0.0})
+  events = advance_detector(detector, settings, 0.5, steady={"standstill": True, "v_ego": 0.0})
   assert [event["condition"] for event in events] == ["standstill_on_no_request"]
-  assert advance_detector(detector, settings, 32.0, steady={"standstill": True, "v_ego": 0.0}) == []
+  assert events[0]["trigger"] == "standstill_observed"
+  assert events[0]["qualified"] is False
+  assert advance_detector(detector, settings, 2.0, steady={"standstill": True, "v_ego": 0.0}) == []
 
+  # Retain compatibility with a queued diagnostic from the superseded build
+  # if its controller counter changed before the observation dwell elapsed.
   detector.reset()
-  detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
-  advance_detector(
-    detector,
-    settings,
-    2.0,
-    steady={"standstill": True, "v_ego": 0.0},
-    final={"physical_res_pressed": True},
-  )
+  detector.update(sample(0.0, standstill=True, v_ego=0.0, ka4_keepalive_request_count=0), settings)
   events = advance_detector(
     detector,
     settings,
-    10.0,
-    steady={"standstill": True, "v_ego": 0.0},
-    final={"standstill": False, "v_ego": 1.0},
-  )
-  assert [event["condition"] for event in events] == ["standstill_on_no_request"]
-
-  detector.reset()
-  detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
-  events = advance_detector(
-    detector,
-    settings,
-    2.0,
-    steady={"standstill": True, "v_ego": 0.0},
-    final={"standstill": False, "v_ego": 1.0, "physical_res_pressed": True},
-  )
-  assert [event["condition"] for event in events] == ["standstill_on_no_request"]
-  assert events[0]["duration"] < auto_upload.SHORT_STOP_MIN_SECONDS
-  assert events[0]["trigger"] == "stop_ended_before_keepalive_request"
-
-  detector.reset()
-  detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
-  assert advance_detector(
-    detector,
-    settings,
-    10.0,
-    steady={"standstill": True, "v_ego": 0.0},
-    final={"cruise_enabled": False},
-  ) == []
-
-  detector.reset()
-  settings["Ka4StockSccStandstillRearm"] = 1
-  detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
-  events = advance_detector(
-    detector,
-    settings,
-    3.0,
+    0.3,
     steady={"standstill": True, "v_ego": 0.0},
     final={
       "ka4_keepalive_request_count": 1,
       "ka4_keepalive_qualified": True,
-      "ka4_keepalive_stopped_sec": 3.0,
+      "ka4_keepalive_stopped_sec": 0.3,
     },
   )
   assert [event["condition"] for event in events] == ["standstill_on"]
@@ -250,23 +235,24 @@ def test_detector_classifies_bounded_standstill_variants():
   events = advance_detector(
     detector,
     settings,
-    31.0,
+    0.5,
     steady={"standstill": True, "v_ego": 0.0, "ka4_keepalive_request_count": 0},
   )
   assert [event["condition"] for event in events] == ["standstill_on_no_request"]
-  assert events[0]["trigger"] == "duration_no_keepalive_request"
+  assert events[0]["trigger"] == "standstill_observed"
 
 
-def test_detector_rejects_interlocks_and_classifies_stable_lane_offsets():
+def test_detector_observes_standstill_despite_interlocks_and_classifies_stable_lane_offsets():
   detector = auto_upload.ValidationEventDetector()
   stop_settings = {"Ka4StockSccStandstillRearm": 0, "PathOffset": -1, "AdjustLaneOffset": 0}
   detector.update(sample(0.0, standstill=True, v_ego=0.0), stop_settings)
-  assert advance_detector(
+  events = advance_detector(
     detector,
     stop_settings,
-    40.0,
+    0.5,
     steady={"standstill": True, "v_ego": 0.0, "brake_pressed": True},
-  ) == []
+  )
+  assert [event["trigger"] for event in events] == ["standstill_observed"]
 
   for path_offset, published, condition in (
     (0, 0.0, "lane_offset_0"),
@@ -322,22 +308,22 @@ def test_detector_rearms_when_event_was_not_durably_recorded():
   detector = auto_upload.ValidationEventDetector()
   settings = {"Ka4StockSccStandstillRearm": 0, "PathOffset": -1, "AdjustLaneOffset": 0}
   detector.update(sample(0.0, standstill=True, v_ego=0.0), settings)
-  events = advance_detector(detector, settings, 31.0, steady={"standstill": True, "v_ego": 0.0})
+  events = advance_detector(detector, settings, 0.5, steady={"standstill": True, "v_ego": 0.0})
   assert [event["condition"] for event in events] == ["standstill_on_no_request"]
 
   detector.nack("standstill_on_no_request")
-  retried = detector.update(sample(31.1, standstill=True, v_ego=0.0), settings)
+  retried = detector.update(sample(0.6, standstill=True, v_ego=0.0), settings)
   assert [event["condition"] for event in retried] == ["standstill_on_no_request"]
 
 
 def test_campaign_condition_partition_keeps_legacy_ids_restore_only():
   assert auto_upload.TARGET_CONDITIONS == {
-    "standstill_on",
+    "standstill_on_no_request",
     "lane_offset_10",
     "stock_scc_close_accel",
   }
   assert auto_upload.OPTIONAL_CONDITIONS == {
-    "standstill_on_no_request",
+    "standstill_on",
     "lane_offset_0",
   }
   assert auto_upload.LEGACY_CONDITIONS == {
@@ -352,6 +338,13 @@ def test_campaign_condition_partition_keeps_legacy_ids_restore_only():
     | auto_upload.OPTIONAL_CONDITIONS
     | auto_upload.LEGACY_CONDITIONS
   )
+  assert auto_upload.NEW_CAMPAIGN_CONDITIONS == (
+    auto_upload.TARGET_CONDITIONS | auto_upload.OPTIONAL_CONDITIONS
+  )
+  assert auto_upload.MAX_NEW_CAMPAIGN_CAPTURES == 10
+  assert auto_upload.MAX_NEW_CAMPAIGN_RLOGS == 30
+  assert auto_upload.MAX_COMPAT_CAPTURE_RECORDS == 14
+  assert auto_upload.MAX_COMPAT_RLOG_RECORDS == 42
 
 
 class ActualMessageSubMaster:
@@ -456,7 +449,8 @@ def test_fresh_ten_hz_cereal_samples_still_detect_close_accel():
   assert [event["condition"] for event in events] == ["stock_scc_close_accel"]
 
 
-def _car_params_bytes(*, fingerprint=str(CAR.KIA_CARNIVAL_4TH_GEN), openpilot_long=False, camera_scc=False):
+def _car_params_bytes(*, fingerprint=str(CAR.KIA_CARNIVAL_4TH_GEN), openpilot_long=False,
+                      camera_scc=False, hda2=False):
   cp = car.CarParams.new_message()
   cp.carFingerprint = fingerprint
   cp.pcmCruise = True
@@ -464,6 +458,8 @@ def _car_params_bytes(*, fingerprint=str(CAR.KIA_CARNIVAL_4TH_GEN), openpilot_lo
   flags = int(HyundaiFlags.CANFD | HyundaiFlags.RADAR_SCC)
   if camera_scc:
     flags |= int(HyundaiFlags.CAMERA_SCC)
+  if hda2:
+    flags |= int(HyundaiFlags.CANFD_HDA2)
   cp.flags = flags
   cp.safetyConfigs = [{"safetyModel": "hyundaiCanfd", "safetyParam": 0}]
   return cp.to_bytes()
@@ -483,6 +479,7 @@ def test_vehicle_gate_accepts_only_ka4_stock_radar_scc_without_longitudinal():
     {"fingerprint": "TEST_CAR"},
     {"openpilot_long": True},
     {"camera_scc": True},
+    {"hda2": True},
   ):
     accepted, _metadata = auto_upload.ka4_stock_scc_gate(FakeParams({
       "DongleId": TEST_DONGLE_ID,
@@ -500,7 +497,27 @@ def test_vehicle_gate_accepts_only_ka4_stock_radar_scc_without_longitudinal():
     assert metadata["deviceAllowed"] is False
 
 
-def test_route_settings_publish_effective_automatic_standstill_metadata():
+def test_upload_runtime_gate_rechecks_exact_owner_before_live_or_network_guards():
+  campaign = auto_upload._new_campaign(now=int(auto_upload.time.time()))
+  guard_reads = []
+
+  allowed, error = auto_upload._upload_runtime_safety_allows(
+    FakeParams({
+      "DongleId": "another-device",
+      auto_upload.VALIDATION_AUTO_UPLOAD_PARAM: 1,
+      "IsOffroad": True,
+    }),
+    campaign,
+    device_state_safe=lambda: guard_reads.append("device") or True,
+    network_state_safe=lambda: guard_reads.append("network") or True,
+  )
+
+  assert allowed is False
+  assert "allowlisted" in error
+  assert guard_reads == []
+
+
+def test_route_settings_publish_disabled_standstill_actuator_metadata():
   params = FakeParams({
     "Ka4StockSccStandstillRearm": 0,
     "PathOffset": 10,
@@ -508,7 +525,7 @@ def test_route_settings_publish_effective_automatic_standstill_metadata():
   })
 
   assert auto_upload._route_settings(params) == {
-    "Ka4StockSccStandstillRearm": 1,
+    "Ka4StockSccStandstillRearm": 0,
     "PathOffset": 10,
     "AdjustLaneOffset": 0,
   }
@@ -726,7 +743,7 @@ def test_enqueue_keeps_prior_capture_when_later_event_is_not_finalized(tmp_path,
   first = _make_segment(tmp_path, route, 0)
   _make_segment(tmp_path, route, 1, locked=True)
   state = auto_upload._default_state()
-  state["campaign"] = {"id": "campaign", "base_url": "https://upload.example"}
+  state["campaign"] = {"id": "campaign", "base_url": auto_upload.DK_VALIDATION_UPLOAD_ORIGIN}
   state["active_route"] = {
     "route": route,
     "settings": {},
@@ -904,7 +921,7 @@ def test_required_capture_can_evict_oldest_optional_without_losing_shared_owner(
   state["queue"] = [
     {
       "id": "optional",
-      "condition": "standstill_on_no_request",
+      "condition": "standstill_on",
       "segments": [shared],
       "owned_preserve": [shared],
       "created_at": 1,
@@ -929,10 +946,10 @@ def test_required_capture_evicts_optional_capture_to_fit_byte_budget(tmp_path, m
   optional_segment = _make_segment(tmp_path, route, 0, size=8)
   required_anchor = _make_segment(tmp_path, route, 1, size=8)
   state = auto_upload._default_state()
-  state["campaign"] = {"id": "campaign", "base_url": "https://upload.example"}
+  state["campaign"] = {"id": "campaign", "base_url": auto_upload.DK_VALIDATION_UPLOAD_ORIGIN}
   state["queue"] = [{
     "id": "optional",
-    "condition": "standstill_on_no_request",
+    "condition": "standstill_on",
     "route": route,
     "segments": [optional_segment],
     "owned_preserve": [optional_segment],
@@ -1542,7 +1559,7 @@ def test_state_is_atomic_sanitized_and_corruption_fails_closed(tmp_path):
   state["status"] = "armed"
   state["campaign"] = auto_upload._new_campaign(now=100)
   assert auto_upload.write_validation_upload_state(state, str(path)) is True
-  assert auto_upload.read_validation_upload_state(str(path))["campaign"]["base_url"] == "https://upload.example"
+  assert auto_upload.read_validation_upload_state(str(path))["campaign"]["base_url"] == auto_upload.DK_VALIDATION_UPLOAD_ORIGIN
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
   path.write_text("{broken", encoding="utf-8")
@@ -1574,10 +1591,16 @@ def test_campaign_is_pinned_to_immutable_validation_receiver(monkeypatch):
 
   assert campaign["base_url"] == auto_upload.VALIDATION_UPLOAD_BASE_URL
   assert campaign["base_url"] != upload.upload_target_settings()[0]
-  campaign["base_url"] = "https://attacker.example"
-  state = auto_upload._default_state()
-  state["campaign"] = campaign
-  assert auto_upload._sanitize_state(state)["status"] == "state_invalid"
+  for untrusted in (
+    "https://attacker.example",
+    "https://adot.synology.me/subpath",
+    "https://adot.synology.me////",
+    "https://adot.synology.me/?",
+  ):
+    campaign["base_url"] = untrusted
+    state = auto_upload._default_state()
+    state["campaign"] = campaign
+    assert auto_upload._sanitize_state(state)["status"] == "state_invalid"
 
 
 @pytest.mark.parametrize("campaign_id", ["short", "A" * 24, "g" * 24, "a" * 25])
@@ -2593,6 +2616,64 @@ def test_disabled_worker_uses_one_second_low_duty_poll(tmp_path, monkeypatch):
     ))
 
   assert sleeps == [1.0]
+
+
+def test_disallowed_owner_device_cannot_arm_campaign_or_reach_network(tmp_path, monkeypatch):
+  params = FakeParams({
+    "DongleId": "another-device",
+    auto_upload.VALIDATION_AUTO_UPLOAD_PARAM: 1,
+    "IsOffroad": True,
+    "IsOnroad": False,
+  })
+  state = auto_upload._default_state()
+  device_state = type("DeviceState", (), {"started": False})()
+
+  class FakeSubMaster:
+    valid = {"deviceState": True}
+    alive = {"deviceState": True}
+    updated = {"deviceState": True}
+    logMonoTime = {"deviceState": 1}
+
+    def update(self, _timeout):
+      return None
+
+    def __getitem__(self, _name):
+      return device_state
+
+  saved = []
+
+  async def stop_on_sleep(_delay):
+    raise asyncio.CancelledError
+
+  monkeypatch.setattr(auto_upload, "HAS_PARAMS", True)
+  monkeypatch.setattr(auto_upload, "Params", lambda: params)
+  monkeypatch.setattr(auto_upload, "read_validation_upload_state", lambda _path: state)
+  monkeypatch.setattr(
+    auto_upload,
+    "write_validation_upload_state",
+    lambda candidate, _path: saved.append(json.loads(json.dumps(candidate))) or True,
+  )
+  monkeypatch.setattr(auto_upload.messaging, "SubMaster", lambda _services: FakeSubMaster())
+  monkeypatch.setattr(auto_upload.messaging, "sub_sock", lambda *_args, **_kwargs: object())
+  monkeypatch.setattr(auto_upload.messaging, "drain_sock", lambda _sock: [])
+  monkeypatch.setattr(
+    auto_upload,
+    "_upload_first_capture_with_live_device_state",
+    lambda *_args, **_kwargs: pytest.fail("disallowed device must not reach upload"),
+  )
+  monkeypatch.setattr(auto_upload.asyncio, "sleep", stop_on_sleep)
+
+  with pytest.raises(asyncio.CancelledError):
+    asyncio.run(auto_upload._validation_auto_upload_worker(
+      state_path=str(tmp_path / "state.json"),
+      root=str(tmp_path),
+      poll_interval=0.1,
+    ))
+
+  assert params.get_bool(auto_upload.VALIDATION_AUTO_UPLOAD_PARAM) is False
+  assert saved[-1]["status"] == "device_not_allowed"
+  assert saved[-1]["campaign"] is None
+  assert saved[-1]["queue"] == []
 
 
 def test_validation_upload_status_endpoint_does_not_expose_capture_details(tmp_path, monkeypatch):

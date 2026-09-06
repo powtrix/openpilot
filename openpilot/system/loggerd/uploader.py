@@ -12,11 +12,16 @@ from collections.abc import Iterator
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.api import Api
-from openpilot.common.external_data import third_party_data_sharing_enabled
+from openpilot.common.external_data import (
+  third_party_data_sharing_enabled,
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.common.utils import CallbackReader, get_upload_stream
 from openpilot.common.params import Params
 from openpilot.common.realtime import set_core_affinity
 from openpilot.system.hardware.hw import Paths
+from openpilot.system.athena.consent_artifacts import artifact_is_blocked, prepare_consent_session
 from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
 from openpilot.common.swaglog import cloudlog
 
@@ -39,8 +44,13 @@ class AutomaticDataSharingDisabled(Exception):
   pass
 
 
-def _require_third_party_data_sharing(params: Params) -> None:
-  if not third_party_data_sharing_enabled(params):
+def _require_third_party_data_sharing(params: Params, consent_generation: str | None = None) -> None:
+  allowed = (
+    third_party_data_sharing_generation_matches(consent_generation, params)
+    if consent_generation is not None
+    else third_party_data_sharing_enabled(params)
+  )
+  if not allowed:
     raise AutomaticDataSharingDisabled("automatic third-party data sharing is disabled")
 
 
@@ -90,6 +100,7 @@ class Uploader:
     self.root = root
 
     self.params = Params()
+    self.consent_generation: str | None = None
 
     # stats for last successfully uploaded file
     self.last_filename = ""
@@ -124,7 +135,7 @@ class Uploader:
           cloudlog.event("uploader_getxattr_failed", key=key, fn=fn)
           # deleter could have deleted, so skip
           continue
-        if is_uploaded:
+        if is_uploaded or artifact_is_blocked(fn):
           continue
 
         # limit uploading on metered connections
@@ -152,7 +163,9 @@ class Uploader:
     return None
 
   def do_upload(self, key: str, fn: str):
-    _require_third_party_data_sharing(self.params)
+    _require_third_party_data_sharing(self.params, self.consent_generation)
+    if artifact_is_blocked(fn):
+      raise AutomaticDataSharingDisabled("artifact predates the current consent session")
     url_resp = self.api.get("v1.4/" + self.dongle_id + "/upload_url/", timeout=10, path=key, access_token=self.api.get_token())
     if url_resp.status_code == 412:
       return url_resp
@@ -169,10 +182,10 @@ class Uploader:
     try:
       compress = key.endswith('.zst') and not fn.endswith('.zst')
       stream, content_length = get_upload_stream(fn, compress)
-      _require_third_party_data_sharing(self.params)
+      _require_third_party_data_sharing(self.params, self.consent_generation)
       guarded_stream = CallbackReader(
         stream,
-        lambda _current: _require_third_party_data_sharing(self.params),
+        lambda _current: _require_third_party_data_sharing(self.params, self.consent_generation),
       )
       headers = {**headers, "Content-Length": str(content_length)}
       response = requests.put(url, data=guarded_stream, headers=headers, timeout=10)
@@ -270,9 +283,22 @@ def main(exit_event: threading.Event | None = None) -> None:
 
   backoff = 0.1
   while not exit_event.is_set():
-    if not third_party_data_sharing_enabled(params):
+    generation = third_party_data_sharing_generation(params)
+    if generation is None:
+      uploader.consent_generation = None
       exit_event.wait(1.0)
       continue
+    if uploader.consent_generation != generation:
+      try:
+        prepared_generation = prepare_consent_session(params)
+      except Exception:
+        cloudlog.exception("uploader failed to prepare third-party consent session")
+        prepared_generation = None
+      if prepared_generation != generation:
+        uploader.consent_generation = None
+        exit_event.wait(1.0)
+        continue
+      uploader.consent_generation = generation
     sm.update(0)
     offroad = params.get_bool("IsOffroad")
     network_type = sm['deviceState'].networkType if not force_wifi else NetworkType.wifi

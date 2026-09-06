@@ -1,15 +1,24 @@
 """Install exception handler for process crash."""
+import threading
+
 import sentry_sdk
 from enum import Enum
 from typing import Any
 from sentry_sdk.integrations.threading import ThreadingIntegration
+from sentry_sdk.transport import HttpTransport
 
-from openpilot.common.external_data import third_party_data_sharing_enabled
+from openpilot.common.external_data import (
+  third_party_data_sharing_enabled,
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.common.params import Params
 from openpilot.system.athena.registration import is_registered_device
 from openpilot.system.hardware import HARDWARE, PC
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.version import get_build_metadata, get_version
+
+SENTRY_CONSENT_GENERATION_FIELD = "_dk_consent_generation"
 
 
 class SentryProject(Enum):
@@ -19,10 +28,46 @@ class SentryProject(Enum):
   SELFDRIVE_NATIVE = "https://3e4b586ed21a4479ad5d85083b639bc6@o33823.ingest.sentry.io/157615"
 
 
+class ConsentHttpTransport(HttpTransport):
+  """Bind every queued Sentry envelope to one exact consent generation."""
+
+  def __init__(self, options):
+    super().__init__(options)
+    self._dk_transport_state = threading.local()
+
+  def capture_envelope(self, envelope) -> None:
+    event = envelope.get_event() or envelope.get_transaction_event()
+    generation = event.pop(SENTRY_CONSENT_GENERATION_FIELD, None) if isinstance(event, dict) else None
+    if not third_party_data_sharing_generation_matches(generation):
+      return
+    envelope._dk_consent_generation = generation
+    super().capture_envelope(envelope)
+
+  def _send_envelope(self, envelope) -> None:
+    generation = getattr(envelope, "_dk_consent_generation", None)
+    if not third_party_data_sharing_generation_matches(generation):
+      return
+    self._dk_transport_state.consent_generation = generation
+    try:
+      super()._send_envelope(envelope)
+    finally:
+      self._dk_transport_state.consent_generation = None
+
+  def _request(self, method, endpoint_type, body, headers):
+    generation = getattr(self._dk_transport_state, "consent_generation", None)
+    if not third_party_data_sharing_generation_matches(generation):
+      raise RuntimeError("Sentry consent generation changed before network write")
+    return super()._request(method, endpoint_type, body, headers)
+
+
 def _before_send(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
   """Recheck consent after event enrichment, immediately before SDK transport."""
   try:
-    return event if third_party_data_sharing_enabled() else None
+    generation = third_party_data_sharing_generation()
+    if generation is None:
+      return None
+    event[SENTRY_CONSENT_GENERATION_FIELD] = generation
+    return event
   except Exception:
     return None
 
@@ -90,6 +135,7 @@ def init(project: SentryProject) -> bool:
                   integrations=integrations,
                   before_send=_before_send,
                   before_send_transaction=_before_send,
+                  transport=ConsentHttpTransport,
                   traces_sample_rate=1.0,
                   max_value_length=8192,
                   environment=env)

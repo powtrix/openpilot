@@ -12,7 +12,6 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
-import numpy as np
 from PIL import Image
 
 if __package__ in (None, ""):
@@ -20,8 +19,15 @@ if __package__ in (None, ""):
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
+from openpilot.common.params import Params
 from openpilot.selfdrive.carrot.xiaoge.lane_inference import DEFAULT_LANE_MODEL_PATH, LaneInference, prepare_lane_image
+from openpilot.selfdrive.carrot.xiaoge.nv12 import nv12_y_plane, pack_nv12
 from openpilot.selfdrive.carrot.xiaoge.v_asm_inference import DEFAULT_MODEL_PATH, VASMInference
+from openpilot.selfdrive.carrot.xiaoge.xiaoge_vision import XIAOGE_BLINDSPOT_TIMEOUT_NS, XIAOGE_LANE_TIMEOUT_NS
 
 try:
   import cv2
@@ -50,6 +56,11 @@ FOLLOWUP_WINDOW_SECONDS = 1.5
 VASM_MIN_SPEED_MPS = 30.0 / 3.6
 VASM_MAX_SPEED_MPS = 120.0 / 3.6
 VASM_MIN_LANE_WIDTH_METERS = 3.0
+CAMERA_TIMEOUT_SECONDS = 2.0
+SNAPSHOT_TIMEOUT_SECONDS = 5.0
+# VisionIPC recv holds the GIL while waiting. Poll without blocking, then sleep
+# in Python so an idle camera cannot stall inference or HTTP on other threads.
+CAMERA_POLL_INTERVAL_SECONDS = 0.005
 
 
 DEFAULT_POLYGONS = {
@@ -105,7 +116,18 @@ def normalize_config(config: object) -> dict:
 
 
 class VASMService:
-  def __init__(self, model_path: Path):
+  def __init__(
+    self,
+    model_path: Path,
+    params: Params | None = None,
+    consent_generation: str | None = None,
+  ):
+    self.params = params if params is not None else Params()
+    self.consent_generation = (
+      consent_generation
+      if consent_generation is not None
+      else third_party_data_sharing_generation(self.params)
+    )
     self.lock = threading.Lock()
     self.snapshot_condition = threading.Condition(self.lock)
     self.snapshot_requests = {"wide": 0, "road": 0}
@@ -125,6 +147,7 @@ class VASMService:
     self.last_frame_at = 0.0
     self.last_inference_at = 0.0
     self.last_inference_ms = 0.0
+    self.last_inference_thread_cpu_ms = 0.0
     self.inference_count = 0
     self.inference_fps = 0.0
     self._fps_window_start = time.monotonic()
@@ -141,7 +164,7 @@ class VASMService:
       "reason": "waiting for carState and modelV2",
       "laneWidth": 0.0,
     }
-    self.vasm_result = {"left": False, "right": False, "updatedMonoTimeNanos": 0}
+    self.vasm_result = {"left": False, "right": False, "side": "", "updatedMonoTimeNanos": 0}
 
     # Lane inference engine setup
     self.lane_inference = LaneInference(DEFAULT_LANE_MODEL_PATH)
@@ -153,6 +176,7 @@ class VASMService:
     self.last_road_frame_at = 0.0
     self.last_lane_inference_at = 0.0
     self.last_lane_inference_ms = 0.0
+    self.last_lane_inference_thread_cpu_ms = 0.0
     self.lane_inference_count = 0
     self.lane_inference_fps = 0.0
     self._lane_fps_window_start = time.monotonic()
@@ -167,6 +191,9 @@ class VASMService:
       "error": "",
       "updatedMonoTimeNanos": 0,
     }
+
+  def data_sharing_allowed(self) -> bool:
+    return third_party_data_sharing_generation_matches(self.consent_generation, self.params)
 
   def _read_config(self) -> dict:
     try:
@@ -230,6 +257,26 @@ class VASMService:
 
   def status(self) -> dict:
     with self.lock:
+      now = time.monotonic()
+      now_nanos = time.monotonic_ns()
+      camera_age = now - self.last_frame_at if self.last_frame_at else None
+      road_camera_age = now - self.last_road_frame_at if self.last_road_frame_at else None
+      camera_available = camera_age is not None and camera_age <= CAMERA_TIMEOUT_SECONDS and not self.camera_error
+      road_camera_available = road_camera_age is not None and road_camera_age <= CAMERA_TIMEOUT_SECONDS and not self.lane_camera_error
+      vasm_timestamp = self.vasm_result["updatedMonoTimeNanos"]
+      vasm_fresh = vasm_timestamp > 0 and 0 <= now_nanos - vasm_timestamp <= XIAOGE_BLINDSPOT_TIMEOUT_NS
+      vehicle_sides = {}
+      for side in ("left", "right"):
+        valid = bool(camera_available and self.inference.valid and vasm_fresh and self.vasm_gate["active"] and
+                     self.vasm_gate["side"] == side and self.vasm_result["side"] == side)
+        vehicle_sides[side] = {
+          "valid": valid,
+          "active": self.vasm_result[side] if valid else False,
+          "confidence": self.inference.confidence[side] if valid else 0.0,
+        }
+      lane_timestamp = self.lane_result["updatedMonoTimeNanos"]
+      lane_fresh = bool(road_camera_available and self.lane_inference.valid and self.lane_result["valid"] and
+                        lane_timestamp > 0 and 0 <= now_nanos - lane_timestamp <= XIAOGE_LANE_TIMEOUT_NS)
       return {
         "standalone": False,
         "integrated": True,
@@ -245,20 +292,15 @@ class VASMService:
         "smoothingSeconds": self.smoothing_seconds,
         "baseIntervalSeconds": self.base_interval_seconds,
         "camera": {
-          "available": bool(self.last_frame_at),
+          "available": camera_available,
           "error": self.camera_error,
-          "lastFrameAgeSeconds": time.monotonic() - self.last_frame_at if self.last_frame_at else None,
+          "lastFrameAgeSeconds": camera_age,
         },
-        "imageSide": {
-          side: {"active": self.inference.active[side], "confidence": self.inference.confidence[side]}
-          for side in ("left", "right")
-        },
-        "vehicleSide": {
-          side: {"active": self.inference.active[side], "confidence": self.inference.confidence[side]}
-          for side in ("left", "right")
-        },
+        "imageSide": vehicle_sides,
+        "vehicleSide": vehicle_sides,
         "inference": {
           "latencyMs": round(self.last_inference_ms, 1),
+          "threadCpuMs": round(self.last_inference_thread_cpu_ms, 1),
           "fps": self.inference_fps,
           "count": self.inference_count,
           "lastAgeSeconds": round(time.monotonic() - self.last_inference_at, 2) if self.last_inference_at else None,
@@ -270,11 +312,14 @@ class VASMService:
           "error": self.lane_inference.error,
           "threshold": self.lane_threshold,
           "intervalSeconds": self.lane_interval_seconds,
-          "cameraAvailable": bool(self.last_road_frame_at),
+          "cameraAvailable": road_camera_available,
           "cameraError": self.lane_camera_error,
+          "lastFrameAgeSeconds": road_camera_age,
+          "resultFresh": lane_fresh,
           "result": self.lane_result,
           "inference": {
             "latencyMs": round(self.last_lane_inference_ms, 1),
+            "threadCpuMs": round(self.last_lane_inference_thread_cpu_ms, 1),
             "fps": self.lane_inference_fps,
             "count": self.lane_inference_count,
             "lastAgeSeconds": round(time.monotonic() - self.last_lane_inference_at, 2) if self.last_lane_inference_at else None,
@@ -288,13 +333,16 @@ class VASMService:
       requested = self.snapshot_requests[stream_type]
       self.snapshot_condition.wait_for(
         lambda: self.snapshot_responses[stream_type] >= requested or not self.running,
-        timeout=1.0,
+        timeout=SNAPSHOT_TIMEOUT_SECONDS,
       )
+      if self.snapshot_responses[stream_type] < requested:
+        return None
       return self.last_road_jpeg if stream_type == "road" else self.last_jpeg
 
   def _update_vasm_gate(self) -> tuple[bool, str]:
     self.sm.update(0)
-    if not self.sm.all_alive_and_valid(["carState", "modelV2"]):
+    services = ["carState", "modelV2"]
+    if not (self.sm.all_alive(services) and self.sm.all_valid(services)):
       gate = {"active": False, "side": "", "reason": "carState or modelV2 is unavailable", "laneWidth": 0.0}
     else:
       speed = float(self.sm["carState"].vEgo)
@@ -342,9 +390,8 @@ class VASMService:
       self.pm.send("customReservedRawData0", msg)
 
   @staticmethod
-  def _jpeg_from_nv12(data: bytes, width: int, height: int, stride: int) -> bytes:
-    frame = np.frombuffer(data, dtype=np.uint8).reshape((-1, stride))
-    nv12 = frame[:height + height // 2, :width]
+  def _jpeg_from_nv12(data: bytes, width: int, height: int, stride: int, uv_offset: int) -> bytes:
+    nv12 = pack_nv12(data, width, height, stride, uv_offset)
     rgb = cv2.cvtColor(nv12, cv2.COLOR_YUV2RGB_NV12)
     output = BytesIO()
     Image.fromarray(rgb).save(output, "JPEG", quality=85)
@@ -353,7 +400,7 @@ class VASMService:
   @staticmethod
   def _lane_jpeg_from_nv12(data: bytes, width: int, height: int, stride: int) -> bytes:
     """Build the grayscale road-camera input expected by the lane model."""
-    frame = np.frombuffer(data, dtype=np.uint8).reshape((-1, stride))
+    frame = nv12_y_plane(data, width, height, stride)
     gray = prepare_lane_image(frame, width, height)
     output = BytesIO()
     Image.fromarray(gray).save(output, "JPEG", quality=50)
@@ -363,7 +410,7 @@ class VASMService:
     from msgq.visionipc import VisionIpcClient, VisionStreamType
 
     client = None
-    while self.running:
+    while self.running and self.data_sharing_allowed():
       try:
         if client is None or not client.is_connected():
           client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, True)
@@ -373,23 +420,23 @@ class VASMService:
             time.sleep(1.0)
             continue
 
-        buffer = client.recv(timeout_ms=1000)
+        buffer = client.recv(timeout_ms=0)
         if buffer is None:
+          time.sleep(CAMERA_POLL_INTERVAL_SECONDS)
           continue
         now = time.monotonic()
-        frame = np.frombuffer(buffer.data, dtype=np.uint8).reshape((-1, client.stride))[:, :client.width]
         gate_active, side = self._update_vasm_gate()
         publish_clear = False
         with self.lock:
           self.last_frame_at = now
           self.camera_error = ""
           if self.snapshot_responses["wide"] < self.snapshot_requests["wide"]:
-            self.last_jpeg = self._jpeg_from_nv12(buffer.data, client.width, client.height, client.stride)
+            self.last_jpeg = self._jpeg_from_nv12(buffer.data, buffer.width, buffer.height, buffer.stride, buffer.uv_offset)
             self.snapshot_responses["wide"] = self.snapshot_requests["wide"]
             self.snapshot_condition.notify_all()
           if not gate_active:
             publish_clear = self.vasm_result["left"] or self.vasm_result["right"]
-            self.vasm_result = {"left": False, "right": False, "updatedMonoTimeNanos": time.monotonic_ns()}
+            self.vasm_result = {"left": False, "right": False, "side": "", "updatedMonoTimeNanos": time.monotonic_ns()}
           else:
             interval = FOLLOWUP_INTERVAL_SECONDS if now < self.followup_until else self.base_interval_seconds
             if now - self.last_inference_at < interval:
@@ -402,13 +449,17 @@ class VASMService:
           configured_sides = self.inference.configured_sides
           if side not in configured_sides or not self.inference.valid:
             continue
+          frame = pack_nv12(buffer.data, buffer.width, buffer.height, buffer.stride, buffer.uv_offset)
           previous = self.last_side_at[side]
           t0 = time.monotonic()
-          self.inference.update(frame, client.width, client.height, side, self.threshold, self.smoothing_seconds, now - previous if previous else interval)
+          cpu0 = time.thread_time()
+          self.inference.update(frame, buffer.width, buffer.height, side, self.threshold, self.smoothing_seconds, now - previous if previous else interval)
           t1 = time.monotonic()
+          thread_cpu_ms = (time.thread_time() - cpu0) * 1000.0
           active = self.inference.active[side]
         with self.lock:
           self.last_inference_ms = (t1 - t0) * 1000.0
+          self.last_inference_thread_cpu_ms = thread_cpu_ms
           self.inference_count += 1
           self._fps_window_count += 1
           if t1 - self._fps_window_start >= 1.0:
@@ -421,6 +472,7 @@ class VASMService:
           self.vasm_result = {
             "left": self.inference.active["left"] if side == "left" else False,
             "right": self.inference.active["right"] if side == "right" else False,
+            "side": side,
             "updatedMonoTimeNanos": time.monotonic_ns(),
           }
         self.publish_vision_result()
@@ -434,7 +486,7 @@ class VASMService:
     from msgq.visionipc import VisionIpcClient, VisionStreamType
 
     client = None
-    while self.running:
+    while self.running and self.data_sharing_allowed():
       try:
         if client is None or not client.is_connected():
           client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_ROAD, True)
@@ -444,16 +496,17 @@ class VASMService:
             time.sleep(1.0)
             continue
 
-        buffer = client.recv(timeout_ms=1000)
+        buffer = client.recv(timeout_ms=0)
         if buffer is None:
+          time.sleep(CAMERA_POLL_INTERVAL_SECONDS)
           continue
         now = time.monotonic()
-        frame = np.frombuffer(buffer.data, dtype=np.uint8).reshape((-1, client.stride))[:, :client.width]
+        frame = nv12_y_plane(buffer.data, buffer.width, buffer.height, buffer.stride)
         with self.lock:
           self.last_road_frame_at = now
           self.lane_camera_error = ""
           if self.snapshot_responses["road"] < self.snapshot_requests["road"]:
-            self.last_road_jpeg = self._lane_jpeg_from_nv12(buffer.data, client.width, client.height, client.stride)
+            self.last_road_jpeg = self._lane_jpeg_from_nv12(buffer.data, buffer.width, buffer.height, buffer.stride)
             self.snapshot_responses["road"] = self.snapshot_requests["road"]
             self.snapshot_condition.notify_all()
           if not self.lane_inference.valid:
@@ -463,12 +516,15 @@ class VASMService:
 
           lane_threshold = self.lane_threshold
         t0 = time.monotonic()
+        cpu0 = time.thread_time()
         res = self.lane_inference.infer(
-          frame, client.width, client.height, conf_thresh=lane_threshold
+          frame, buffer.width, buffer.height, conf_thresh=lane_threshold
         )
         t1 = time.monotonic()
+        thread_cpu_ms = (time.thread_time() - cpu0) * 1000.0
         with self.lock:
           self.last_lane_inference_ms = (t1 - t0) * 1000.0
+          self.last_lane_inference_thread_cpu_ms = thread_cpu_ms
           self.lane_inference_count += 1
           self._lane_fps_window_count += 1
           if t1 - self._lane_fps_window_start >= 1.0:
@@ -497,16 +553,38 @@ class Handler(BaseHTTPRequestHandler):
     except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
       return
 
+  def end_headers(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self._headers_buffer = []
+      self.close_connection = True
+      return
+    super().end_headers()
+
+  def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
+    super().send_error(code, message, explain)
+
   def _json(self, status: HTTPStatus, payload: object) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     body = json.dumps(payload).encode()
     self.send_response(status)
     self.send_header("Content-Type", "application/json")
     self.send_header("Content-Length", str(len(body)))
     self.send_header("Cache-Control", "no-store")
     self.end_headers()
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     self.wfile.write(body)
 
   def do_GET(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     path = urlparse(self.path).path
     if path == "/":
       body = self.index_path.read_bytes()
@@ -514,6 +592,9 @@ class Handler(BaseHTTPRequestHandler):
       self.send_header("Content-Type", "text/html; charset=utf-8")
       self.send_header("Content-Length", str(len(body)))
       self.end_headers()
+      if not self.service.data_sharing_allowed():
+        self.close_connection = True
+        return
       self.wfile.write(body)
     elif path == "/api/status":
       self._json(HTTPStatus.OK, self.service.status())
@@ -533,11 +614,17 @@ class Handler(BaseHTTPRequestHandler):
       self.send_header("Content-Length", str(len(jpeg)))
       self.send_header("Cache-Control", "no-store")
       self.end_headers()
+      if not self.service.data_sharing_allowed():
+        self.close_connection = True
+        return
       self.wfile.write(jpeg)
     else:
       self.send_error(HTTPStatus.NOT_FOUND)
 
   def do_POST(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     path = urlparse(self.path).path
     try:
       length = int(self.headers.get("Content-Length", "0"))
@@ -554,6 +641,9 @@ class Handler(BaseHTTPRequestHandler):
       self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
   def do_DELETE(self) -> None:
+    if not self.service.data_sharing_allowed():
+      self.close_connection = True
+      return
     if urlparse(self.path).path != "/api/config":
       self.send_error(HTTPStatus.NOT_FOUND)
       return
@@ -574,6 +664,11 @@ def main() -> None:
     parser.error("port must be 1 through 65535")
 
   service, server = create_server(args.host, args.port, args.model)
+  if not service.data_sharing_allowed():
+    server.server_close()
+    service.running = False
+    print("Xiaoge vision server disabled: automatic third-party data sharing is off")
+    return
   print(f"Xiaoge vision server: http://{args.host}:{args.port}")
   try:
     server.serve_forever()
@@ -584,8 +679,21 @@ def main() -> None:
     service.running = False
 
 
-def create_server(host: str = HOST, port: int = PORT, model_path: Path = DEFAULT_MODEL_PATH) -> tuple[VASMService, ThreadingHTTPServer]:
-  service = VASMService(model_path)
+def create_server(
+  host: str = HOST,
+  port: int = PORT,
+  model_path: Path = DEFAULT_MODEL_PATH,
+  params: Params | None = None,
+  consent_generation: str | None = None,
+) -> tuple[VASMService, ThreadingHTTPServer]:
+  # Camera wakeups can leave receivers on camerad's isolated CPU, where realtime
+  # driving tasks take precedence. Set affinity before OpenCV creates workers so
+  # both inference and camera threads stay on the background cores.
+  if sys.platform == "linux":
+    from openpilot.common.realtime import set_core_affinity
+    set_core_affinity([0, 1, 2, 3])
+  cv2.setNumThreads(2)
+  service = VASMService(model_path, params, consent_generation)
   Handler.service = service
   server = ThreadingHTTPServer((host, port), Handler)
   threading.Thread(target=service.run_camera, daemon=True).start()

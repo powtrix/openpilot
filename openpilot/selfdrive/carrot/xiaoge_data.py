@@ -13,6 +13,10 @@ import openpilot.cereal.messaging as messaging
 from opendbc.can import CANParser
 
 from openpilot.cereal import car
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 
@@ -35,6 +39,7 @@ class XiaogeDataBroadcaster:
     self.vision_server = None
 
     self.params = Params()
+    self.consent_generation: str | None = None
     self.car_brand_checked = False
     self.is_tesla = False
     self.tesla_can_sock = None
@@ -61,9 +66,20 @@ class XiaogeDataBroadcaster:
       data.extend(packet)
     return bytes(data)
 
-  def send_packet_to_client(self, conn: socket.socket, packet: bytes) -> bool:
+  def send_packet_to_client(
+    self,
+    conn: socket.socket,
+    packet: bytes,
+    consent_generation: str | None = None,
+  ) -> bool:
+    if consent_generation is None:
+      consent_generation = third_party_data_sharing_generation(self.params)
     try:
+      if not third_party_data_sharing_generation_matches(consent_generation, self.params):
+        return False
       conn.sendall(struct.pack("!I", len(packet)))
+      if not third_party_data_sharing_generation_matches(consent_generation, self.params):
+        return False
       conn.sendall(packet)
       return True
     except OSError:
@@ -74,11 +90,16 @@ class XiaogeDataBroadcaster:
     with self.clients_lock:
       self.clients[addr] = conn
     try:
-      while self.server_running:
+      while (
+        self.server_running
+        and third_party_data_sharing_generation_matches(self.consent_generation, self.params)
+      ):
         command = self.recvall(conn, 4)
         if not command:
           break
         if struct.unpack("!I", command)[0] == 2:
+          if not third_party_data_sharing_generation_matches(self.consent_generation, self.params):
+            break
           conn.sendall(struct.pack("!I", 0))
     except OSError:
       pass
@@ -95,10 +116,15 @@ class XiaogeDataBroadcaster:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind(("0.0.0.0", self.tcp_port))
         server_socket.listen(5)
+        server_socket.settimeout(0.25)
         print(f"Xiaoge data TCP server listening on port {self.tcp_port}")
         while self.server_running:
           try:
             conn, addr = server_socket.accept()
+          except TimeoutError:
+            if not third_party_data_sharing_generation_matches(self.consent_generation, self.params):
+              break
+            continue
           except OSError:
             if self.server_running:
               raise
@@ -113,15 +139,19 @@ class XiaogeDataBroadcaster:
   def start_vision_server(self) -> None:
     from openpilot.selfdrive.carrot.xiaoge.v_asm_server import create_server
 
-    self.vision_service, self.vision_server = create_server()
+    self.vision_service, self.vision_server = create_server(
+      params=self.params,
+      consent_generation=self.consent_generation,
+    )
     print("Xiaoge vision server listening on port 8082")
     self.vision_server.serve_forever()
 
   def broadcast_to_clients(self, packet: bytes) -> None:
+    consent_generation = self.consent_generation
     with self.clients_lock:
       clients = dict(self.clients)
     for addr, conn in clients.items():
-      if not self.send_packet_to_client(conn, packet):
+      if not self.send_packet_to_client(conn, packet, consent_generation):
         with self.clients_lock:
           self.clients.pop(addr, None)
         conn.close()
@@ -222,12 +252,18 @@ class XiaogeDataBroadcaster:
     }).encode()
 
   def broadcast_data(self) -> None:
+    self.consent_generation = third_party_data_sharing_generation(self.params)
+    if self.consent_generation is None:
+      return
     self.server_running = True
     threading.Thread(target=self.start_tcp_server, daemon=True).start()
     threading.Thread(target=self.start_vision_server, daemon=True).start()
     rk = Ratekeeper(20, print_delay_threshold=None)
     try:
       while self.server_running:
+        consent_generation = self.consent_generation
+        if not third_party_data_sharing_generation_matches(consent_generation, self.params):
+          break
         self.sm.update(0)
         data: dict[str, Any] = {}
         if self.sm.alive["carState"]:
@@ -239,7 +275,8 @@ class XiaogeDataBroadcaster:
           data["modelV2"] = self.collect_model_data(self.sm["modelV2"])
         if self.sm.alive["selfdriveState"]:
           data["systemState"] = self.collect_system_state(self.sm["selfdriveState"])
-        self.broadcast_to_clients(self.create_packet(data))
+        if third_party_data_sharing_generation_matches(consent_generation, self.params):
+          self.broadcast_to_clients(self.create_packet(data))
         self.sequence += 1
         rk.keep_time()
     except KeyboardInterrupt:

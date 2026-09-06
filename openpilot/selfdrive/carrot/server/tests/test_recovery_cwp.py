@@ -69,8 +69,14 @@ def test_cwp_boot_sends_recovery_port(monkeypatch):
   )
   monkeypatch.setattr(recovery, "_local_ip", lambda: "192.168.0.5")
   monkeypatch.setattr(recovery, "_cwp_device_id", lambda: "device-id")
+  monkeypatch.setattr(recovery, "_community_data_sharing_generation", lambda: "generation-1")
+  monkeypatch.setattr(
+    recovery,
+    "_community_data_sharing_generation_matches",
+    lambda expected: expected == "generation-1",
+  )
   monkeypatch.setattr(recovery.time, "sleep", lambda _seconds: None)
-  monkeypatch.setattr(recovery, "_cwp_request", lambda path, payload: requests.append((path, payload)) or {
+  monkeypatch.setattr(recovery, "_cwp_request", lambda path, payload, **_kwargs: requests.append((path, payload)) or {
     "ok": True,
     "body": {"ok": True, "registered": True, "pushed": 1},
   })
@@ -120,6 +126,43 @@ def test_recovery_cwp_fails_closed_without_third_party_master_consent(monkeypatc
   status = recovery._cwp_status()
   assert status["ok"] is False
   assert status["disabled_by_community_sharing"] is True
+
+
+def test_recovery_cwp_boot_drops_stale_work_after_fast_off_on_cycle(monkeypatch):
+  state = {"generation": "generation-1"}
+  calls = []
+  monkeypatch.setattr(recovery, "_read_param", lambda key, default="": "1" if key == recovery.CWP_RECOVERY_BOOT_PARAM else default)
+  monkeypatch.setattr(recovery, "_community_data_sharing_generation", lambda: state["generation"])
+  monkeypatch.setattr(
+    recovery,
+    "_community_data_sharing_generation_matches",
+    lambda expected: expected == state["generation"],
+  )
+  monkeypatch.setattr(recovery, "_local_ip", lambda: "192.168.0.5")
+  monkeypatch.setattr(recovery, "_cwp_request", lambda *_args, **_kwargs: calls.append(True))
+
+  def cycle_consent(_seconds):
+    state["generation"] = "generation-2"
+
+  monkeypatch.setattr(recovery.time, "sleep", cycle_consent)
+
+  recovery._cwp_boot_worker(6999)
+
+  assert calls == []
+
+
+def test_recovery_cwp_rechecks_generation_at_urlopen_boundary(monkeypatch):
+  request = recovery.urllib.request.Request("https://example.invalid", data=b"private")
+  monkeypatch.setattr(
+    recovery.urllib.request,
+    "urlopen",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network called after revoke")),
+  )
+
+  result = recovery._request_result(request, 1, request_allowed=lambda: False)
+
+  assert result["ok"] is False
+  assert "no longer allowed" in result["error"]
 
 
 def test_recovery_page_has_short_cwp_toggle_states():

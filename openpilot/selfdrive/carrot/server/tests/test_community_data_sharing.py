@@ -12,6 +12,7 @@ from openpilot.system.manager import process_config
 class FakeParams:
   def __init__(self, sharing_value, values=None):
     self.sharing_value = sharing_value
+    self._dk_consent_generation = "generation-1"
     self.values = dict(values or {})
     self.values.setdefault(DK_THIRD_PARTY_DATA_SHARING_PARAM, True)
 
@@ -237,16 +238,23 @@ def test_popular_value_paths_recheck_consent_before_network(monkeypatch):
   monkeypatch.setattr(popular_values, "Params", lambda: params)
   monkeypatch.setattr(popular_values, "_popular_url", lambda params: "https://example.test/popular")
   monkeypatch.setattr(popular_values, "_snapshot_url", lambda params: "https://example.test/snapshot")
-  monkeypatch.setattr(popular_values, "_current_settings_hash", lambda: "hash")
-  monkeypatch.setattr(popular_values, "build_snapshot_payload", lambda: {"car_key": "CAR", "values": {}})
   monkeypatch.setattr(popular_values, "_request_headers", lambda params: {})
 
-  checks = iter([True, False])
-  monkeypatch.setattr(popular_values, "community_data_sharing_enabled", lambda params=None: next(checks))
+  def revoke_while_building_hash():
+    params._dk_consent_generation = "generation-2"
+    return "hash"
+
+  monkeypatch.setattr(popular_values, "_current_settings_hash", revoke_while_building_hash)
   assert asyncio.run(popular_values.download_popular_values_once(session)) is None
 
-  checks = iter([True, False])
-  monkeypatch.setattr(popular_values, "community_data_sharing_enabled", lambda params=None: next(checks))
+  params._dk_consent_generation = "generation-3"
+
+  def revoke_while_building_snapshot():
+    params._dk_consent_generation = "generation-4"
+    return {"car_key": "CAR", "values": {}}
+
+  monkeypatch.setattr(popular_values, "_current_settings_hash", lambda: "hash")
+  monkeypatch.setattr(popular_values, "build_snapshot_payload", revoke_while_building_snapshot)
   assert not asyncio.run(popular_values.popular_value_upload_once(session))
 
 
@@ -294,7 +302,8 @@ def _patch_notify_inputs(monkeypatch, gate_values):
   params = FakeParams(True, {"DongleId": "dongle"})
   monkeypatch.setattr(params_module, "Params", lambda: params)
   checks = iter(gate_values)
-  monkeypatch.setattr(auto_update, "community_data_sharing_enabled", lambda params=None: next(checks))
+  monkeypatch.setattr(auto_update, "community_data_sharing_generation", lambda params=None: "generation")
+  monkeypatch.setattr(auto_update, "community_data_sharing_generation_matches", lambda *_args: next(checks))
 
   async def fake_git(args, timeout):
     del timeout
@@ -312,7 +321,7 @@ def _patch_notify_inputs(monkeypatch, gate_values):
 
 
 def test_auto_update_notify_rechecks_consent_before_post(monkeypatch):
-  _patch_notify_inputs(monkeypatch, [True, False])
+  _patch_notify_inputs(monkeypatch, [False])
   calls = []
   monkeypatch.setattr(cweb_push, "post_json", lambda *args: calls.append(args) or (True, 200, "ok"))
 
@@ -321,7 +330,7 @@ def test_auto_update_notify_rechecks_consent_before_post(monkeypatch):
 
 
 def test_auto_update_notify_enabled_preserves_post(monkeypatch):
-  _patch_notify_inputs(monkeypatch, [True, True])
+  _patch_notify_inputs(monkeypatch, [True])
   calls = []
   monkeypatch.setattr(cweb_push, "post_json", lambda *args: calls.append(args) or (True, 200, "ok"))
 
