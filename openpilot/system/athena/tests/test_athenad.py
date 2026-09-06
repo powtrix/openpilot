@@ -17,6 +17,7 @@ from websocket._exceptions import WebSocketConnectionClosedException
 from openpilot.cereal import messaging
 
 from openpilot.common.params import Params
+from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.common.timeout import Timeout
 from openpilot.system.athena import athenad
 from openpilot.system.athena.athenad import MAX_RETRY_COUNT, UPLOAD_SESS, dispatcher
@@ -72,6 +73,7 @@ class TestAthenadMethods:
     }
 
     self.params = Params()
+    self.params.put_bool(DK_THIRD_PARTY_DATA_SHARING_PARAM, True)
     for k, v in self.default_params.items():
       self.params.put(k, v)
     self.params.put_bool("GsmMetered", True)

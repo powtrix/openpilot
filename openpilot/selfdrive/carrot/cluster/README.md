@@ -300,8 +300,11 @@ relaunch it with the new affinity/scheduler settings, without a whole system res
 Explicit `CLUSTER_REALTIME_CORES` or `CLUSTER_REALTIME_PRIORITY` environment
 values still override the corresponding Params.
 The HUD reads the local Git branch immediately on every platform and refreshes
-the upstream update state asynchronously at most every 60 seconds. The Git
-worker changes itself to `SCHED_OTHER` before `ls-remote`/`fetch`, so TICI does
+the advertised upstream head asynchronously at most every 60 seconds without
+fetching into the running checkout. If the advertised commit is not already in
+the local object store, the HUD conservatively reports one available update;
+otherwise it reports the exact behind count. The Git
+worker changes itself to `SCHED_OTHER` before the remote check, so TICI does
 not run those commands in the render process's FIFO scheduling class.
 Native H.264 callback output is queued as complete access units. The bounded
 queue retains the latest codec config, keyframe, and frame without waiting for

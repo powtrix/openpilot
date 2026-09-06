@@ -12,7 +12,8 @@ from collections.abc import Iterator
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.api import Api
-from openpilot.common.utils import get_upload_stream
+from openpilot.common.external_data import third_party_data_sharing_enabled
+from openpilot.common.utils import CallbackReader, get_upload_stream
 from openpilot.common.params import Params
 from openpilot.common.realtime import set_core_affinity
 from openpilot.system.hardware.hw import Paths
@@ -32,6 +33,15 @@ MAX_UPLOAD_SIZES = {
 allow_sleep = bool(int(os.getenv("UPLOADER_SLEEP", "1")))
 force_wifi = os.getenv("FORCEWIFI") is not None
 fake_upload = os.getenv("FAKEUPLOAD") is not None
+
+
+class AutomaticDataSharingDisabled(Exception):
+  pass
+
+
+def _require_third_party_data_sharing(params: Params) -> None:
+  if not third_party_data_sharing_enabled(params):
+    raise AutomaticDataSharingDisabled("automatic third-party data sharing is disabled")
 
 
 class FakeRequest:
@@ -142,6 +152,7 @@ class Uploader:
     return None
 
   def do_upload(self, key: str, fn: str):
+    _require_third_party_data_sharing(self.params)
     url_resp = self.api.get("v1.4/" + self.dongle_id + "/upload_url/", timeout=10, path=key, access_token=self.api.get_token())
     if url_resp.status_code == 412:
       return url_resp
@@ -157,14 +168,22 @@ class Uploader:
     stream = None
     try:
       compress = key.endswith('.zst') and not fn.endswith('.zst')
-      stream, _ = get_upload_stream(fn, compress)
-      response = requests.put(url, data=stream, headers=headers, timeout=10)
+      stream, content_length = get_upload_stream(fn, compress)
+      _require_third_party_data_sharing(self.params)
+      guarded_stream = CallbackReader(
+        stream,
+        lambda _current: _require_third_party_data_sharing(self.params),
+      )
+      headers = {**headers, "Content-Length": str(content_length)}
+      response = requests.put(url, data=guarded_stream, headers=headers, timeout=10)
       return response
     finally:
       if stream:
         stream.close()
 
   def upload(self, name: str, key: str, fn: str, network_type: int, metered: bool) -> bool:
+    if not third_party_data_sharing_enabled(self.params):
+      return False
     try:
       sz = os.path.getsize(fn)
     except OSError:
@@ -251,6 +270,9 @@ def main(exit_event: threading.Event | None = None) -> None:
 
   backoff = 0.1
   while not exit_event.is_set():
+    if not third_party_data_sharing_enabled(params):
+      exit_event.wait(1.0)
+      continue
     sm.update(0)
     offroad = params.get_bool("IsOffroad")
     network_type = sm['deviceState'].networkType if not force_wifi else NetworkType.wifi

@@ -66,10 +66,16 @@ QR_BACKUP_PYDEPS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "
 QR_BACKUP_WHEEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..", "third_party", "wheels"))
 _qr_dependency_lock = threading.Lock()
 VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
-BACKUP_EXCLUDED_PARAMS = frozenset({VALIDATION_AUTO_UPLOAD_PARAM})
+COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing"
+THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing"
+BACKUP_EXCLUDED_PARAMS = frozenset({
+  VALIDATION_AUTO_UPLOAD_PARAM,
+  COMMUNITY_DATA_SHARING_PARAM,
+  THIRD_PARTY_DATA_SHARING_PARAM,
+})
 
 
-def _validation_consent_is_disabled(value: Any) -> bool:
+def _explicit_consent_is_disabled(value: Any) -> bool:
   if value is False or value == 0:
     return True
   if isinstance(value, (bytes, bytearray, memoryview)):
@@ -86,7 +92,7 @@ def _validation_consent_is_disabled(value: Any) -> bool:
 
 
 def filter_param_values_for_backup(values: dict[str, Any]) -> dict[str, Any]:
-  """Keep explicit consent out of every portable settings representation."""
+  """Keep privacy consent out of every portable settings representation."""
   return {
     key: value
     for key, value in values.items()
@@ -390,13 +396,27 @@ def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]
 
 
 def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *,
-                    allow_validation_auto_upload_enable: bool = False) -> None:
+                    allow_validation_auto_upload_enable: bool = False,
+                    allow_community_data_sharing_enable: bool = False,
+                    allow_third_party_data_sharing_enable: bool = False) -> None:
   if (
     name == VALIDATION_AUTO_UPLOAD_PARAM
-    and not _validation_consent_is_disabled(value)
+    and not _explicit_consent_is_disabled(value)
     and not allow_validation_auto_upload_enable
   ):
     raise PermissionError("automatic validation log collection requires explicit consent")
+  if (
+    name == COMMUNITY_DATA_SHARING_PARAM
+    and not _explicit_consent_is_disabled(value)
+    and not allow_community_data_sharing_enable
+  ):
+    raise PermissionError("Carrot community data sharing requires explicit consent")
+  if (
+    name == THIRD_PARTY_DATA_SHARING_PARAM
+    and not _explicit_consent_is_disabled(value)
+    and not allow_third_party_data_sharing_enable
+  ):
+    raise PermissionError("automatic third-party data sharing requires explicit consent")
 
   if not HAS_PARAMS:
     _mem_store[name] = str(value)
@@ -534,7 +554,7 @@ def restore_param_values_from_backup(values: Dict[str, Any], source: str = "rest
   fails = []
 
   for key, value in values.items():
-    if key == VALIDATION_AUTO_UPLOAD_PARAM and not _validation_consent_is_disabled(value):
+    if key in BACKUP_EXCLUDED_PARAMS and not _explicit_consent_is_disabled(value):
       continue
     try:
       definition = definitions.get(key)
@@ -1297,7 +1317,7 @@ def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional
     type_name = "unknown"
     normalized_value: Any = raw_value
 
-    if key == VALIDATION_AUTO_UPLOAD_PARAM and not _validation_consent_is_disabled(raw_value):
+    if key in BACKUP_EXCLUDED_PARAMS and not _explicit_consent_is_disabled(raw_value):
       status = "skipped"
       reason = "explicit consent required"
       can_apply = False

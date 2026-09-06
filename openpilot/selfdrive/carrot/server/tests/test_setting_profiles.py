@@ -17,6 +17,8 @@ CATALOG = {
   "TFollowDecelBoost": {"default": 50, "min": 0, "max": 100},
   "CruiseSpeed1": {"default": 30, "min": 0, "max": 160},
   "CarrotValidationAutoUpload": {"default": 0, "min": 0, "max": 1},
+  "CarrotCommunityDataSharing": {"default": 0, "min": 0, "max": 1},
+  "DkThirdPartyDataSharing": {"default": 0, "min": 0, "max": 1},
 }
 
 
@@ -28,7 +30,7 @@ def profile_store(tmp_path, monkeypatch):
   # by_name is used, as the set of allowed parameter names.
   monkeypatch.setattr(setting_profiles, "get_settings_cached", lambda: (None, None, CATALOG, None))
   # No git and no live params in the test environment.
-  monkeypatch.setattr(setting_profiles, "read_git_profile_meta", lambda: {})
+  monkeypatch.setattr(setting_profiles, "read_git_profile_meta", dict)
   monkeypatch.setattr(setting_profiles, "snapshot_current_setting_values",
                       lambda: {"ApplyModelSpeed": 0, "TFollowDecelBoost": 50})
   return path
@@ -56,25 +58,40 @@ def test_unknown_parameters_are_dropped_from_stored_values(profile_store, monkey
   assert created["values"]["ApplyModelSpeed"] == 5
 
 
-def test_validation_consent_is_never_stored_or_returned_in_profiles(profile_store, monkeypatch):
+def test_privacy_consents_are_never_stored_or_returned_in_profiles(profile_store, monkeypatch):
   monkeypatch.setattr(
     setting_profiles,
     "snapshot_current_setting_values",
-    lambda: {"ApplyModelSpeed": 5, "CarrotValidationAutoUpload": 1},
+    lambda: {
+      "ApplyModelSpeed": 5,
+      "CarrotValidationAutoUpload": 1,
+      "CarrotCommunityDataSharing": 1,
+      "DkThirdPartyDataSharing": 1,
+    },
   )
   created = setting_profiles.create_setting_profile("p")
   assert created["values"] == {"ApplyModelSpeed": 5}
 
   updated = setting_profiles.update_setting_profile(
     created["id"],
-    {"values": {"CruiseSpeed1": 45, "CarrotValidationAutoUpload": 1}},
+    {"values": {
+      "CruiseSpeed1": 45,
+      "CarrotValidationAutoUpload": 1,
+      "CarrotCommunityDataSharing": 1,
+      "DkThirdPartyDataSharing": 1,
+    }},
   )
   assert updated["values"] == {"CruiseSpeed1": 45}
 
   profile_store.write_text(json.dumps({"profiles": [{
     "id": "stale",
     "name": "old",
-    "values": {"ApplyModelSpeed": 1, "CarrotValidationAutoUpload": 1},
+    "values": {
+      "ApplyModelSpeed": 1,
+      "CarrotValidationAutoUpload": 1,
+      "CarrotCommunityDataSharing": 1,
+      "DkThirdPartyDataSharing": 1,
+    },
   }]}), encoding="utf-8")
   assert setting_profiles.read_setting_profiles()["profiles"][0]["values"] == {"ApplyModelSpeed": 1}
 

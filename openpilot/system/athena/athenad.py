@@ -31,6 +31,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.api import Api, get_key_pair
+from openpilot.common.external_data import third_party_data_sharing_enabled
 from openpilot.common.utils import CallbackReader, get_upload_stream
 from openpilot.common.params import Params
 from openpilot.common.realtime import set_core_affinity
@@ -144,6 +145,11 @@ class AbortTransferException(Exception):
   pass
 
 
+def _require_third_party_data_sharing(params: Params | None = None) -> None:
+  if not third_party_data_sharing_enabled(params):
+    raise AbortTransferException("automatic third-party data sharing is disabled")
+
+
 class UploadQueueCache:
 
   @staticmethod
@@ -168,6 +174,7 @@ class UploadQueueCache:
 
 def handle_long_poll(ws: WebSocket, exit_event: threading.Event | None) -> None:
   end_event = threading.Event()
+  params = Params()
 
   threads = [
     threading.Thread(target=ws_manage, args=(ws, end_event), name='ws_manage'),
@@ -188,12 +195,19 @@ def handle_long_poll(ws: WebSocket, exit_event: threading.Event | None) -> None:
     thread.start()
   try:
     while not end_event.wait(0.1):
-      if exit_event is not None and exit_event.is_set():
+      if (
+        (exit_event is not None and exit_event.is_set())
+        or not third_party_data_sharing_enabled(params)
+      ):
         end_event.set()
   except (KeyboardInterrupt, SystemExit):
     end_event.set()
     raise
   finally:
+    try:
+      ws.close()
+    except Exception:
+      pass
     for thread in threads:
       cloudlog.debug(f"athena.joining {thread.name}")
       thread.join()
@@ -250,7 +264,7 @@ def cb(sm, item, tid, end_event: threading.Event, sz: int, cur: int) -> None:
       if sm['deviceState'].networkMetered:
         raise AbortTransferException
 
-  if end_event.is_set():
+  if end_event.is_set() or not third_party_data_sharing_enabled():
     raise AbortTransferException
 
   cur_upload_items[tid] = replace(item, progress=cur / sz if sz else 1)
@@ -258,9 +272,13 @@ def cb(sm, item, tid, end_event: threading.Event, sz: int, cur: int) -> None:
 
 def upload_handler(end_event: threading.Event) -> None:
   sm = messaging.SubMaster(['deviceState'])
+  params = Params()
   tid = threading.get_ident()
 
   while not end_event.is_set():
+    if not third_party_data_sharing_enabled(params):
+      end_event.wait(0.25)
+      continue
     cur_upload_items[tid] = None
 
     try:
@@ -285,6 +303,7 @@ def upload_handler(end_event: threading.Event) -> None:
         continue
 
       try:
+        _require_third_party_data_sharing(params)
         fn = item.path
         try:
           sz = os.path.getsize(fn)
@@ -315,6 +334,7 @@ def upload_handler(end_event: threading.Event) -> None:
 
 
 def _do_upload(upload_item: UploadItem, callback: Callable | None = None) -> requests.Response:
+  _require_third_party_data_sharing()
   path = upload_item.path
   compress = False
 
@@ -326,6 +346,7 @@ def _do_upload(upload_item: UploadItem, callback: Callable | None = None) -> req
   stream = None
   try:
     stream, content_length = get_upload_stream(path, compress)
+    _require_third_party_data_sharing()
     response = UPLOAD_SESS.put(upload_item.url,
                                data=CallbackReader(stream, callback, content_length) if callback else stream,
                                headers={**upload_item.headers, 'Content-Length': str(content_length)},
@@ -403,6 +424,7 @@ def uploadFileToUrl(fn: str, url: str, headers: dict[str, str]) -> UploadFilesTo
 
 @dispatcher.add_method
 def uploadFilesToUrls(files_data: list[UploadFileDict]) -> UploadFilesToUrlResponse:
+  _require_third_party_data_sharing()
   files = map(UploadFile.from_dict, files_data)
 
   items: list[UploadItemDict] = []
@@ -483,6 +505,7 @@ def setRouteViewed(route: str) -> dict[str, int | str]:
 
 def startLocalProxy(global_end_event: threading.Event, remote_ws_uri: str, local_port: int) -> dict[str, int]:
   try:
+    _require_third_party_data_sharing()
     # migration, can be removed once 0.9.8 is out for a while
     if local_port == 8022:
       local_port = 22
@@ -601,7 +624,11 @@ def log_handler(end_event: threading.Event) -> None:
 
   log_files = []
   last_scan = 0.
+  params = Params()
   while not end_event.is_set():
+    if not third_party_data_sharing_enabled(params):
+      end_event.wait(0.25)
+      continue
     try:
       curr_scan = time.monotonic()
       if curr_scan - last_scan > 10:
@@ -626,8 +653,9 @@ def log_handler(end_event: threading.Event) -> None:
               "jsonrpc": "2.0",
               "id": log_entry
             }
-            low_priority_send_queue.put_nowait(json.dumps(jsonrpc))
-            curr_log = log_entry
+            if third_party_data_sharing_enabled(params):
+              low_priority_send_queue.put_nowait(json.dumps(jsonrpc))
+              curr_log = log_entry
         except OSError:
           pass  # file could be deleted by log rotation
 
@@ -660,8 +688,12 @@ def log_handler(end_event: threading.Event) -> None:
 def stat_handler(end_event: threading.Event) -> None:
   STATS_DIR = Paths.stats_root()
   last_scan = 0.0
+  params = Params()
 
   while not end_event.is_set():
+    if not third_party_data_sharing_enabled(params):
+      end_event.wait(0.25)
+      continue
     curr_scan = time.monotonic()
     try:
       if curr_scan - last_scan > 10:
@@ -677,8 +709,9 @@ def stat_handler(end_event: threading.Event) -> None:
               "jsonrpc": "2.0",
               "id": stat_filenames[0]
             }
-            low_priority_send_queue.put_nowait(json.dumps(jsonrpc))
-          os.remove(stat_path)
+            if third_party_data_sharing_enabled(params):
+              low_priority_send_queue.put_nowait(json.dumps(jsonrpc))
+              os.remove(stat_path)
         last_scan = curr_scan
     except Exception:
       cloudlog.exception("athena.stat_handler.exception")
@@ -763,6 +796,9 @@ def ws_send(ws: WebSocket, end_event: threading.Event) -> None:
         data = send_queue.get_nowait()
       except queue.Empty:
         data = low_priority_send_queue.get(timeout=1)
+      if not third_party_data_sharing_enabled():
+        end_event.set()
+        break
       for i in range(0, len(data), WS_FRAME_SIZE):
         frame = data[i:i+WS_FRAME_SIZE]
         last = i + WS_FRAME_SIZE >= len(data)
@@ -812,6 +848,9 @@ def main(exit_event: threading.Event | None = None):
     cloudlog.exception("failed to set core affinity")
 
   params = Params()
+  if not third_party_data_sharing_enabled(params):
+    cloudlog.info("athenad disabled: automatic third-party data sharing is off")
+    return
   dongle_id = params.get("DongleId")
   UploadQueueCache.initialize(upload_queue)
 
@@ -820,12 +859,13 @@ def main(exit_event: threading.Event | None = None):
 
   conn_start = None
   conn_retries = 0
-  while exit_event is None or not exit_event.is_set():
+  while (exit_event is None or not exit_event.is_set()) and third_party_data_sharing_enabled(params):
     try:
       if conn_start is None:
         conn_start = time.monotonic()
 
       cloudlog.event("athenad.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries)
+      _require_third_party_data_sharing(params)
       ws = create_connection(ws_uri,
                              cookie="jwt=" + api.get_token(),
                              enable_multithread=True,
@@ -851,7 +891,10 @@ def main(exit_event: threading.Event | None = None):
       conn_retries += 1
       params.remove("LastAthenaPingTime")
 
-    time.sleep(backoff(conn_retries))
+    delay = backoff(conn_retries)
+    for _ in range(delay * 2):
+      if (exit_event is not None and exit_event.wait(0.5)) or not third_party_data_sharing_enabled(params):
+        return
 
 
 if __name__ == "__main__":

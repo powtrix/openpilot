@@ -78,8 +78,14 @@ test("all supported languages carry the complete one-time consent warning", asyn
   }
 });
 
-test("param writes include the same-origin JSON request marker", async () => {
+test("confirmed consent writes fetch and attach a one-use same-origin session", async () => {
   const source = await read("js/shared/api.js");
   assert.match(source, /"Content-Type": "application\/json"/);
   assert.match(source, /"X-Carrot-Web-Request": "1"/);
+  assert.match(source, /\/api\/web-consent\/session/);
+  assert.match(source, /headers\["X-Carrot-Web-Consent"\]/);
+  assert.match(source, /options\.webConsent === true/);
+
+  const settingsSource = await read("js/pages/setting.js");
+  assert.match(settingsSource, /paramCommitOptions\.webConsent = true/);
 });

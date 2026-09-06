@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -6,13 +7,14 @@ import pytest
 from opendbc.can import CANPacker, CANParser
 from opendbc.can.dbc import DBC
 from opendbc.can.parser import get_raw_value
-from opendbc.car import DT_CTRL, gen_empty_fingerprint
+from opendbc.car import Bus, DT_CTRL, gen_empty_fingerprint
+import opendbc.car.hyundai.carcontroller as hyundai_carcontroller
 import opendbc.car.hyundai.interface as hyundai_interface
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.tests.test_stock_scc_resume import build_control, build_controller, build_state
 from opendbc.car.hyundai.values import Buttons, CAR, HyundaiFlags, HyundaiSafetyFlags
 import opendbc.car.interfaces as car_interfaces
-from opendbc.car.structs import CarParams
+from opendbc.car.structs import CarControl, CarParams, CarState
 from opendbc.safety.tests.libsafety import libsafety_py
 
 
@@ -20,6 +22,7 @@ DBC_NAME = "hyundai_canfd_generated"
 SCC_CONTROL_FREQUENCY = 50
 CRUISE_BUTTONS_FREQUENCY = 50
 SCC_CONTROL_ADDRESS = 0x1A0
+ADRV_0X161_ADDRESS = 0x161
 CRUISE_BUTTONS_ADDRESS = 0x1CF
 CRUISE_BUTTONS_ALT_ADDRESS = 0x1AA
 
@@ -65,6 +68,117 @@ class InjectedButton:
 def decode_message(dbc: DBC, message_name: str, data: bytes) -> dict[str, int]:
   message = dbc.name_to_msg[message_name]
   return {name: get_raw_value(data, signal) for name, signal in message.sigs.items()}
+
+
+def build_full_hda1_ka4_controller(monkeypatch):
+  class TestParams:
+    @staticmethod
+    def get_int(key):
+      return {
+        "MaxAngleFrames": 89,
+        "CruiseButtonTest1": 8,
+        "CruiseButtonTest2": 30,
+        "CruiseButtonTest3": 1,
+      }.get(key, 0)
+
+    @staticmethod
+    def get_bool(_key):
+      return False
+
+    @staticmethod
+    def get_float(_key):
+      return 0.0
+
+    @staticmethod
+    def put_int_nonblocking(_key, _value):
+      pass
+
+  monkeypatch.setattr(hyundai_carcontroller, "Params", TestParams)
+  monkeypatch.setattr(hyundai_carcontroller.hyundaicanfd, "Params", TestParams)
+
+  CP = CarParams.new_message()
+  CP.carFingerprint = CAR.KIA_CARNIVAL_4TH_GEN
+  CP.flags = int(HyundaiFlags.CANFD | HyundaiFlags.RADAR_SCC | HyundaiFlags.CANFD_ALT_BUTTONS)
+  CP.pcmCruise = True
+  CP.openpilotLongitudinalControl = False
+  CP.wheelbase = 3.09
+  CP.steerRatio = 14.23
+  CP.init("safetyConfigs", 1)
+  CP.safetyConfigs[0].safetyModel = CarParams.SafetyModel.hyundaiCanfd
+  CP.safetyConfigs[0].safetyParam = int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS)
+  controller = hyundai_carcontroller.CarController({Bus.pt: DBC_NAME}, CP.as_reader())
+
+  dbc = DBC(DBC_NAME)
+  packer = CANPacker(DBC_NAME)
+  raw_adrv = packer.make_can_msg("ADRV_0x161", controller.CAN.CAM, {
+    "COUNTER": 17,
+    "LFA_ICON": 0,
+    "LKA_ICON": 0,
+    "ALERTS_1": 1,
+    "ALERTS_2": 21,
+    "ALERTS_3": 26,
+    "ALERTS_5": 5,
+    "MUTE": 1,
+    "DAW_ICON": 2,
+    "SOUNDS_1": 1,
+    "SOUNDS_2": 2,
+    "SOUNDS_3": 3,
+    "SOUNDS_4": 4,
+  })
+  adrv_values = decode_message(dbc, "ADRV_0x161", raw_adrv[1])
+
+  raw_button = packer.make_can_msg("CRUISE_BUTTONS_ALT", controller.CAN.ECAN, {
+    "COUNTER": 4,
+    "CRUISE_BUTTONS": Buttons.NONE,
+    "DISTANCE_UNIT": 1,
+    "NEW_SIGNAL_5": 2,
+    "SET_ME_2": 3,
+  })
+  button_values = decode_message(dbc, "CRUISE_BUTTONS_ALT", raw_button[1])
+
+  car_state = CarState.new_message()
+  car_state.standstill = True
+  car_state.canValid = True
+  car_state.latEnabled = True
+  car_state.cruiseState.enabled = True
+  car_state.cruiseState.speed = 80 / 3.6
+  CS = SimpleNamespace(
+    out=car_state.as_reader(),
+    is_metric=True,
+    modelV2=None,
+    scc_control={
+      "InfoDisplay": 0,
+      "ACCMode": 1,
+      "ACC_ObjDist": 5.0,
+      "ACC_ObjRelSpd": 0.0,
+      "HUD_LEAD_INFO": 2,
+      "SysFailState": 0,
+      "TakeOverReq": 0,
+    },
+    adrv_0x161=adrv_values,
+    lfahda_cluster=None,
+    buttons_counter=button_values["COUNTER"],
+    cruise_buttons_msg=button_values,
+    cruise_buttons=deque([Buttons.NONE]),
+    main_buttons=deque([Buttons.NONE]),
+  )
+
+  car_control = CarControl.new_message()
+  car_control.enabled = True
+  car_control.latActive = True
+  car_control.hudControl.setSpeed = 80 / 3.6
+  car_control.hudControl.leadVisible = True
+  car_control.hudControl.leadRadar = 1
+  car_control.hudControl.leadDistance = 5.0
+  CC = car_control.as_reader()
+  return controller, CC, CS, car_state, dbc, raw_adrv
+
+
+def get_adrv_0x161(messages, dbc):
+  matches = [message for message in messages if message[0] == ADRV_0X161_ADDRESS]
+  assert len(matches) == 1
+  assert matches[0][2] == 0
+  return matches[0], decode_message(dbc, "ADRV_0x161", matches[0][1])
 
 
 class Ka4StockSccReplay:
@@ -214,6 +328,68 @@ def test_ka4_public_reference_uses_crc_protected_alt_button_payload():
 
   checksum = message.sigs["CHECKSUM"]
   assert values["CHECKSUM"] == checksum.calc_checksum(message.address, checksum, bytearray(KA4_ALT_BUTTON_PUBLIC_SAMPLE))
+
+
+def test_ka4_hda1_full_controller_update_masks_and_restores_real_adrv(monkeypatch):
+  controller, CC, CS, car_state, dbc, raw_adrv = build_full_hda1_ka4_controller(monkeypatch)
+  assert controller.ka4_stock_scc_standstill_rearm
+  assert controller.CAN.ECAN == 0
+  assert controller.CAN.CAM == 2
+
+  _, messages = controller.update(CC, CS, 0)
+  masked_message, masked = get_adrv_0x161(messages, dbc)
+  assert masked["ALERTS_5"] == 0
+  assert masked["COUNTER"] == 18
+  checksum = dbc.name_to_msg["ADRV_0x161"].sigs["CHECKSUM"]
+  assert masked["CHECKSUM"] == checksum.calc_checksum(
+    masked_message[0], checksum, bytearray(masked_message[1]),
+  )
+  for signal in (
+    "ALERTS_1", "ALERTS_2", "ALERTS_3", "MUTE", "DAW_ICON",
+    "SOUNDS_1", "SOUNDS_2", "SOUNDS_3", "SOUNDS_4",
+  ):
+    assert masked[signal] == CS.adrv_0x161[signal]
+
+  # The accepted ECAN replacement suppresses the raw camera-side ADRV frame
+  # inside Panda's 20 Hz forwarding timeout, so the masked payload is the one
+  # that reaches the vehicle side of the HDA1 harness.
+  safety = libsafety_py.libsafety
+  assert safety.set_safety_hooks(
+    CarParams.SafetyModel.hyundaiCanfd, int(HyundaiSafetyFlags.CANFD_ALT_BUTTONS),
+  ) == 0
+  safety.init_tests()
+  safety.set_timer(1_000_000)
+  assert safety.safety_tx_hook(libsafety_py.make_CANPacket(masked_message[0], masked_message[2], masked_message[1]))
+  safety.set_timer(1_069_999)
+  assert safety.safety_fwd_hook(libsafety_py.make_CANPacket(raw_adrv[0], raw_adrv[2], raw_adrv[1])) == -1
+  safety.set_timer(1_070_000)
+  assert safety.safety_fwd_hook(libsafety_py.make_CANPacket(raw_adrv[0], raw_adrv[2], raw_adrv[1])) == 0
+
+  # A driver brake interlock restores the exact OEM prompt through the same
+  # full controller and real DBC path.
+  car_state.brakePressed = True
+  CS.out = car_state.as_reader()
+  controller.frame = 5
+  _, messages = controller.update(CC, CS, 0)
+  _, restored = get_adrv_0x161(messages, dbc)
+  assert restored["ALERTS_5"] == 5
+
+  # Establish a fresh qualified stop through the full update path, then verify
+  # the exclusive 30.00-second boundary on actual packed ADRV frames.
+  controller, CC, CS, _, dbc, _ = build_full_hda1_ka4_controller(monkeypatch)
+  for _ in range(31):
+    controller.update(CC, CS, 0)
+  assert controller.stock_scc_stop_start_frame == 0
+
+  controller.frame = 2995
+  _, messages = controller.update(CC, CS, 0)
+  _, before_boundary = get_adrv_0x161(messages, dbc)
+  assert before_boundary["ALERTS_5"] == 0
+
+  controller.frame = 3000
+  _, messages = controller.update(CC, CS, 0)
+  _, at_boundary = get_adrv_0x161(messages, dbc)
+  assert at_boundary["ALERTS_5"] == 5
 
 
 @pytest.mark.parametrize("ecan_bus", [0, 4], ids=["single-panda", "second-panda-offset"])

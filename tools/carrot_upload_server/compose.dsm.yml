@@ -1,12 +1,16 @@
 services:
-  carrot-upload:
+  dk-upload:
+    container_name: dk-upload
     build: .
-    image: carrot-upload:1.2.0
+    image: dk-upload:2.0.0
     restart: unless-stopped
     init: true
     environment:
       CARROT_UPLOAD_ROOT: /data/openpilot
-      CARROT_UPLOAD_DB: /data/openpilot/tmux/.state/uploads.sqlite3
+      CARROT_UPLOAD_DB: /data/state/uploads.sqlite3
+      CARROT_ALLOWED_DEVICE_IDS: "${DK_UPLOAD_ALLOWED_DEVICE_ID:?set the private device ID}"
+      CARROT_ALLOWED_DEVICE_PUBLIC_KEY_SHA256: "${DK_UPLOAD_ALLOWED_DEVICE_ID:?set the private device ID}=${DK_UPLOAD_DEVICE_PUBLIC_KEY_SHA256:?set the exact lowercase SHA-256 SPKI fingerprint}"
+      CARROT_LEGACY_UPLOADS_ENABLED: "false"
       CARROT_DAILY_DEVICE_QUOTA_BYTES: "1073741824"
       CARROT_DAILY_IP_QUOTA_BYTES: "8589934592"
       CARROT_MAX_FILE_BYTES: "536870912"
@@ -30,12 +34,8 @@ services:
       CARROT_PROGRESS_COMMIT_INTERVAL_SECONDS: "1"
       CARROT_VALIDATION_CHALLENGE_TTL_SECONDS: "300"
       CARROT_VALIDATION_SESSION_TTL_SECONDS: "1800"
-      CARROT_VALIDATION_IDENTITY_MAX_LIFETIME_SECONDS: "600"
-      CARROT_VALIDATION_IDENTITY_CLOCK_SKEW_SECONDS: "30"
-      CARROT_VALIDATION_AUDIENCE: "https://upload.shind0.synology.me/api/v1/validation"
-      CARROT_VALIDATION_VERIFY_URL_TEMPLATE: "https://api.commadotai.com/v1.1/devices/{device_id}/"
+      CARROT_VALIDATION_AUDIENCE: "https://adot.synology.me/api/v1/validation"
       CARROT_VALIDATION_VERIFY_TIMEOUT_SECONDS: "5"
-      CARROT_VALIDATION_VERIFY_CONNECT_TIMEOUT_SECONDS: "3"
       CARROT_VALIDATION_VERIFY_CONCURRENT: "4"
       CARROT_VALIDATION_VERIFY_ATTEMPT_LIMIT: "5"
       CARROT_VALIDATION_VERIFY_COOLDOWN_SECONDS: "2"
@@ -45,11 +45,10 @@ services:
       CARROT_CLEANUP_INTERVAL_SECONDS: "900"
     ports:
       - "127.0.0.1:18080:8080"
-    user: "1026:100"
-    group_add:
-      - "101"
+    user: "10001:10001"
     volumes:
-      - /volume1/openpilot:/data/openpilot
+      - /volume1/openpilot/.carrot-validation-v1:/data/openpilot/.carrot-validation-v1:rw
+      - /volume1/docker/dk-upload/state:/data/state:rw
     read_only: true
     tmpfs:
       - /tmp:size=64m
@@ -58,3 +57,32 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.5
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 4096
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          d=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health', timeout=2));
+          assert d.get('ok') is True and d.get('service') == 'dk-upload'
+          and d.get('deviceAllowlistConfigured') is True
+          and d.get('deviceKeyPinsConfigured') is True
+          and d.get('legacyUploadsEnabled') is False
+          and d.get('storageWritable') is True
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

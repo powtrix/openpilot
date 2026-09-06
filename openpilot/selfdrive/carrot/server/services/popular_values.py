@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 
 from aiohttp import ClientSession
 
+from ...community_data import community_data_sharing_enabled
 from .params import HAS_PARAMS, Params, get_param_values, infer_type_from_setting
 from .settings import get_settings_cached
 
@@ -348,7 +349,16 @@ def _request_headers(params: Params | None = None) -> dict[str, str]:
   return headers
 
 
-async def _post_snapshot(session: ClientSession, url: str, payload: dict[str, Any], timeout_s: float, headers: dict[str, str]) -> tuple[bool, int, str]:
+async def _post_snapshot(
+  session: ClientSession,
+  url: str,
+  payload: dict[str, Any],
+  timeout_s: float,
+  headers: dict[str, str],
+  params: Params,
+) -> tuple[bool, int, str]:
+  if not community_data_sharing_enabled(params):
+    return False, 0, "community data sharing disabled"
   try:
     async with session.post(url, json=payload, timeout=timeout_s, headers=headers) as resp:
       text = await resp.text()
@@ -361,6 +371,8 @@ async def download_popular_values_once(session: ClientSession) -> dict[str, Any]
   if not HAS_PARAMS:
     return None
   params = Params()
+  if not community_data_sharing_enabled(params):
+    return None
   url = _popular_url(params)
   car_key = _param_text(params, "CarSelected3")
   settings_hash = _current_settings_hash()
@@ -369,6 +381,8 @@ async def download_popular_values_once(session: ClientSession) -> dict[str, Any]
 
   timeout_s = max(1.0, _env_float("CARROT_PARAM_VALUE_TIMEOUT_S", DEFAULT_TIMEOUT_S))
   try:
+    if not community_data_sharing_enabled(params):
+      return None
     async with session.get(
       url,
       params={"car_key_type": "CarSelected3", "car_key": car_key, "settings_hash": settings_hash},
@@ -394,6 +408,8 @@ async def popular_value_upload_once(session: ClientSession) -> bool:
   if not HAS_PARAMS:
     return False
   params = Params()
+  if not community_data_sharing_enabled(params):
+    return False
   url = _snapshot_url(params)
   if not url:
     return False
@@ -412,7 +428,9 @@ async def popular_value_upload_once(session: ClientSession) -> bool:
 
   headers = _request_headers(params)
   for attempt in range(1, retry_count + 1):
-    ok, status, body = await _post_snapshot(session, url, payload, timeout_s, headers)
+    if not community_data_sharing_enabled(params):
+      return False
+    ok, status, body = await _post_snapshot(session, url, payload, timeout_s, headers, params)
     if ok:
       print(
         f"[carrot_param_value] uploaded car_key={payload.get('car_key')} params={len(payload.get('values') or {})}",
@@ -438,7 +456,7 @@ async def refresh_popular_values_once(session: ClientSession, *, upload: bool = 
 
 def start_popular_value_upload(app: Any) -> asyncio.Task | None:
   session = app.get("http")
-  if session is None:
+  if session is None or not community_data_sharing_enabled():
     return None
   return asyncio.create_task(refresh_popular_values_once(session, upload=True))
 
@@ -454,6 +472,8 @@ def schedule_popular_value_refresh(app: Any, min_interval: float | None = None) 
   reflects fleet changes within ~min_interval, without polling or websockets.
   Does NOT re-upload (that only happens once at boot)."""
   global _popular_refresh_last_at, _popular_refresh_task
+  if not community_data_sharing_enabled():
+    return
   session = app.get("http")
   if session is None:
     return

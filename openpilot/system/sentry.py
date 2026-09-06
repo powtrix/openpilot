@@ -1,8 +1,10 @@
 """Install exception handler for process crash."""
 import sentry_sdk
 from enum import Enum
+from typing import Any
 from sentry_sdk.integrations.threading import ThreadingIntegration
 
+from openpilot.common.external_data import third_party_data_sharing_enabled
 from openpilot.common.params import Params
 from openpilot.system.athena.registration import is_registered_device
 from openpilot.system.hardware import HARDWARE, PC
@@ -17,8 +19,26 @@ class SentryProject(Enum):
   SELFDRIVE_NATIVE = "https://3e4b586ed21a4479ad5d85083b639bc6@o33823.ingest.sentry.io/157615"
 
 
+def _before_send(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
+  """Recheck consent after event enrichment, immediately before SDK transport."""
+  try:
+    return event if third_party_data_sharing_enabled() else None
+  except Exception:
+    return None
+
+
+def _ensure_initialized(project: SentryProject) -> bool:
+  if sentry_sdk.is_initialized():
+    return True
+  return init(project)
+
+
 def report_tombstone(fn: str, message: str, contents: str) -> None:
   cloudlog.error({'tombstone': message})
+  if not third_party_data_sharing_enabled():
+    return
+  if not _ensure_initialized(SentryProject.SELFDRIVE_NATIVE):
+    return
 
   with sentry_sdk.configure_scope() as scope:
     scope.set_extra("tombstone_fn", fn)
@@ -32,6 +52,10 @@ def capture_exception(*args, **kwargs) -> None:
   params = Params()
   if not params.get_bool("CarrotExceptionSent"):
     params.put("CarrotException", "exception")
+  if not third_party_data_sharing_enabled(params):
+    return
+  if not _ensure_initialized(SentryProject.SELFDRIVE):
+    return
 
   try:
     sentry_sdk.capture_exception(*args, **kwargs)
@@ -45,6 +69,8 @@ def set_tag(key: str, value: str) -> None:
 
 
 def init(project: SentryProject) -> bool:
+  if not third_party_data_sharing_enabled():
+    return False
   build_metadata = get_build_metadata()
   # forks like to mess with this, so double check
   comma_remote = build_metadata.openpilot.comma_remote and "commaai" in build_metadata.openpilot.git_origin
@@ -62,6 +88,8 @@ def init(project: SentryProject) -> bool:
                   default_integrations=False,
                   release=get_version(),
                   integrations=integrations,
+                  before_send=_before_send,
+                  before_send_transaction=_before_send,
                   traces_sample_rate=1.0,
                   max_value_length=8192,
                   environment=env)

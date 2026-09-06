@@ -46,6 +46,8 @@ const settingProfileSectionExpandedState = new Map();
 const settingProfileMenuActions = new WeakMap();
 const settingProfileMenuControllers = new Map();
 let settingSoundSampleAudio = null;
+const THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing";
+const COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing";
 const VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload";
 let validationUploadStatusRequestSequence = 0;
 
@@ -121,6 +123,34 @@ function confirmValidationUploadEnable() {
     {
       title: getUIText("validation_upload_enable_title", "Automatic validation upload consent"),
       confirmLabel: getUIText("validation_upload_enable", "Agree & enable"),
+      cancelLabel: getUIText("cancel", "Cancel"),
+    },
+  );
+}
+
+function confirmCommunityDataSharingEnable() {
+  return appConfirm(
+    getUIText(
+      "community_data_sharing_enable_confirm",
+      "Enable Carrot community data sharing? Device identifiers, network status, settings, automatic tmux diagnostics, and support metadata may be exchanged with Carrot community services without per-file confirmation. KA4 automatic validation upload remains controlled by its separate consent below.",
+    ),
+    {
+      title: getUIText("community_data_sharing_enable_title", "Carrot community data-sharing consent"),
+      confirmLabel: getUIText("community_data_sharing_enable", "Agree & enable"),
+      cancelLabel: getUIText("cancel", "Cancel"),
+    },
+  );
+}
+
+function confirmThirdPartyDataSharingEnable() {
+  return appConfirm(
+    getUIText(
+      "third_party_data_sharing_enable_confirm",
+      "Enable automatic third-party diagnostics and data sharing? This reconnects comma remote services and permits automatic diagnostic logs, statistics, remote log requests, Prime/Firehose status checks, and separately enabled Carrot community sharing. Local recording, private-NAS KA4 validation, explicitly started personal-NAS/manual dashcam uploads, Git updates, and navigation/maps remain independent.",
+    ),
+    {
+      title: getUIText("third_party_data_sharing_enable_title", "Automatic external data-sharing consent"),
+      confirmLabel: getUIText("third_party_data_sharing_enable", "Agree & enable"),
       cancelLabel: getUIText("cancel", "Cancel"),
     },
   );
@@ -2772,9 +2802,13 @@ async function renderItems(group, options = {}) {
 
     async function commitSettingValue(next, commitOptions = {}) {
       const previous = val.dataset.committedValue ?? val.dataset.rawValue ?? String(p.default);
-      const validationConsentConfirmed = commitOptions.validationConsentConfirmed === true;
+      let validationConsentConfirmed = commitOptions.validationConsentConfirmed === true;
+      let communityConsentConfirmed = commitOptions.communityConsentConfirmed === true;
+      let thirdPartyConsentConfirmed = commitOptions.thirdPartyConsentConfirmed === true;
       const paramCommitOptions = { ...commitOptions };
       delete paramCommitOptions.validationConsentConfirmed;
+      delete paramCommitOptions.communityConsentConfirmed;
+      delete paramCommitOptions.thirdPartyConsentConfirmed;
       if (
         !profile
         && name === VALIDATION_AUTO_UPLOAD_PARAM
@@ -2787,6 +2821,44 @@ async function renderItems(group, options = {}) {
           if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
           return false;
         }
+        validationConsentConfirmed = true;
+      }
+      if (
+        !profile
+        && name === COMMUNITY_DATA_SHARING_PARAM
+        && Number(next) === 1
+        && String(previous) !== "1"
+        && !communityConsentConfirmed
+      ) {
+        if (!await confirmCommunityDataSharingEnable()) {
+          syncSettingControlState(el, previous);
+          return false;
+        }
+        communityConsentConfirmed = true;
+      }
+      if (
+        !profile
+        && name === THIRD_PARTY_DATA_SHARING_PARAM
+        && Number(next) === 1
+        && String(previous) !== "1"
+        && !thirdPartyConsentConfirmed
+      ) {
+        if (!await confirmThirdPartyDataSharingEnable()) {
+          syncSettingControlState(el, previous);
+          return false;
+        }
+        thirdPartyConsentConfirmed = true;
+      }
+      if (
+        !profile
+        && Number(next) === 1
+        && (
+          (name === VALIDATION_AUTO_UPLOAD_PARAM && validationConsentConfirmed)
+          || (name === COMMUNITY_DATA_SHARING_PARAM && communityConsentConfirmed)
+          || (name === THIRD_PARTY_DATA_SHARING_PARAM && thirdPartyConsentConfirmed)
+        )
+      ) {
+        paramCommitOptions.webConsent = true;
       }
       try {
         let committed = next;
@@ -2930,16 +3002,31 @@ async function renderItems(group, options = {}) {
         const previous = val.dataset.committedValue ?? val.dataset.rawValue ?? String(p.default);
         toggleInput.disabled = true;
         try {
-          const requiresConfirmation = name === VALIDATION_AUTO_UPLOAD_PARAM
+          const requiresValidationConfirmation = name === VALIDATION_AUTO_UPLOAD_PARAM
             && next === 1
             && String(previous) !== "1";
+          const requiresCommunityConfirmation = name === COMMUNITY_DATA_SHARING_PARAM
+            && next === 1
+            && String(previous) !== "1";
+          const requiresThirdPartyConfirmation = name === THIRD_PARTY_DATA_SHARING_PARAM
+            && next === 1
+            && String(previous) !== "1";
+          const requiresConfirmation = requiresValidationConfirmation
+            || requiresCommunityConfirmation
+            || requiresThirdPartyConfirmation;
           const result = await settingToggleRuntime.commit({
             next,
             previous,
             requiresConfirmation,
-            confirm: confirmValidationUploadEnable,
+            confirm: requiresThirdPartyConfirmation
+              ? confirmThirdPartyDataSharingEnable
+              : (requiresCommunityConfirmation
+                ? confirmCommunityDataSharingEnable
+                : confirmValidationUploadEnable),
             commit: () => commitSettingValue(next, {
-              validationConsentConfirmed: requiresConfirmation,
+              validationConsentConfirmed: requiresValidationConfirmation,
+              communityConsentConfirmed: requiresCommunityConfirmation,
+              thirdPartyConsentConfirmed: requiresThirdPartyConfirmation,
             }),
             restore: (committedValue) => {
               syncSettingControlState(el, committedValue);

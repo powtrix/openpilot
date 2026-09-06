@@ -9,6 +9,8 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout
 
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
+
 from .params import get_param_values
 
 try:
@@ -40,6 +42,8 @@ def support_discord_webhook_url() -> str:
     value = os.environ.get(key, "").strip()
     if value:
       return value
+  if not community_data_sharing_enabled():
+    return ""
   return _decode_obfuscated_webhook_url()
 
 
@@ -163,6 +167,18 @@ async def send_support_webhook(session: ClientSession | None, payload: dict[str,
     return {"configured": False, "ok": False, "skipped": True}
   if not url.startswith(("http://", "https://")):
     return {"configured": True, "ok": False, "error": "invalid webhook url"}
+  # A custom operator-provided webhook is outside the Carrot community
+  # consent. The bundled community webhook must be rechecked immediately
+  # before the request in case consent changed while the support tunnel was
+  # starting.
+  default_url = _decode_obfuscated_webhook_url()
+  if url == default_url and not community_data_sharing_enabled():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_community_sharing": True,
+    }
 
   body = {
     "username": "Carrot Support",
@@ -174,6 +190,13 @@ async def send_support_webhook(session: ClientSession | None, payload: dict[str,
   if session is None:
     session = ClientSession(timeout=ClientTimeout(total=12))
   try:
+    if url == default_url and not community_data_sharing_enabled():
+      return {
+        "configured": True,
+        "ok": False,
+        "skipped": True,
+        "disabled_by_community_sharing": True,
+      }
     async with session.post(url, json=body) as resp:
       text = await resp.text()
       if 200 <= resp.status < 300:

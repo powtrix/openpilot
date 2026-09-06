@@ -75,7 +75,7 @@ def test_longitudinal_comfort_settings_use_driver_facing_language(params):
   lead_accel_response = by_name["LeadAccelResponse"]
   assert (lead_accel_response["min"], lead_accel_response["max"], lead_accel_response["default"]) == (0, 5, 0)
   assert lead_accel_response["control"] == "select"
-  assert "차간거리 1단계" in lead_accel_response["descr"]
+  assert "모든 차간거리 단계" in lead_accel_response["descr"]
   assert "170/130/80/36/10" in lead_accel_response["descr"]
   assert "95/80/60/35/15%" in lead_accel_response["descr"]
   assert "MPC 뒤에 가속을 별도로 더하지 않으며" in lead_accel_response["descr"]
@@ -187,22 +187,14 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
-def test_ka4_stock_scc_standstill_extension_is_explicit_opt_in(settings, params):
+def test_ka4_stock_scc_standstill_extension_is_automatic_not_user_configurable(settings, params):
   by_name = {p["name"]: p for p in params}
-  rearm = by_name["Ka4StockSccStandstillRearm"]
-  assert (rearm["min"], rearm["max"], rearm["default"]) == (0, 1, 0)
-  assert rearm["control"] == "toggle"
-  assert rearm["risk"] == "high"
-  assert "검증 대상: 2023년식" in rearm["descr"]
-  assert "주차된 상태" in rearm["descr"]
-  assert "30초" in rearm["descr"]
-  assert "시도" in rearm["descr"]
-  assert "in an attempt" in rearm["edescr"]
+  assert "Ka4StockSccStandstillRearm" not in by_name
 
   driving = next(category for category in settings["menu"] if category["id"] == "DRIVING")
   start_auto = next(group for group in driving["groups"] if group["id"] == "START_AUTO")
   auto_cruise = next(group for group in start_auto["groups"] if group["id"] == "BASIC_AUTOCRUISE")
-  assert "Ka4StockSccStandstillRearm" in auto_cruise["params"]
+  assert "Ka4StockSccStandstillRearm" not in auto_cruise["params"]
 
   params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
   assert '{"Ka4StockSccStandstillRearm", {PERSISTENT, INT, "0"}}' in params_keys
@@ -223,9 +215,11 @@ def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params
   assert "일반 전송 목적지로 우회할 수 없습니다" in auto_upload["descr"]
   assert "모바일 데이터" in auto_upload["descr"]
   assert "WPA2/WPA3" in auto_upload["descr"]
+  assert "단방향 해시" in auto_upload["descr"]
   assert "No vehicle-control setting is changed" in auto_upload["edescr"]
   assert "no per-log confirmation" in auto_upload["edescr"]
   assert "ordinary Carrot Web upload destination cannot redirect" in auto_upload["edescr"]
+  assert "one-way hash" in auto_upload["edescr"]
   disclosure_fragments = {
     "descr": [
       "캡처당 주변 full rlog 최대 3개", "최대 14개 캡처/42개 full rlog", "최대 5개 캡처/750 MiB",
@@ -249,6 +243,73 @@ def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params
 
   params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
   assert '{"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}}' in params_keys
+
+
+def test_carrot_community_data_sharing_is_explicit_opt_in(settings, params):
+  by_name = {p["name"]: p for p in params}
+  sharing = by_name["CarrotCommunityDataSharing"]
+  assert (sharing["min"], sharing["max"], sharing["default"]) == (0, 1, 0)
+  assert sharing["control"] == "toggle"
+  assert sharing["risk"] == "high"
+  for fragment in (
+    "장치 식별자", "로컬 네트워크 주소", "전체 설정값", "자동 onroad·예외 tmux",
+    "기본 Discord", "모바일 데이터", "KA4 자동 검증 로그 전송", "백업·프로필·QR",
+    "DK 외부 자동 로그·진단 공유",
+  ):
+    assert fragment in sharing["descr"]
+  for fragment in (
+    "device identifiers", "local network address", "all setting values",
+    "automatic onroad and exception tmux", "bundled Discord", "mobile data",
+    "KA4 automatic validation upload", "backups, profiles, and QR", "master consent",
+  ):
+    assert fragment in sharing["edescr"]
+
+  system = next(category for category in settings["menu"] if category["id"] == "SYSTEM")
+  record = next(group for group in system["groups"] if group["id"] == "SYS_RECORD")
+  basic = next(group for group in record["groups"] if group["id"] == "SYS_RECORD_BASIC")
+  assert basic["params"] == [
+    "RecordRoadCam",
+    "DkThirdPartyDataSharing",
+    "CarrotCommunityDataSharing",
+    "CarrotValidationAutoUpload",
+    "MaxTimeOffroadMin",
+  ]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"CarrotCommunityDataSharing", {PERSISTENT, BOOL, "0"}}' in params_keys
+
+
+def test_dk_third_party_data_sharing_is_high_risk_master_opt_in(settings, params):
+  by_name = {p["name"]: p for p in params}
+  sharing = by_name["DkThirdPartyDataSharing"]
+  assert (sharing["min"], sharing["max"], sharing["default"]) == (0, 1, 0)
+  assert sharing["control"] == "toggle"
+  assert sharing["risk"] == "high"
+
+  disclosure_fragments = {
+    "descr": [
+      "전체 상위 동의", "기본값은 꺼짐", "Athena", "cloudlog", "위치", "rlog/qlog/qcamera",
+      "원격 SSH", "Prime/Firehose", "Sentry", "stock uploader", "Carrot 커뮤니티 데이터 공유",
+      "기존 Athena 업로드 큐", "KA4 자동 검증 로그", "백업·프로필·QR", "주행 제어 설정은 바뀌지 않습니다",
+    ],
+    "edescr": [
+      "Master consent", "off by default", "Athena", "cloudlogs", "location", "rlog, qlog, qcamera",
+      "remote SSH", "Prime and Firehose", "Sentry", "stock uploader", "Carrot Community Data Sharing",
+      "old Athena upload queue", "KA4 automatic validation", "backups, profiles, and QR",
+      "No vehicle-control setting is changed",
+    ],
+  }
+  for field, fragments in disclosure_fragments.items():
+    for fragment in fragments:
+      assert fragment in sharing[field], f"{field}: {fragment}"
+
+  system = next(category for category in settings["menu"] if category["id"] == "SYSTEM")
+  record = next(group for group in system["groups"] if group["id"] == "SYS_RECORD")
+  basic = next(group for group in record["groups"] if group["id"] == "SYS_RECORD_BASIC")
+  assert basic["params"].index("DkThirdPartyDataSharing") < basic["params"].index("CarrotCommunityDataSharing")
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"DkThirdPartyDataSharing", {PERSISTENT, BOOL, "0"}}' in params_keys
 
 
 def test_wide_camera_fallback_setting_is_exposed(settings, params):

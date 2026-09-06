@@ -163,15 +163,17 @@ Scope and exclusions:
 <a id="ka4-stock-scc-standstill"></a>
 ### Experimental KA4 stock-SCC standstill extension
 
-`Ka4StockSccStandstillRearm` is a separate experimental setting that defaults to `0`. It can run only when all of the following are identified:
+This behavior is applied automatically, without a user setting, only when all of the following are identified. `Ka4StockSccStandstillRearm` remains internal state for log classification and compatibility with older installations; it is not shown as a Carrot Web switch.
 
 - Fourth-generation Kia Carnival KA4 (the current vehicle-validation target is model year 2023)
 - CAN FD, PCM cruise, and stock radar SCC
 - No openpilot longitudinal control and no camera SCC
 
-With value `1`, it attempts short RES groups only after the vehicle is physically near zero speed, SCC is active, and a nearby stopped lead is stable. Raw vehicle speed must be at most `0.03 m/s`, lead distance must be greater than zero and at most `20 m`, absolute relative speed must be at most `0.5 m/s`, and there must be no SCC failure or takeover request. The first request is about 2.5 seconds into the qualified stop, subsequent requests are at least about 2.5 seconds apart, and the last group finishes no later than 27 seconds so the controller does not queue more requests beyond the 30-second boundary.
+It attempts short RES groups only after the vehicle is physically near zero speed, SCC is active, and a nearby stopped lead is stable. Raw vehicle speed must be at most `0.03 m/s`, lead distance must be greater than zero and at most `20 m`, absolute relative speed must be at most `0.5 m/s`, and there must be no SCC failure or takeover request. The normal first request is about 2.5 seconds into the qualified stop and subsequent requests are at least about 2.5 seconds apart. If the stock `ALERTS_5=5` resume prompt is already present, a recovery request is advanced to follow the 0.30-second qualification dwell. The last group finishes no later than 27 seconds so the controller does not queue more requests beyond the 30-second boundary.
 
-Brake, accelerator, Auto Hold, parking brake, physical cruise/main/LFA buttons, SCC faults, cancel requests, or vehicle motion prevent or abort a group. In-vehicle validation has not yet established that this actually delays the stock accelerator prompt. The driver must verify the cluster and road conditions; change the setting while parked and test only in a controlled environment.
+On HDA1 vehicles where this branch replaces the cluster message, only the `ALERTS_5=5` resume-prompt field is masked from the first qualified stopped sample until just before 30.00 seconds. Every other OEM alert, sound, DAW, and mute field is preserved, and the prompt is restored at 30.00 seconds. HDA2 does not use this cluster-message replacement path.
+
+Brake, accelerator, Auto Hold, parking brake, physical cruise/main/LFA buttons, SCC faults, cancel requests, invalid CAN, unsafe lead state, or vehicle motion aborts requests and restores the prompt immediately. The alert-field masking is deterministic in code, but in-vehicle validation has not yet established that the stock SCC ECU accepts synthetic RES or that the actual auto-resume window is extended. The driver must verify the cluster and road conditions and test only in a controlled environment.
 
 With separate `CarrotValidationAutoUpload` consent, the device can automatically select nearby full rlogs after the drive. Those logs record the experimental RES frame-request count and qualification state. That count means the controller appended a frame to its outgoing CAN list; it does not prove Panda transmission or acceptance by the stock SCC ECU. See [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) for upload scope and privacy details.
 

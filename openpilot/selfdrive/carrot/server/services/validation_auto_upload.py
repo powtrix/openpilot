@@ -35,6 +35,14 @@ from .params import HAS_PARAMS, Params
 
 
 VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
+# This fork's automatic campaign is intentionally private to the owner's
+# comma device. Keep only a one-way identifier in the public branch; the NAS
+# has the raw device ID in its private deployment environment. The server
+# repeats the same allowlist check, while this client gate prevents another
+# installation from collecting full rlogs in the first place.
+DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256 = frozenset({
+  "6bb662f1e2215eff5f71c28790c40196e497d633beedcf550c01d487ec053b30",
+})
 STATE_SCHEMA_VERSION = 1
 CAMPAIGN_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 CLOCK_ROLLBACK_TOLERANCE_SECONDS = 60
@@ -78,17 +86,22 @@ NETWORK_GUARD_INITIAL_TIMEOUT_SECONDS = 1.0
 RETRY_DELAYS = (30.0, 120.0, 600.0, 3600.0, 6 * 3600.0)
 
 TARGET_CONDITIONS = frozenset({
-  "standstill_off",
-  "standstill_off_physical_res",
   "standstill_on",
-  "lane_offset_0",
   "lane_offset_10",
+  "stock_scc_close_accel",
 })
 OPTIONAL_CONDITIONS = frozenset({
   "standstill_on_no_request",
-  "stock_scc_close_accel",
+  "lane_offset_0",
 })
-CAPTURE_CONDITIONS = TARGET_CONDITIONS | OPTIONAL_CONDITIONS
+# Keep already queued captures from A/B builds readable and uploadable, but do
+# not require user setting changes or physical button presses in a new
+# automatic-on campaign.
+LEGACY_CONDITIONS = frozenset({
+  "standstill_off",
+  "standstill_off_physical_res",
+})
+CAPTURE_CONDITIONS = TARGET_CONDITIONS | OPTIONAL_CONDITIONS | LEGACY_CONDITIONS
 
 
 def _is_https_upload_url(value: Any) -> bool:
@@ -108,10 +121,11 @@ def _configured_validation_upload_base_url(raw_override: Any) -> str:
   return normalized if _is_https_upload_url(normalized) else ""
 
 
-# The validation receiver sees a short-lived device JWT while establishing an
-# authenticated upload session. Until comma exposes a purpose-scoped proof,
-# automatic collection must only trust the operator-controlled built-in
-# receiver (or one immutable deployment-time override), never a Web UI value.
+# The validation receiver sees only a challenge-bound signature made with the
+# device registration key while establishing an upload session; it never sees
+# a reusable comma API bearer. Automatic collection still trusts only the
+# operator-controlled built-in receiver (or one immutable deployment-time
+# override), never a Web UI value.
 # A non-empty malformed override disables the feature instead of silently
 # falling back to a different receiver than the deployer intended.
 VALIDATION_UPLOAD_BASE_URL = _configured_validation_upload_base_url(
@@ -427,10 +441,10 @@ class ValidationEventDetector:
     )
 
   @staticmethod
-  def _standstill_condition(route_settings: dict[str, int], physical_res: bool) -> str:
-    if int(route_settings.get("Ka4StockSccStandstillRearm", 0)) > 0:
-      return "standstill_on_no_request"
-    return "standstill_off_physical_res" if physical_res else "standstill_off"
+  def _standstill_condition() -> str:
+    # The supported KA4 controller now applies the behavior automatically.
+    # Legacy OFF IDs remain accepted for restored queues only.
+    return "standstill_on_no_request"
 
   @staticmethod
   def _lane_condition_for_settings(route_settings: dict[str, int]) -> str | None:
@@ -473,8 +487,7 @@ class ValidationEventDetector:
         self.stop_emitted = False
       self.stop_physical_res |= sample.physical_res_pressed
       duration = max(0.0, sample.now - self.stop_started_at)
-      rearm_enabled = int(route_settings.get("Ka4StockSccStandstillRearm", 0)) > 0
-      if rearm_enabled and keepalive_requested and not self.stop_emitted:
+      if keepalive_requested and not self.stop_emitted:
         events.append({
           "condition": "standstill_on",
           "duration": round(sample.ka4_keepalive_stopped_sec, 3),
@@ -485,9 +498,9 @@ class ValidationEventDetector:
         self.stop_emitted = True
       elif duration >= STOP_CAPTURE_SECONDS and not self.stop_emitted:
         events.append({
-          "condition": self._standstill_condition(route_settings, self.stop_physical_res),
+          "condition": self._standstill_condition(),
           "duration": round(duration, 3),
-          "trigger": "duration_no_keepalive_request" if rearm_enabled else "duration",
+          "trigger": "duration_no_keepalive_request",
           "qualified": bool(sample.ka4_keepalive_qualified),
           "controllerStoppedSec": round(max(0.0, sample.ka4_keepalive_stopped_sec), 3),
         })
@@ -500,14 +513,11 @@ class ValidationEventDetector:
         and sample.v_ego > 0.05
         and not self._driver_interlock(sample)
       )
-      if duration >= SHORT_STOP_MIN_SECONDS and clean_stop_end and not self.stop_emitted:
+      if (duration >= SHORT_STOP_MIN_SECONDS or self.stop_physical_res) and clean_stop_end and not self.stop_emitted:
         events.append({
-          "condition": self._standstill_condition(route_settings, self.stop_physical_res),
+          "condition": self._standstill_condition(),
           "duration": round(duration, 3),
-          "trigger": (
-            "stop_ended_before_keepalive_request" if int(route_settings.get("Ka4StockSccStandstillRearm", 0)) > 0
-            else "stop_ended_early"
-          ),
+          "trigger": "stop_ended_before_keepalive_request",
           "qualified": bool(sample.ka4_keepalive_qualified),
           "controllerStoppedSec": round(max(0.0, sample.ka4_keepalive_stopped_sec), 3),
         })
@@ -1088,7 +1098,10 @@ def _disable_invalid_state_consent(state: dict[str, Any], params: Any) -> bool:
 
 def _route_settings(params: Any) -> dict[str, int]:
   return {
-    "Ka4StockSccStandstillRearm": _param_int(params, "Ka4StockSccStandstillRearm"),
+    # A route is created only after ka4_stock_scc_gate() proves the exact
+    # automatic-on topology. Do not race the controller's compatibility Param
+    # write or let a stale legacy zero misclassify a current route.
+    "Ka4StockSccStandstillRearm": 1,
     "PathOffset": _param_int(params, "PathOffset"),
     "AdjustLaneOffset": _param_int(params, "AdjustLaneOffset"),
   }
@@ -1130,6 +1143,15 @@ def _git_identity(params: Any) -> dict[str, Any]:
 
 
 def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
+  device_id = _param_text(params, "DongleId")
+  device_id_sha256 = hashlib.sha256(device_id.encode("utf-8")).hexdigest() if device_id else ""
+  if device_id_sha256 not in DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256:
+    return False, {
+      "reason": "device_not_allowed",
+      "deviceId": device_id or "unknown",
+      "deviceAllowed": False,
+    }
+
   raw = None
   for key in ("CarParams", "CarParamsPersistent"):
     try:
@@ -1152,6 +1174,8 @@ def ka4_stock_scc_gate(params: Any) -> tuple[bool, dict[str, Any]]:
       and not bool(flags & int(HyundaiFlags.CAMERA_SCC))
     )
     return gate, {
+      "deviceId": device_id,
+      "deviceAllowed": True,
       "carFingerprint": str(cp.carFingerprint),
       "pcmCruise": bool(cp.pcmCruise),
       "openpilotLongitudinalControl": bool(cp.openpilotLongitudinalControl),

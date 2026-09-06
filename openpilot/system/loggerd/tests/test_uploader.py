@@ -4,9 +4,12 @@ import threading
 import logging
 import json
 from pathlib import Path
+import pytest
 from openpilot.system.hardware.hw import Paths
 
+from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.loggerd import uploader
 from openpilot.system.loggerd.uploader import main, UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE
 
 from openpilot.system.loggerd.tests.loggerd_tests_common import UploaderTestCase
@@ -182,3 +185,16 @@ class TestUploader(UploaderTestCase):
     for f_path in f_paths:
       lock_path = f_path.with_suffix(f_path.suffix + ".lock")
       assert not lock_path.is_file(), "File lock not cleared on startup"
+
+  def test_third_party_sharing_off_blocks_upload_url_request(self, monkeypatch):
+    self.params.put_bool(DK_THIRD_PARTY_DATA_SHARING_PARAM, False)
+    candidate = self.make_file_with_data(self.seg_dir, "qlog", 0.01)
+    instance = uploader.Uploader("0000000000000000", str(Paths.log_root()))
+    monkeypatch.setattr(
+      instance.api,
+      "get",
+      lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("comma API called")),
+    )
+
+    with pytest.raises(uploader.AutomaticDataSharingDisabled):
+      instance.do_upload(f"{self.seg_dir}/qlog.zst", str(candidate))
