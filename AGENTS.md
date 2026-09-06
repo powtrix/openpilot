@@ -3,15 +3,10 @@
 - For long-running work, treat user questions, status checks, clarifications, and added in-scope
   requests as interruptions to answer while continuing the active work. Stop an active process or
   abandon the task only when the user explicitly asks to stop, cancel, pause, or replace it.
-- Every non-model change must be applied to `carrot-wip`, `carrot-cinque-terre`, and
-  `carrot-bmr_v6` and pushed to all three remote branches. Preserve each branch's model-specific
-  changes while integrating the complete `carrot-wip` history into both model branches, and verify
-  that none of the three branches has an unpushed commit before reporting the work complete.
-  Keep shared UI, model-name display helpers, and generated web assets identical across all three
-  branches; differences must be limited to model selection/artifacts and their model-specific tests.
-- Keep `powtrix/dkcarrot-wip` as the user-facing exact mirror of `powtrix/carrot-wip`. Push both refs
-  to the same commit whenever `carrot-wip` changes; retain `carrot-wip` for installed-device
-  compatibility while new installs and branch selection use `dkcarrot-wip`.
+- Use local `dkcarrot-wip`, tracking `powtrix/dkcarrot-wip`, as the only development and push target.
+  Keep local `carrot-wip`, tracking `origin/carrot-wip`, and local `carrot`, tracking
+  `powtrix/carrot`, as read-only comparison branches. Do not fetch, inspect, merge, validate, or
+  push any other branch unless the user explicitly asks for that exact branch.
 - On this Windows workstation, vehicle tmux session captures are stored under
   `\\DS1821P\openpilot\<branch>`. When tmux is mentioned, search the directory for the known
   branch for a vehicle folder whose name ends with the exact dongle ID. If the branch is unknown,
