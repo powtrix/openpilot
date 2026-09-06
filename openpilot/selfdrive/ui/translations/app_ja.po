@@ -1178,8 +1178,8 @@ msgid "Unknown Vehicle Variant"
 msgstr ""
 
 #: openpilot/selfdrive/ui/layouts/settings/software.py
-msgid "Updates are only downloaded while the car is off."
-msgstr "アップデートは車両の電源が切れている間のみダウンロードされます。"
+msgid "Manual updates are available while vehicle power is on."
+msgstr "車両の電源が入っている状態でも手動更新を利用できます。"
 
 #: openpilot/selfdrive/ui/widgets/prime.py
 msgid "Upgrade Now"
@@ -1468,4 +1468,3 @@ msgstr ""
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "🔥 Firehose Mode 🔥"
 msgstr "🔥 Firehoseモード 🔥"
-

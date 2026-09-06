@@ -52,7 +52,7 @@ class SoftwareLayout(Widget):
   def __init__(self):
     super().__init__()
 
-    self._onroad_label = ListItem(lambda: tr("Updates are only downloaded while the car is off."))
+    self._onroad_label = ListItem(lambda: tr("Manual updates are available while vehicle power is on."))
     self._version_item = text_item(lambda: tr("Current Version"), ui_state.params.get("UpdaterCurrentDescription") or "")
     self._download_btn = button_item(lambda: tr("Download"), lambda: tr("CHECK"), callback=self._on_download_update)
 
@@ -97,7 +97,7 @@ class SoftwareLayout(Widget):
     self._version_item.set_description(current_release_notes)
 
     # Update download button visibility and state
-    self._download_btn.set_visible(ui_state.is_offroad())
+    self._download_btn.set_visible(True)
 
     updater_state = ui_state.params.get("UpdaterState") or "idle"
     failed_count = ui_state.params.get("UpdateFailedCount") or 0
@@ -139,14 +139,13 @@ class SoftwareLayout(Widget):
     self._branch_btn.action_item.set_value(current_branch)
 
     # Update install button
-    self._install_btn.set_visible(ui_state.is_offroad() and update_available)
+    self._install_btn.set_visible(update_available)
     if update_available:
       new_desc = ui_state.params.get("UpdaterNewDescription") or ""
       new_release_notes = (ui_state.params.get("UpdaterNewReleaseNotes") or b"").decode("utf-8", "replace")
       self._install_btn.action_item.set_text(tr("INSTALL"))
       self._install_btn.action_item.set_value(new_desc)
       self._install_btn.set_description(new_release_notes)
-      # Enable install button for testing (like Qt showEvent)
       self._install_btn.action_item.set_enabled(True)
     else:
       self._install_btn.set_visible(False)

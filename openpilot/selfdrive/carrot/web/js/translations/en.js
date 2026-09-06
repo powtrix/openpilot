@@ -307,7 +307,7 @@ window.CarrotTranslations.register("en", {
     cellular_metered_desc: "Prevent large data uploads when on a metered connection",
     hidden_network: "Hidden Network",
     connect_upper: "CONNECT",
-    updates_offroad_only: "Updates are only downloaded while the car is off.",
+    updates_offroad_only: "Manual updates are available while vehicle power is on.",
     download: "Download",
     check_upper: "CHECK",
     install_update: "Install Update",

@@ -651,7 +651,7 @@ msgstr[0] ""
 msgstr[1] ""
 
 #: openpilot/selfdrive/ui/layouts/settings/software.py
-msgid "Updates are only downloaded while the car is off."
+msgid "Manual updates are available while vehicle power is on."
 msgstr ""
 
 #: openpilot/selfdrive/ui/layouts/settings/software.py
@@ -1471,4 +1471,3 @@ msgstr ""
 #: openpilot/selfdrive/selfdrived/events.py
 msgid "Check tires, pressure, or alignment (Factor: {stiffness_factor:.1f})"
 msgstr ""
-

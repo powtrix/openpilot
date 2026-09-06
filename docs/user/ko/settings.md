@@ -294,7 +294,7 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 | 카메라 | `UseWideCamera` | 광각 전방 카메라 고장 시의 입력 대체 |
 | 네트워크·지도 | `HotspotOnBoot`, `MapboxStyle` | 부팅 시 핫스팟과 지도 배경 스타일 |
 | 사운드 | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | 안내음 언어와 일반·인게이지 볼륨 |
-| 소프트웨어 | `SoftwareMenu` | Carrot Web의 소프트웨어 메뉴 활성화 |
+| 소프트웨어 | `SoftwareMenu` | 소프트웨어 업데이트 메뉴 활성화 |
 
 - `RecordRoadCam`: `0` 녹화 안 함, `1` 일반 카메라, `2` 일반+광각 카메라입니다. 저장 공간 사용량을 확인하세요.
 - `CarrotValidationAutoUpload`: 기본값은 꺼짐입니다. 주차 중 한 번 동의하면 최대 7일 동안 해당 KA4 시험 조건의 로그 선택과 주행 후 Wi-Fi 전송을 로그별 재확인 없이 자동 처리합니다. 이벤트 캡처당 최대 3개, 캠페인당 최대 14개 캡처/42개 full rlog를 다루며 동시에 대기하는 큐는 최대 5개 캡처/750 MiB입니다. 750 MiB는 동시 대기 한도라 누적 전송량이나 재시도 데이터 사용량은 이를 넘을 수 있고, 서버의 장치별 일일 1 GiB 한도에 도달하면 보존한 로그를 다음 날 재시도할 수 있습니다. 브랜치에 내장되거나 배포 시 고정된 수신 서버만 사용하며 Carrot Web의 일반 전송 목적지로 우회할 수 없습니다. 설정 줄에는 정리된 대기 상태가 표시됩니다. 휴대폰 테더링은 모바일 데이터를 쓸 수 있고 설정을 꺼도 이미 서버에 전송된 자료는 자동 삭제되지 않습니다. 전체 범위와 개인정보는 [분석용 대시캠 로그 전송](dashcam-log-sharing.md#automatic-validation-upload)을 먼저 확인하세요.
@@ -302,7 +302,7 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 - `UseWideCamera`: 광각 전방 카메라가 고장 난 장치에서만 끄고 장치를 재부팅합니다.
 - `CarrotYouTubeLive`: 네트워크 사용량, 발열과 개인정보 노출 가능성을 함께 확인하세요.
 - `HotspotOnBoot`: USIM을 장착한 장치에서 자동 핫스팟을 사용할 때의 설정입니다.
-- `SoftwareMenu`: 메모리 문제가 있을 때 끌 수 있는 Carrot Web 메뉴 설정입니다.
+- `SoftwareMenu`: 소프트웨어 업데이트 메뉴를 표시합니다. 차량 전원이 켜져 있어도 기어·차속·openpilot 인게이지 여부 검사 없이 사용자가 직접 `CHECK`, `DOWNLOAD`, `INSTALL`을 실행할 수 있습니다. 주행 중 주기적인 자동 업데이트 작업은 계속 일시 중지됩니다. 메모리 문제가 있을 때는 이 설정을 끌 수 있습니다.
 
 ## 위험도별로 접근하기
 
