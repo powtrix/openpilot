@@ -173,7 +173,7 @@ def test_ka4_stock_scc_resume_state_requests_short_resume_press():
   assert not resume_message_requested(step_controller(controller, CC, CS, 306))
 
 
-def test_ka4_stock_scc_legacy_metadata_value_cannot_disable_automatic_behavior():
+def test_ka4_stock_scc_rearm_internal_gate_disables_experimental_behavior():
   controller = build_controller()
   controller.ka4_stock_scc_standstill_rearm = False
   CC = build_control()
@@ -181,9 +181,9 @@ def test_ka4_stock_scc_legacy_metadata_value_cannot_disable_automatic_behavior()
 
   enter_standstill_resume_state(controller, CC, CS)
 
-  assert controller.stock_scc_stop_start_frame == 0
-  assert controller.stock_scc_keepalive_pending
-  assert resume_message_requested(controller.create_button_messages(CC, CS, use_clu11=False))
+  assert controller.stock_scc_stop_start_frame is None
+  assert not controller.stock_scc_keepalive_pending
+  assert not resume_message_requested(controller.create_button_messages(CC, CS, use_clu11=False))
 
 
 @pytest.mark.parametrize("state_frame, expected", [(2695, True), (2696, False), (2700, False), (3000, False)])

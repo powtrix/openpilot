@@ -61,6 +61,7 @@ VALIDATION_CONDITIONS = frozenset({
 VALIDATION_TRIGGERS = frozenset({
   "keepalive_requested",
   "duration_no_keepalive_request",
+  "standstill_observed",
   "duration",
   "stop_ended_before_keepalive_request",
   "stop_ended_early",
@@ -2318,14 +2319,12 @@ class UploadService:
       "Ka4StockSccStandstillRearm", "PathOffset", "AdjustLaneOffset",
     }:
       raise web.HTTPBadRequest(text="invalid validationCapture routeSettings")
-    rearm_enabled = self._protocol_int(
+    self._protocol_int(
       route_settings.get("Ka4StockSccStandstillRearm"),
       "routeSettings.Ka4StockSccStandstillRearm",
       low=0,
       high=1,
     )
-    if rearm_enabled != 1:
-      raise web.HTTPBadRequest(text="validationCapture KA4 stock-SCC rearm gate did not pass")
     self._protocol_int(route_settings.get("PathOffset"), "routeSettings.PathOffset", low=-150, high=150)
     self._protocol_int(
       route_settings.get("AdjustLaneOffset"), "routeSettings.AdjustLaneOffset", low=0, high=500,

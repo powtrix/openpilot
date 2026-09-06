@@ -187,7 +187,7 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
-def test_ka4_stock_scc_standstill_extension_is_automatic_not_user_configurable(settings, params):
+def test_ka4_stock_scc_standstill_experiment_is_not_user_configurable(settings, params):
   by_name = {p["name"]: p for p in params}
   assert "Ka4StockSccStandstillRearm" not in by_name
 

@@ -2,7 +2,8 @@ dkcarrot-wip (2026-09-06)
 ========================
 * Keep prepared branch updates installable while Carrot Web checks Git status
 * Focus the device target-branch picker on dkcarrot-wip and compatibility branches
-* Add powered manual updates and KA4 stock-SCC validation support
+* Add powered manual updates and passive KA4 stock-SCC validation support
+* Preserve confirmed steering behavior and disable the unproven stopped-lead RES/alert-mask experiment
 
 carrot (2026-06-22)
 ========================

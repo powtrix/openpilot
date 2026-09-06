@@ -186,6 +186,7 @@ def _capture_metadata(
     "lane_offset_0": "stable_lane_control",
     "lane_offset_10": "stable_lane_control",
     "stock_scc_close_accel": "accelerating_while_closing",
+    "standstill_on_no_request": "standstill_observed",
   }.get(condition, "keepalive_requested")
   raw = {
     "anchorSegment": int(anchor_text),
@@ -203,7 +204,7 @@ def _capture_metadata(
     "detectedAt": 1_800_000_000,
     "settingsEpoch": 0,
     "routeSettings": {
-      "Ka4StockSccStandstillRearm": 1,
+      "Ka4StockSccStandstillRearm": 0,
       "PathOffset": 10 if condition == "lane_offset_10" else 0,
       "AdjustLaneOffset": 0,
     },
@@ -1452,7 +1453,7 @@ def test_validation_capture_rejects_every_non_ka4_stock_scc_gate_variant(tmp_pat
         ("git", "topology", "safetyConfigs"),
         [{"model": "noOutput", "param": 0}],
       ),
-      ("automatic rearm off", ("routeSettings", "Ka4StockSccStandstillRearm"), 0),
+      ("automatic rearm value invalid", ("routeSettings", "Ka4StockSccStandstillRearm"), 2),
     ]
     invalid_bodies: list[tuple[str, dict[str, Any]]] = []
     for name, path, value in invalid_variants:

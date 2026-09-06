@@ -54,7 +54,10 @@ MAX_ROUTE_NAME_BYTES = 220
 MAX_PENDING_BYTES = 750 * 1024 * 1024
 MAX_CAPTURES_PER_CONDITION = 2
 OFFROAD_STABLE_SECONDS = 10.0
-STOP_CAPTURE_SECONDS = 30.5
+# Capture the beginning of the stopped epoch while the same rlog still holds
+# the stock SCC state transition. This is observation-only and never drives a
+# cruise button or vehicle-control message.
+STOP_CAPTURE_SECONDS = 0.5
 SHORT_STOP_MIN_SECONDS = 8.0
 LANE_CAPTURE_SECONDS = 15.0
 LANE_CAPTURE_MIN_SPEED = 10.0
@@ -86,12 +89,14 @@ NETWORK_GUARD_INITIAL_TIMEOUT_SECONDS = 1.0
 RETRY_DELAYS = (30.0, 120.0, 600.0, 3600.0, 6 * 3600.0)
 
 TARGET_CONDITIONS = frozenset({
-  "standstill_on",
+  "standstill_on_no_request",
   "lane_offset_10",
   "stock_scc_close_accel",
 })
 OPTIONAL_CONDITIONS = frozenset({
-  "standstill_on_no_request",
+  # Retain the superseded controller-request classification for a capture
+  # already in flight while an older build is upgraded.
+  "standstill_on",
   "lane_offset_0",
 })
 # Keep already queued captures from A/B builds readable and uploadable, but do
@@ -426,15 +431,14 @@ class ValidationEventDetector:
       or sample.cancel_requested
     )
 
-  @classmethod
-  def _standstill_active(cls, sample: ValidationSample) -> bool:
+  @staticmethod
+  def _standstill_active(sample: ValidationSample) -> bool:
     return (
       sample.standstill
       and sample.cruise_enabled
       and sample.can_valid
       and sample.engaged
       and abs(sample.v_ego) <= 0.05
-      and not cls._driver_interlock(sample)
     )
 
   @staticmethod
@@ -497,7 +501,7 @@ class ValidationEventDetector:
         events.append({
           "condition": self._standstill_condition(),
           "duration": round(duration, 3),
-          "trigger": "duration_no_keepalive_request",
+          "trigger": "standstill_observed",
           "qualified": bool(sample.ka4_keepalive_qualified),
           "controllerStoppedSec": round(max(0.0, sample.ka4_keepalive_stopped_sec), 3),
         })
@@ -1095,10 +1099,9 @@ def _disable_invalid_state_consent(state: dict[str, Any], params: Any) -> bool:
 
 def _route_settings(params: Any) -> dict[str, int]:
   return {
-    # A route is created only after ka4_stock_scc_gate() proves the exact
-    # automatic-on topology. Do not race the controller's compatibility Param
-    # write or let a stale legacy zero misclassify a current route.
-    "Ka4StockSccStandstillRearm": 1,
+    # This is a legacy diagnostic field. New builds force it to zero because
+    # periodic stopped-lead RES rearming is not enabled in production.
+    "Ka4StockSccStandstillRearm": _param_int(params, "Ka4StockSccStandstillRearm"),
     "PathOffset": _param_int(params, "PathOffset"),
     "AdjustLaneOffset": _param_int(params, "AdjustLaneOffset"),
   }

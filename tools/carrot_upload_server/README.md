@@ -107,8 +107,9 @@ cannot redirect this protocol.
    `KIA_CARNIVAL_4TH_GEN`, stock longitudinal control (`pcmCruise=true` and
    `openpilotLongitudinalControl=false`), Hyundai CAN-FD plus radar-SCC flags
    without camera-SCC or CAN-FD HDA2, a `hyundaiCanfd` safety model, a passed
-   device topology gate, and `Ka4StockSccStandstillRearm=1`. Signed metadata from any other
-   topology or from a stale pre-automatic-rearm route is rejected. The server
+   device topology gate. `Ka4StockSccStandstillRearm` is accepted as bounded legacy metadata
+   (`0` or `1`) and does not authorize control behavior. Signed metadata from any other
+   topology is rejected. The server
    writes one canonical, immutable manifest and returns deterministic `receiptId`,
    `manifestSha256`, `files`, `verifiedDeviceId`, and `captureId` values. Every
    idempotent completion retry rechecks the exact current DB set plus each
