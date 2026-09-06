@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -14,14 +15,16 @@ import shutil
 import sqlite3
 import time
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit
 
-import aiohttp
 from aiohttp import web
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 
 GIB = 1024 * 1024 * 1024
@@ -32,13 +35,16 @@ FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 CAPTURE_RE = re.compile(r"^[0-9a-f]{32}$")
 CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{20,96}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+DEVICE_KEY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DEVICE_PROOF_RE = re.compile(r"^[A-Za-z0-9_-]{1,2048}$")
 RECEIVER_PART_RE = re.compile(r"^\..+\.(?:[0-9a-f]{16}|[0-9a-f]{32})\.part$")
 MANIFEST_PART_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z\.json\.part$")
 VALIDATION_RLOG_NAMES = frozenset({"rlog", "rlog.bz2", "rlog.zst"})
 VALIDATION_NAMESPACE = ".carrot-validation-v1"
 VALIDATION_PURPOSE = "validation"
 LEGACY_QUOTA_NAMESPACE = "legacy"
-DEVICE_AUTH_VERSION = 1
+DEVICE_AUTH_VERSION = 2
+DEVICE_PROOF_DOMAIN = b"dk-carrot-validation-device-proof-v2\0"
 RECEIPT_VERSION = 1
 VALIDATION_COMPLETION_BODY_MAX = 32 * 1024
 VALIDATION_MANIFEST_MAX = 16 * 1024
@@ -107,10 +113,57 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+  raw = os.environ.get(name)
+  if raw is None:
+    return default
+  value = raw.strip().lower()
+  if value in {"1", "true", "yes", "on"}:
+    return True
+  if value in {"0", "false", "no", "off"}:
+    return False
+  raise ValueError(f"{name} must be a boolean value")
+
+
+def _env_allowed_device_ids(name: str = "CARROT_ALLOWED_DEVICE_IDS") -> frozenset[str]:
+  raw = os.environ.get(name, "")
+  values = frozenset(value for value in re.split(r"[,\s]+", raw.strip()) if value)
+  invalid = sorted(
+    value for value in values
+    if not DEVICE_RE.fullmatch(value) or value.lower() in {"unknown", "none"}
+  )
+  if invalid:
+    raise ValueError(f"{name} contains an invalid device ID")
+  return values
+
+
+def _env_device_public_key_pins(
+  name: str = "CARROT_ALLOWED_DEVICE_PUBLIC_KEY_SHA256",
+) -> dict[str, str]:
+  raw = os.environ.get(name, "")
+  pins: dict[str, str] = {}
+  for entry in (value for value in re.split(r"[,\s]+", raw.strip()) if value):
+    if entry.count("=") != 1:
+      raise ValueError(f"{name} must contain deviceId=lowercase-sha256 entries")
+    device, fingerprint = entry.split("=", 1)
+    if (
+      not DEVICE_RE.fullmatch(device)
+      or device.lower() in {"unknown", "none"}
+      or not DEVICE_KEY_SHA256_RE.fullmatch(fingerprint)
+      or device in pins
+    ):
+      raise ValueError(f"{name} contains an invalid or duplicate device key pin")
+    pins[device] = fingerprint
+  return pins
+
+
 @dataclass(frozen=True)
 class Config:
   storage_root: Path
   db_path: Path
+  allowed_device_ids: frozenset[str] = frozenset()
+  allowed_device_public_key_sha256: Mapping[str, str] = field(default_factory=dict)
+  legacy_uploads_enabled: bool = False
   daily_device_quota: int = GIB
   daily_ip_quota: int = 8 * GIB
   max_file_bytes: int = 512 * MIB
@@ -138,12 +191,8 @@ class Config:
   trusted_proxy_networks: tuple[str, ...] = ("127.0.0.0/8", "::1/128", "172.16.0.0/12")
   validation_challenge_ttl_seconds: int = 5 * 60
   validation_session_ttl_seconds: int = 30 * 60
-  validation_identity_max_lifetime_seconds: int = 10 * 60
-  validation_identity_clock_skew_seconds: int = 30
   validation_audience: str = "carrot-validation-upload-v1"
-  validation_verify_url_template: str = "https://api.commadotai.com/v1.1/devices/{device_id}/"
   validation_verify_timeout_seconds: float = 5.0
-  validation_verify_connect_timeout_seconds: float = 3.0
   validation_verify_concurrent: int = 4
   validation_verify_attempt_limit: int = 5
   validation_verify_cooldown_seconds: int = 2
@@ -158,6 +207,9 @@ class Config:
     return cls(
       storage_root=root,
       db_path=Path(os.environ.get("CARROT_UPLOAD_DB", "/data/state/uploads.sqlite3")),
+      allowed_device_ids=_env_allowed_device_ids(),
+      allowed_device_public_key_sha256=_env_device_public_key_pins(),
+      legacy_uploads_enabled=_env_bool("CARROT_LEGACY_UPLOADS_ENABLED", False),
       daily_device_quota=_env_int("CARROT_DAILY_DEVICE_QUOTA_BYTES", GIB, MIB),
       daily_ip_quota=_env_int("CARROT_DAILY_IP_QUOTA_BYTES", 8 * GIB, MIB),
       max_file_bytes=_env_int("CARROT_MAX_FILE_BYTES", 512 * MIB, MIB),
@@ -190,18 +242,8 @@ class Config:
       session_rate_bucket_limit=_env_int("CARROT_SESSION_RATE_BUCKET_LIMIT", 4096, 16),
       validation_challenge_ttl_seconds=_env_int("CARROT_VALIDATION_CHALLENGE_TTL_SECONDS", 5 * 60, 30),
       validation_session_ttl_seconds=_env_int("CARROT_VALIDATION_SESSION_TTL_SECONDS", 30 * 60, 60),
-      validation_identity_max_lifetime_seconds=_env_int(
-        "CARROT_VALIDATION_IDENTITY_MAX_LIFETIME_SECONDS", 10 * 60, 60,
-      ),
-      validation_identity_clock_skew_seconds=_env_int("CARROT_VALIDATION_IDENTITY_CLOCK_SKEW_SECONDS", 30),
       validation_audience=os.environ.get("CARROT_VALIDATION_AUDIENCE", "carrot-validation-upload-v1"),
-      validation_verify_url_template=os.environ.get(
-        "CARROT_VALIDATION_VERIFY_URL_TEMPLATE", "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      ),
       validation_verify_timeout_seconds=_env_float("CARROT_VALIDATION_VERIFY_TIMEOUT_SECONDS", 5.0, 0.5),
-      validation_verify_connect_timeout_seconds=_env_float(
-        "CARROT_VALIDATION_VERIFY_CONNECT_TIMEOUT_SECONDS", 3.0, 0.25,
-      ),
       validation_verify_concurrent=_env_int("CARROT_VALIDATION_VERIFY_CONCURRENT", 4, 1),
       validation_verify_attempt_limit=_env_int("CARROT_VALIDATION_VERIFY_ATTEMPT_LIMIT", 5, 1),
       validation_verify_cooldown_seconds=_env_int("CARROT_VALIDATION_VERIFY_COOLDOWN_SECONDS", 2, 1),
@@ -235,105 +277,118 @@ class StreamProgress:
   persisted_once: bool = False
 
 
-class IdentityVerificationRejected(Exception):
-  """The official comma API did not authenticate the supplied device JWT."""
+class DeviceProofVerificationRejected(Exception):
+  """The supplied key or signature did not match the receiver's device pin."""
 
 
-class IdentityVerificationUnavailable(Exception):
-  """The official comma API could not be reached within the configured bounds."""
+class DeviceProofVerificationUnavailable(Exception):
+  """The local cryptographic verifier failed without an authentication result."""
 
 
-class DeviceIdentityVerifier(Protocol):
-  async def verify(self, identity_token: str, expected_device_id: str) -> str:
+class DeviceProofVerifier(Protocol):
+  async def verify(
+    self,
+    *,
+    algorithm: str,
+    public_key_pem: str,
+    proof: str,
+    message: bytes,
+    expected_fingerprint: str,
+    expected_device_id: str,
+  ) -> str:
     """Return the authenticated device ID or raise a verification exception."""
 
 
-class CommaDeviceIdentityVerifier:
-  """Verify a comma device JWT by presenting it to a fixed official API origin."""
+class PinnedDeviceProofVerifier:
+  """Verify a challenge signature against an exact SHA-256 SPKI key pin."""
 
-  MAX_RESPONSE_BYTES = 64 * 1024
+  MAX_PUBLIC_KEY_PEM_BYTES = 8 * 1024
 
-  def __init__(
-    self,
-    url_template: str,
+  @staticmethod
+  def _decode_proof(value: str) -> bytes:
+    if not DEVICE_PROOF_RE.fullmatch(value):
+      raise DeviceProofVerificationRejected("device proof is not unpadded base64url")
+    try:
+      return base64.b64decode(
+        value + "=" * (-len(value) % 4),
+        altchars=b"-_",
+        validate=True,
+      )
+    except (ValueError, TypeError) as exc:
+      raise DeviceProofVerificationRejected("device proof is not unpadded base64url") from exc
+
+  @classmethod
+  def _verify_sync(
+    cls,
     *,
-    timeout_seconds: float,
-    connect_timeout_seconds: float,
-    session_factory: Any = aiohttp.ClientSession,
-  ):
-    if url_template.count("{device_id}") != 1:
-      raise ValueError("validation verifier URL must contain exactly one {device_id} placeholder")
-    probe = urlsplit(url_template.replace("{device_id}", "0123456789abcdef"))
-    if probe.scheme != "https" or not probe.hostname or probe.username or probe.password or probe.query or probe.fragment:
-      raise ValueError("validation verifier URL must be a fixed HTTPS endpoint without credentials or query data")
-    if "{" in url_template.replace("{device_id}", "") or "}" in url_template.replace("{device_id}", ""):
-      raise ValueError("validation verifier URL contains an unsupported placeholder")
-    self._url_template = url_template
-    self._origin = (probe.scheme, probe.hostname, probe.port)
-    self._timeout_seconds = max(0.5, float(timeout_seconds))
-    self._connect_timeout_seconds = max(0.25, min(float(connect_timeout_seconds), self._timeout_seconds))
-    self._session_factory = session_factory
+    algorithm: str,
+    public_key_pem: str,
+    proof: str,
+    message: bytes,
+    expected_fingerprint: str,
+    expected_device_id: str,
+  ) -> str:
+    try:
+      public_key_bytes = public_key_pem.encode("ascii")
+    except UnicodeEncodeError as exc:
+      raise DeviceProofVerificationRejected("device public key must be ASCII PEM") from exc
+    public_key_block = public_key_bytes.strip()
+    if (
+      not public_key_bytes
+      or len(public_key_bytes) > cls.MAX_PUBLIC_KEY_PEM_BYTES
+      or b"\0" in public_key_bytes
+      or not public_key_block.startswith((b"-----BEGIN PUBLIC KEY-----\n", b"-----BEGIN PUBLIC KEY-----\r\n"))
+      or not public_key_block.endswith(b"-----END PUBLIC KEY-----")
+    ):
+      raise DeviceProofVerificationRejected("device public key PEM is invalid")
+    try:
+      public_key = serialization.load_pem_public_key(public_key_bytes)
+    except (TypeError, ValueError, UnsupportedAlgorithm) as exc:
+      raise DeviceProofVerificationRejected("device public key PEM is invalid") from exc
 
-  def _url(self, device_id: str) -> str:
-    url = self._url_template.replace("{device_id}", quote(device_id, safe=""))
-    parsed = urlsplit(url)
-    if (parsed.scheme, parsed.hostname, parsed.port) != self._origin:
-      raise IdentityVerificationRejected("device identity endpoint origin mismatch")
-    return url
-
-  async def verify(self, identity_token: str, expected_device_id: str) -> str:
-    timeout = aiohttp.ClientTimeout(
-      total=self._timeout_seconds,
-      connect=self._connect_timeout_seconds,
-      sock_read=self._timeout_seconds,
+    public_der = public_key.public_bytes(
+      serialization.Encoding.DER,
+      serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    try:
-      async with self._session_factory(timeout=timeout) as session:
-        async with session.get(
-          self._url(expected_device_id),
-          headers={"Authorization": f"JWT {identity_token}", "Accept": "application/json"},
-          allow_redirects=False,
-        ) as response:
-          if response.status != 200:
-            if response.status in {408, 425, 429} or 500 <= response.status <= 599:
-              raise IdentityVerificationUnavailable(
-                f"comma API identity verification temporarily unavailable with status {response.status}",
-              )
-            raise IdentityVerificationRejected(f"comma API rejected identity with status {response.status}")
-          if response.content_length is not None and response.content_length > self.MAX_RESPONSE_BYTES:
-            raise IdentityVerificationUnavailable("comma API identity response is too large")
-          data = bytearray()
-          async for chunk in response.content.iter_chunked(8192):
-            data.extend(chunk)
-            if len(data) > self.MAX_RESPONSE_BYTES:
-              raise IdentityVerificationUnavailable("comma API identity response is too large")
-    except (IdentityVerificationRejected, IdentityVerificationUnavailable):
-      raise
-    except (TimeoutError, aiohttp.ClientError) as exc:
-      raise IdentityVerificationUnavailable("comma API identity verification unavailable") from exc
-    except Exception as exc:
-      raise IdentityVerificationUnavailable("comma API identity verification failed closed") from exc
+    fingerprint = hashlib.sha256(public_der).hexdigest()
+    if not hmac.compare_digest(fingerprint, expected_fingerprint):
+      raise DeviceProofVerificationRejected("device public key does not match its receiver pin")
 
+    signature = cls._decode_proof(proof)
     try:
-      payload = json.loads(data.decode("utf-8"))
-    except Exception as exc:
-      raise IdentityVerificationUnavailable("comma API returned invalid identity JSON") from exc
-    if not isinstance(payload, dict):
-      raise IdentityVerificationUnavailable("comma API returned invalid identity data")
-    response_identity = payload.get("dongle_id") or payload.get("id")
-    if response_identity is not None and str(response_identity).strip() != expected_device_id:
-      raise IdentityVerificationRejected("comma API identity does not match requested device")
-    # The deployed device-info schema is known to return pairing/Prime state,
-    # but not every revision includes an identity field. A 200 from the exact
-    # device-specific URL still proves that comma accepted this JWT for the
-    # requested device. If an identity field is present, it is checked above.
+      if algorithm == "RS256":
+        if not isinstance(public_key, rsa.RSAPublicKey) or public_key.key_size < 2048:
+          raise DeviceProofVerificationRejected("RS256 requires an RSA key of at least 2048 bits")
+        public_key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+      elif algorithm == "ES256":
+        if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(public_key.curve, ec.SECP256R1):
+          raise DeviceProofVerificationRejected("ES256 requires a P-256 EC key")
+        # cryptography's ECDSA API and the device client exchange the standard
+        # ASN.1 DER-encoded (r, s) signature, not the JOSE 64-byte form.
+        public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+      else:
+        raise DeviceProofVerificationRejected("unsupported device key algorithm")
+    except InvalidSignature as exc:
+      raise DeviceProofVerificationRejected("device proof signature is invalid") from exc
     return expected_device_id
+
+  async def verify(self, **kwargs: Any) -> str:
+    try:
+      return await asyncio.to_thread(self._verify_sync, **kwargs)
+    except DeviceProofVerificationRejected:
+      raise
+    except Exception as exc:
+      raise DeviceProofVerificationUnavailable("local device proof verification failed closed") from exc
 
 
 class UploadService:
-  def __init__(self, config: Config, *, validation_verifier: DeviceIdentityVerifier | None = None):
+  def __init__(self, config: Config, *, validation_verifier: DeviceProofVerifier | None = None):
     self.config = config
+    # Snapshot deployment policy so a mutable mapping supplied by an embedding
+    # process cannot change the authentication boundary behind active sessions.
+    self._device_key_pins = dict(config.allowed_device_public_key_sha256)
     self._mkdir_parents_durable(self.config.storage_root)
+    self._mkdir_parents_durable(self._path(VALIDATION_NAMESPACE))
     self._mkdir_parents_durable(self.config.db_path.parent)
     self._db_lock = asyncio.Lock()
     self._active_lock = asyncio.Lock()
@@ -351,12 +406,10 @@ class UploadService:
     }
     self._validation_verifier_semaphore = asyncio.Semaphore(config.validation_verify_concurrent)
     self._validation_hash_semaphore = asyncio.Semaphore(config.validation_hash_concurrent)
+    self._validation_storage_probe_at = 0.0
+    self._validation_storage_probe_ok = False
     self._trusted_proxies = tuple(ipaddress.ip_network(value) for value in config.trusted_proxy_networks)
-    self._validation_verifier = validation_verifier or CommaDeviceIdentityVerifier(
-      config.validation_verify_url_template,
-      timeout_seconds=config.validation_verify_timeout_seconds,
-      connect_timeout_seconds=config.validation_verify_connect_timeout_seconds,
-    )
+    self._validation_verifier = validation_verifier or PinnedDeviceProofVerifier()
     self._init_db()
     self._fsync_directory(self.config.db_path.parent)
     self._reconcile_startup()
@@ -381,6 +434,7 @@ class UploadService:
           car_name TEXT NOT NULL DEFAULT 'none',
           git_branch TEXT NOT NULL DEFAULT 'unknown',
           tmux_reason TEXT NOT NULL DEFAULT 'tmux',
+          device_key_sha256 TEXT NOT NULL DEFAULT '',
           created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL
         );
@@ -454,6 +508,7 @@ class UploadService:
         ("car_name", "TEXT NOT NULL DEFAULT 'none'"),
         ("git_branch", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("tmux_reason", "TEXT NOT NULL DEFAULT 'tmux'"),
+        ("device_key_sha256", "TEXT NOT NULL DEFAULT ''"),
       ):
         if name not in columns:
           connection.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
@@ -544,6 +599,22 @@ class UploadService:
       raise web.HTTPBadRequest(text="invalid device id")
     return device
 
+  def _require_allowed_device(self, device: str) -> str:
+    if device not in self.config.allowed_device_ids:
+      raise web.HTTPForbidden(text="device is not allowed by receiver policy")
+    return device
+
+  def _require_validation_device_key_pin(self, device: str) -> str:
+    self._require_allowed_device(device)
+    fingerprint = self._device_key_pins.get(device)
+    if not isinstance(fingerprint, str) or not DEVICE_KEY_SHA256_RE.fullmatch(fingerprint):
+      raise web.HTTPServiceUnavailable(text="device public key pin is not configured")
+    return fingerprint
+
+  def _require_legacy_uploads_enabled(self) -> None:
+    if not self.config.legacy_uploads_enabled:
+      raise web.HTTPForbidden(text="legacy uploads are disabled")
+
   @staticmethod
   def _validate_segment(value: Any) -> str:
     segment = str(value or "").strip()
@@ -620,66 +691,17 @@ class UploadService:
     cls._fsync_directory(path.parent)
 
   @staticmethod
-  def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    if len(token) > 16 * 1024:
-      raise web.HTTPUnauthorized(text="invalid device identity token")
-    parts = token.split(".")
-    if len(parts) != 3 or not all(parts):
-      raise web.HTTPUnauthorized(text="invalid device identity token")
-    try:
-      payload_bytes = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
-      payload = json.loads(payload_bytes.decode("utf-8"))
-    except Exception as exc:
-      raise web.HTTPUnauthorized(text="invalid device identity token") from exc
-    if not isinstance(payload, dict):
-      raise web.HTTPUnauthorized(text="invalid device identity token")
-    return payload
-
-  @staticmethod
-  def _jwt_numeric_date(payload: dict[str, Any], name: str) -> float:
-    value = payload.get(name)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-      raise web.HTTPUnauthorized(text="invalid device identity token lifetime")
-    return float(value)
-
-  def _validate_identity_claims(
-    self,
-    token: str,
-    *,
+  def _validation_device_proof_message(
     device: str,
     challenge_id: str,
     nonce: str,
     audience: str,
-  ) -> int:
-    payload = self._decode_jwt_payload(token)
-    exact_claims = {
-      "identity": device,
-      "carrotUploadChallenge": challenge_id,
-      "carrotUploadNonce": nonce,
-      "carrotUploadPurpose": VALIDATION_PURPOSE,
-      "carrotUploadAudience": audience,
-    }
-    if any(payload.get(name) != value for name, value in exact_claims.items()):
-      raise web.HTTPUnauthorized(text="device identity token claims do not match challenge")
-
-    issued_at = self._jwt_numeric_date(payload, "iat")
-    not_before = self._jwt_numeric_date(payload, "nbf")
-    expires_at = self._jwt_numeric_date(payload, "exp")
-    now = datetime.now(UTC).timestamp()
-    skew = self.config.validation_identity_clock_skew_seconds
-    maximum_lifetime = self.config.validation_identity_max_lifetime_seconds
-    if (
-      expires_at <= issued_at
-      or expires_at - issued_at > maximum_lifetime
-      or issued_at > now + skew
-      or issued_at < now - maximum_lifetime - skew
-      or not_before > now + skew
-      or not_before < issued_at - skew
-      or expires_at <= now - skew
-      or expires_at > now + maximum_lifetime + skew
-    ):
-      raise web.HTTPUnauthorized(text="device identity token is not short-lived or current")
-    return int(expires_at)
+  ) -> bytes:
+    # Every field has already passed its endpoint-specific length/alphabet
+    # validation, and the NUL separators make the tuple unambiguous.
+    return DEVICE_PROOF_DOMAIN + b"\0".join(
+      value.encode("utf-8") for value in (device, challenge_id, nonce, audience)
+    )
 
   @staticmethod
   def _canonical_json(value: Any) -> bytes:
@@ -795,9 +817,38 @@ class UploadService:
     *,
     validation: bool = True,
   ) -> bool:
-    free = shutil.disk_usage(self.config.storage_root).free
+    disk_path = self._path(VALIDATION_NAMESPACE) if validation else self.config.storage_root
+    free = shutil.disk_usage(disk_path).free
     protected = 0 if validation else self.config.validation_free_space_reserve_bytes
     return free - max(0, reserved) - max(0, expected) >= self.config.min_free_bytes + protected
+
+  def _validation_storage_writable(self, *, cache_seconds: float = 10.0) -> bool:
+    """Probe the only writable upload namespace without exposing its contents."""
+    now = time.monotonic()
+    if self._validation_storage_probe_at > 0.0 and now - self._validation_storage_probe_at < cache_seconds:
+      return self._validation_storage_probe_ok
+
+    root = self._path(VALIDATION_NAMESPACE)
+    probe = root / f".health.{secrets.token_hex(16)}.part"
+    ready = False
+    try:
+      self._mkdir_parents_durable(root)
+      with probe.open("xb") as output:
+        output.write(b"dk-upload-health-v1\n")
+        output.flush()
+        os.fsync(output.fileno())
+      self._unlink_durable(probe)
+      ready = True
+    except OSError:
+      logging.exception("validation storage write probe failed")
+      try:
+        self._unlink_durable(probe)
+      except OSError:
+        pass
+
+    self._validation_storage_probe_ok = ready
+    self._validation_storage_probe_at = now
+    return ready
 
   @staticmethod
   def _reconcile_stale_reservations_connection(
@@ -871,11 +922,12 @@ class UploadService:
 
   def _cleanup_stale_parts_sync(self, now: int, *, startup: bool = False) -> int:
     removed = 0
-    roots = (
-      self.config.storage_root / VALIDATION_NAMESPACE,
-      self.config.storage_root / "routes",
-      self.config.db_path.parent / "manifests",
-    )
+    roots = [self.config.storage_root / VALIDATION_NAMESPACE]
+    if self.config.legacy_uploads_enabled:
+      roots.extend((
+        self.config.storage_root / "routes",
+        self.config.db_path.parent / "manifests",
+      ))
     stale_before = now - self.config.stale_part_seconds
     for root in roots:
       if not root.is_dir():
@@ -1165,10 +1217,13 @@ class UploadService:
     return (body, len(data)) if include_size else body
 
   async def create_session(self, request: web.Request) -> web.Response:
+    self._require_legacy_uploads_enabled()
     body = await self._json_body(request, 16 * 1024)
     if not isinstance(body, dict):
       raise web.HTTPBadRequest(text="JSON object is required")
-    device = self._validate_device(body.get("deviceId") or body.get("dongleId"))
+    device = self._require_allowed_device(
+      self._validate_device(body.get("deviceId") or body.get("dongleId")),
+    )
     purpose = str(body.get("purpose") or "upload").strip().lower()
     if purpose not in {"dashcam", "tmux", "test"}:
       raise web.HTTPBadRequest(text="invalid purpose")
@@ -1204,11 +1259,16 @@ class UploadService:
     body = await self._json_body(request, 8 * 1024)
     if not isinstance(body, dict):
       raise web.HTTPBadRequest(text="JSON object is required")
-    device = self._validate_device(body.get("deviceId"))
+    device = self._require_allowed_device(self._validate_device(body.get("deviceId")))
+    self._require_validation_device_key_pin(device)
     source_ip = self.source_ip(request)
     self._check_session_rate(source_ip, validation=True)
     audience = str(self.config.validation_audience).strip()
-    if not audience or len(audience) > 256:
+    try:
+      audience_bytes = audience.encode("utf-8")
+    except UnicodeEncodeError as exc:
+      raise web.HTTPServiceUnavailable(text="validation audience is not configured") from exc
+    if not audience or len(audience_bytes) > 256 or "\0" in audience:
       raise web.HTTPServiceUnavailable(text="validation audience is not configured")
     now = int(datetime.now(UTC).timestamp())
     expires_at = now + self.config.validation_challenge_ttl_seconds
@@ -1334,11 +1394,23 @@ class UploadService:
     body = await self._json_body(request, 32 * 1024)
     if not isinstance(body, dict):
       raise web.HTTPBadRequest(text="JSON object is required")
-    device = self._validate_device(body.get("deviceId"))
+    device = self._require_allowed_device(self._validate_device(body.get("deviceId")))
+    expected_fingerprint = self._require_validation_device_key_pin(device)
     challenge_id = self._validate_challenge(body.get("challengeId"))
-    identity_token = str(body.get("identityToken") or "").strip()
-    if not identity_token:
-      raise web.HTTPUnauthorized(text="device identity token is required")
+    if "identityToken" in body:
+      raise web.HTTPBadRequest(text="generic device identity tokens are not accepted")
+    algorithm = body.get("deviceKeyAlgorithm")
+    public_key_pem = body.get("devicePublicKey")
+    proof = body.get("deviceProof")
+    if (
+      not isinstance(algorithm, str)
+      or algorithm not in {"RS256", "ES256"}
+      or not isinstance(public_key_pem, str)
+      or not public_key_pem
+      or not isinstance(proof, str)
+      or not proof
+    ):
+      raise web.HTTPUnauthorized(text="device key algorithm, public key, and proof are required")
     source_ip = self.source_ip(request)
     async with self._db_lock:
       with self._connect() as connection:
@@ -1352,13 +1424,6 @@ class UploadService:
     if challenge["consumed_at"] is not None:
       raise web.HTTPConflict(text="validation challenge was already consumed")
 
-    self._validate_identity_claims(
-      identity_token,
-      device=device,
-      challenge_id=challenge_id,
-      nonce=str(challenge["nonce"]),
-      audience=str(challenge["audience"]),
-    )
     challenge, verification_marker = await self._claim_validation_verification(
       challenge_id, device, source_ip,
     )
@@ -1371,22 +1436,34 @@ class UploadService:
       except TimeoutError as exc:
         await self._release_validation_verification(challenge_id, verification_marker, rejected=False)
         raise web.HTTPServiceUnavailable(
-          text="official device identity verifier is busy",
+          text="device proof verifier is busy",
           headers={"Retry-After": str(self.config.validation_verify_cooldown_seconds)},
         ) from exc
       verified_device = await asyncio.wait_for(
-        self._validation_verifier.verify(identity_token, device),
+        self._validation_verifier.verify(
+          algorithm=algorithm,
+          public_key_pem=public_key_pem,
+          proof=proof,
+          message=self._validation_device_proof_message(
+            device,
+            challenge_id,
+            str(challenge["nonce"]),
+            str(challenge["audience"]),
+          ),
+          expected_fingerprint=expected_fingerprint,
+          expected_device_id=device,
+        ),
         timeout=self.config.validation_verify_timeout_seconds + 1.0,
       )
-    except IdentityVerificationUnavailable as exc:
+    except DeviceProofVerificationUnavailable as exc:
       await self._release_validation_verification(challenge_id, verification_marker, rejected=False)
-      raise web.HTTPServiceUnavailable(text="official device identity verification is temporarily unavailable") from exc
-    except IdentityVerificationRejected as exc:
+      raise web.HTTPServiceUnavailable(text="device proof verification is temporarily unavailable") from exc
+    except DeviceProofVerificationRejected as exc:
       await self._release_validation_verification(challenge_id, verification_marker, rejected=True)
-      raise web.HTTPUnauthorized(text="official device identity verification rejected the token") from exc
+      raise web.HTTPUnauthorized(text="device proof verification rejected the signature") from exc
     except TimeoutError as exc:
       await self._release_validation_verification(challenge_id, verification_marker, rejected=False)
-      raise web.HTTPServiceUnavailable(text="official device identity verification timed out") from exc
+      raise web.HTTPServiceUnavailable(text="device proof verification timed out") from exc
     except asyncio.CancelledError:
       await asyncio.shield(
         self._release_validation_verification(challenge_id, verification_marker, rejected=False),
@@ -1398,7 +1475,7 @@ class UploadService:
       # An injected verifier is still an authentication boundary. Unexpected
       # behavior must never degrade into accepting an unverified token.
       await self._release_validation_verification(challenge_id, verification_marker, rejected=False)
-      raise web.HTTPServiceUnavailable(text="official device identity verification failed closed") from exc
+      raise web.HTTPServiceUnavailable(text="device proof verification failed closed") from exc
     finally:
       if acquired_verifier:
         self._validation_verifier_semaphore.release()
@@ -1408,9 +1485,9 @@ class UploadService:
 
     token = secrets.token_urlsafe(32)
     token_hash = self._token_hash(token)
-    # The short-lived JWT is a one-time authentication assertion. Exchange it
-    # for a longer, narrowly purpose-scoped upload session so several large
-    # rlogs can finish after the assertion itself expires.
+    # Exchange the one-time, receiver-bound proof for a longer, narrowly
+    # purpose-scoped session so several large rlogs can finish after the
+    # challenge expires without sending the device's general comma JWT.
     now = int(datetime.now(UTC).timestamp())
     expires_at = now + self.config.validation_session_ttl_seconds
     car_name = self._storage_component(body.get("carName"), "none")
@@ -1442,9 +1519,13 @@ class UploadService:
           raise web.HTTPConflict(text="validation challenge was already consumed")
         connection.execute(
           """INSERT INTO sessions(
-               token_hash, device_id, source_ip, purpose, car_name, git_branch, tmux_reason, created_at, expires_at
-             ) VALUES(?,?,?,?,?,?,?,?,?)""",
-          (token_hash, device, source_ip, VALIDATION_PURPOSE, car_name, git_branch, "validation", now, expires_at),
+               token_hash, device_id, source_ip, purpose, car_name, git_branch, tmux_reason,
+               device_key_sha256, created_at, expires_at
+             ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+          (
+            token_hash, device, source_ip, VALIDATION_PURPOSE, car_name, git_branch,
+            "validation", expected_fingerprint, now, expires_at,
+          ),
         )
 
     return web.json_response({
@@ -1479,6 +1560,11 @@ class UploadService:
         ).fetchone()
     if row is None or int(row["expires_at"]) < int(datetime.now(UTC).timestamp()):
       raise web.HTTPUnauthorized(text="expired upload session")
+    self._require_allowed_device(str(row["device_id"]))
+    if row["purpose"] == VALIDATION_PURPOSE:
+      current_pin = self._require_validation_device_key_pin(str(row["device_id"]))
+      if not hmac.compare_digest(str(row["device_key_sha256"]), current_pin):
+        raise web.HTTPForbidden(text="upload session device key pin changed")
     if row["source_ip"] != self.source_ip(request):
       raise web.HTTPForbidden(text="upload session IP mismatch")
     if device is not None and row["device_id"] != device:
@@ -1776,16 +1862,36 @@ class UploadService:
           self._active_by_device.pop(device, None)
 
   async def health(self, _request: web.Request) -> web.Response:
-    ready = self._has_disk_space()
+    allowlist_configured = bool(self.config.allowed_device_ids)
+    pins_configured = (
+      allowlist_configured
+      and set(self._device_key_pins) == set(self.config.allowed_device_ids)
+      and all(
+        isinstance(value, str) and DEVICE_KEY_SHA256_RE.fullmatch(value)
+        for value in self._device_key_pins.values()
+      )
+    )
+    storage_writable = self._validation_storage_writable()
+    try:
+      disk_ready = self._has_disk_space()
+    except OSError:
+      disk_ready = False
+    ready = allowlist_configured and pins_configured and storage_writable and disk_ready
+    status = 200 if ready else 503 if not allowlist_configured or not pins_configured else 507
     return web.json_response({
       "ok": ready,
-      "service": "carrot-upload",
+      "service": "dk-upload",
+      "deviceAllowlistConfigured": allowlist_configured,
+      "deviceKeyPinsConfigured": pins_configured,
+      "legacyUploadsEnabled": self.config.legacy_uploads_enabled,
+      "storageWritable": storage_writable,
       "dailyQuotaBytes": self.config.daily_device_quota,
       "maxFileBytes": self.config.max_file_bytes,
       "bandwidthLimit": None,
-    }, status=200 if ready else 507)
+    }, status=status)
 
   async def upload_file(self, request: web.Request) -> web.Response:
+    self._require_legacy_uploads_enabled()
     device = self._validate_device(request.match_info.get("device"))
     segment = self._validate_segment(request.match_info.get("segment"))
     filename = self._validate_filename(request.match_info.get("filename"))
@@ -2533,6 +2639,7 @@ class UploadService:
       await self._finish_reservation(reservation, received, stored)
 
   async def complete(self, request: web.Request) -> web.Response:
+    self._require_legacy_uploads_enabled()
     session = await self.authenticate(request, purposes={"dashcam"})
     body = await self._json_body(request, 512 * 1024)
     if not isinstance(body, dict):
@@ -2577,6 +2684,7 @@ class UploadService:
       await self._finish_reservation(reservation, len(encoded), stored)
 
   async def tmux_upload(self, request: web.Request) -> web.Response:
+    self._require_legacy_uploads_enabled()
     session = await self.authenticate(request, purposes={"tmux"})
     device = session["device_id"]
     await self._enter_upload(device)
@@ -2819,7 +2927,7 @@ def create_app(
   config: Config | None = None,
   *,
   start_cleanup: bool = True,
-  validation_verifier: DeviceIdentityVerifier | None = None,
+  validation_verifier: DeviceProofVerifier | None = None,
 ) -> web.Application:
   service = UploadService(config or Config.from_env(), validation_verifier=validation_verifier)
   app = web.Application(

@@ -223,9 +223,11 @@ def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params
   assert "일반 전송 목적지로 우회할 수 없습니다" in auto_upload["descr"]
   assert "모바일 데이터" in auto_upload["descr"]
   assert "WPA2/WPA3" in auto_upload["descr"]
+  assert "단방향 해시" in auto_upload["descr"]
   assert "No vehicle-control setting is changed" in auto_upload["edescr"]
   assert "no per-log confirmation" in auto_upload["edescr"]
   assert "ordinary Carrot Web upload destination cannot redirect" in auto_upload["edescr"]
+  assert "one-way hash" in auto_upload["edescr"]
   disclosure_fragments = {
     "descr": [
       "캡처당 주변 full rlog 최대 3개", "최대 14개 캡처/42개 full rlog", "최대 5개 캡처/750 MiB",
@@ -249,6 +251,38 @@ def test_ka4_validation_auto_upload_is_bounded_explicit_consent(settings, params
 
   params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
   assert '{"CarrotValidationAutoUpload", {PERSISTENT, INT, "0"}}' in params_keys
+
+
+def test_carrot_community_data_sharing_is_explicit_opt_in(settings, params):
+  by_name = {p["name"]: p for p in params}
+  sharing = by_name["CarrotCommunityDataSharing"]
+  assert (sharing["min"], sharing["max"], sharing["default"]) == (0, 1, 0)
+  assert sharing["control"] == "toggle"
+  assert sharing["risk"] == "high"
+  for fragment in (
+    "장치 식별자", "로컬 네트워크 주소", "전체 설정값", "자동 onroad·예외 tmux",
+    "기본 Discord", "모바일 데이터", "KA4 자동 검증 로그 전송", "백업·프로필·QR",
+  ):
+    assert fragment in sharing["descr"]
+  for fragment in (
+    "device identifiers", "local network address", "all setting values",
+    "automatic onroad and exception tmux", "bundled Discord", "mobile data",
+    "KA4 automatic validation upload", "backups, profiles, and QR",
+  ):
+    assert fragment in sharing["edescr"]
+
+  system = next(category for category in settings["menu"] if category["id"] == "SYSTEM")
+  record = next(group for group in system["groups"] if group["id"] == "SYS_RECORD")
+  basic = next(group for group in record["groups"] if group["id"] == "SYS_RECORD_BASIC")
+  assert basic["params"] == [
+    "RecordRoadCam",
+    "CarrotCommunityDataSharing",
+    "CarrotValidationAutoUpload",
+    "MaxTimeOffroadMin",
+  ]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"CarrotCommunityDataSharing", {PERSISTENT, BOOL, "0"}}' in params_keys
 
 
 def test_wide_camera_fallback_setting_is_exposed(settings, params):

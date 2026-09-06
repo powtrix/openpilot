@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 from dataclasses import replace
@@ -7,6 +8,7 @@ from typing import Any
 
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
+import pytest
 
 from .. import server as receiver_server
 from ..server import UPLOAD_SERVICE_KEY, Config, create_app
@@ -15,12 +17,16 @@ from ..server import UPLOAD_SERVICE_KEY, Config, create_app
 DEVICE = "0123456789abcdef"
 OTHER_DEVICE = "fedcba9876543210"
 CLIENT_IP = "203.0.113.10"
+DEVICE_KEY_SHA256 = "1" * 64
 
 
 def config(tmp_path: Path, *, quota: int = 1024 * 1024) -> Config:
   return Config(
     storage_root=tmp_path / "uploads",
     db_path=tmp_path / "state" / "uploads.sqlite3",
+    allowed_device_ids=frozenset({DEVICE}),
+    allowed_device_public_key_sha256={DEVICE: DEVICE_KEY_SHA256},
+    legacy_uploads_enabled=True,
     daily_device_quota=quota,
     daily_ip_quota=quota * 4,
     max_file_bytes=1024 * 1024,
@@ -86,6 +92,187 @@ def test_health_session_stream_upload_and_completion(tmp_path: Path):
       assert len(manifests) == 1
 
   asyncio.run(run())
+
+
+def test_security_policy_defaults_fail_closed(tmp_path: Path):
+  async def run():
+    cfg = Config(
+      storage_root=tmp_path / "uploads",
+      db_path=tmp_path / "state" / "uploads.sqlite3",
+      min_free_bytes=0,
+      validation_free_space_reserve_bytes=0,
+    )
+    async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+      health = await client.get("/api/v1/health")
+      assert health.status == 503
+      assert await health.json() == {
+        "ok": False,
+        "service": "dk-upload",
+        "deviceAllowlistConfigured": False,
+        "deviceKeyPinsConfigured": False,
+        "legacyUploadsEnabled": False,
+        "storageWritable": True,
+        "dailyQuotaBytes": 1024 * 1024 * 1024,
+        "maxFileBytes": 512 * 1024 * 1024,
+        "bandwidthLimit": None,
+      }
+
+      legacy = await client.post(
+        "/api/v1/session",
+        json={"deviceId": DEVICE, "purpose": "dashcam"},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert legacy.status == 403
+      assert "disabled" in (await legacy.json())["error"]
+
+      challenge = await client.post(
+        "/api/v1/validation/challenge",
+        json={"deviceId": DEVICE},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert challenge.status == 403
+      assert "not allowed" in (await challenge.json())["error"]
+
+  asyncio.run(run())
+
+
+def test_health_fails_closed_when_validation_store_is_not_writable(tmp_path: Path, monkeypatch):
+  async def run():
+    cfg = replace(config(tmp_path), legacy_uploads_enabled=False)
+    app = create_app(cfg, start_cleanup=False)
+    monkeypatch.setattr(app[UPLOAD_SERVICE_KEY], "_validation_storage_writable", lambda: False)
+    async with TestClient(TestServer(app)) as client:
+      health = await client.get("/api/v1/health")
+      body = await health.json()
+
+      assert health.status == 507
+      assert body["ok"] is False
+      assert body["deviceAllowlistConfigured"] is True
+      assert body["deviceKeyPinsConfigured"] is True
+      assert body["storageWritable"] is False
+
+  asyncio.run(run())
+
+
+def test_validation_readiness_and_challenge_fail_closed_without_exact_key_pins(tmp_path: Path):
+  async def run():
+    for pins in ({}, {DEVICE: DEVICE_KEY_SHA256, OTHER_DEVICE: "2" * 64}):
+      cfg = replace(config(tmp_path), allowed_device_public_key_sha256=pins)
+      async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+        health = await client.get("/api/v1/health")
+        body = await health.json()
+        assert health.status == 503
+        assert body["ok"] is False
+        assert body["deviceAllowlistConfigured"] is True
+        assert body["deviceKeyPinsConfigured"] is False
+        assert DEVICE_KEY_SHA256 not in json.dumps(body)
+
+        challenge = await client.post(
+          "/api/v1/validation/challenge",
+          json={"deviceId": DEVICE},
+          headers={"X-Forwarded-For": CLIENT_IP},
+        )
+        if pins:
+          assert challenge.status == 200
+        else:
+          assert challenge.status == 503
+          assert "key pin" in (await challenge.json())["error"]
+
+  asyncio.run(run())
+
+
+def test_allowlist_and_legacy_switch_cover_existing_sessions_and_routes(tmp_path: Path):
+  async def run():
+    enabled = config(tmp_path)
+    async with TestClient(TestServer(create_app(enabled, start_cleanup=False))) as client:
+      token = await session(client)
+
+      disallowed_session = await client.post(
+        "/api/v1/session",
+        json={"deviceId": OTHER_DEVICE, "purpose": "dashcam"},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert disallowed_session.status == 403
+
+      disallowed_challenge = await client.post(
+        "/api/v1/validation/challenge",
+        json={"deviceId": OTHER_DEVICE},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert disallowed_challenge.status == 403
+
+    disabled = replace(enabled, legacy_uploads_enabled=False)
+    async with TestClient(TestServer(create_app(disabled, start_cleanup=False))) as client:
+      health = await client.get("/api/v1/health")
+      assert health.status == 200
+      assert (await health.json())["legacyUploadsEnabled"] is False
+
+      headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Forwarded-For": CLIENT_IP,
+        "X-File-Size": "1",
+      }
+      upload = await client.put(
+        f"/api/v1/upload/{DEVICE}/route--0/qlog", data=b"x", headers=headers,
+      )
+      complete = await client.post(
+        "/api/v1/complete", json={"deviceId": DEVICE}, headers=headers,
+      )
+      tmux = await client.post("/api/v1/tmux/upload", data=b"ignored", headers=headers)
+      new_session = await client.post(
+        "/api/v1/session",
+        json={"deviceId": DEVICE, "purpose": "dashcam"},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert [upload.status, complete.status, tmux.status, new_session.status] == [403] * 4
+      for response in (upload, complete, tmux, new_session):
+        assert "disabled" in (await response.json())["error"]
+
+      allowed_challenge = await client.post(
+        "/api/v1/validation/challenge",
+        json={"deviceId": DEVICE},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert allowed_challenge.status == 200
+
+    revoked = replace(enabled, allowed_device_ids=frozenset({OTHER_DEVICE}))
+    async with TestClient(TestServer(create_app(revoked, start_cleanup=False))) as client:
+      revoked_upload = await client.put(
+        f"/api/v1/upload/{DEVICE}/route--0/qlog", data=b"x", headers=headers,
+      )
+      assert revoked_upload.status == 403
+      assert "not allowed" in (await revoked_upload.json())["error"]
+
+  asyncio.run(run())
+
+
+def test_security_policy_environment_parsing(tmp_path: Path, monkeypatch):
+  monkeypatch.setenv("CARROT_UPLOAD_ROOT", str(tmp_path / "uploads"))
+  monkeypatch.setenv("CARROT_UPLOAD_DB", str(tmp_path / "state" / "uploads.sqlite3"))
+  monkeypatch.setenv("CARROT_ALLOWED_DEVICE_IDS", f"{DEVICE}, {OTHER_DEVICE}")
+  monkeypatch.setenv(
+    "CARROT_ALLOWED_DEVICE_PUBLIC_KEY_SHA256",
+    f"{DEVICE}={'1' * 64}, {OTHER_DEVICE}={'2' * 64}",
+  )
+  monkeypatch.setenv("CARROT_LEGACY_UPLOADS_ENABLED", "true")
+  cfg = Config.from_env()
+  assert cfg.allowed_device_ids == frozenset({DEVICE, OTHER_DEVICE})
+  assert cfg.allowed_device_public_key_sha256 == {DEVICE: "1" * 64, OTHER_DEVICE: "2" * 64}
+  assert cfg.legacy_uploads_enabled is True
+
+  monkeypatch.setenv("CARROT_ALLOWED_DEVICE_IDS", "not/valid")
+  with pytest.raises(ValueError, match="invalid device ID"):
+    Config.from_env()
+
+  monkeypatch.setenv("CARROT_ALLOWED_DEVICE_IDS", DEVICE)
+  monkeypatch.setenv("CARROT_ALLOWED_DEVICE_PUBLIC_KEY_SHA256", f"{DEVICE}={'A' * 64}")
+  with pytest.raises(ValueError, match="device key pin"):
+    Config.from_env()
+
+  monkeypatch.setenv("CARROT_ALLOWED_DEVICE_PUBLIC_KEY_SHA256", f"{DEVICE}={'1' * 64}")
+  monkeypatch.setenv("CARROT_LEGACY_UPLOADS_ENABLED", "sometimes")
+  with pytest.raises(ValueError, match="boolean"):
+    Config.from_env()
 
 
 def test_session_is_bound_to_ip_and_device(tmp_path: Path):

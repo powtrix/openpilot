@@ -3,7 +3,14 @@ from openpilot.selfdrive.carrot.recovery import server as recovery
 
 def test_cwp_status_disables_unregistered_device(monkeypatch):
   writes = []
-  monkeypatch.setattr(recovery, "_read_param", lambda key, default="": "1" if key == recovery.CWP_RECOVERY_BOOT_PARAM else default)
+  monkeypatch.setattr(
+    recovery,
+    "_read_param",
+    lambda key, default="": "1" if key in {
+      recovery.COMMUNITY_DATA_SHARING_PARAM,
+      recovery.CWP_RECOVERY_BOOT_PARAM,
+    } else default,
+  )
   monkeypatch.setattr(recovery, "_write_param", lambda key, value: writes.append((key, value)))
   monkeypatch.setattr(recovery, "_cwp_device_id", lambda: "device-id")
   monkeypatch.setattr(recovery, "_cwp_request", lambda path, payload: {
@@ -50,7 +57,14 @@ def test_cwp_enable_writes_persistent_param(monkeypatch):
 
 def test_cwp_boot_sends_recovery_port(monkeypatch):
   requests = []
-  monkeypatch.setattr(recovery, "_read_param", lambda key, default="": "1" if key == recovery.CWP_RECOVERY_BOOT_PARAM else default)
+  monkeypatch.setattr(
+    recovery,
+    "_read_param",
+    lambda key, default="": "1" if key in {
+      recovery.COMMUNITY_DATA_SHARING_PARAM,
+      recovery.CWP_RECOVERY_BOOT_PARAM,
+    } else default,
+  )
   monkeypatch.setattr(recovery, "_local_ip", lambda: "192.168.0.5")
   monkeypatch.setattr(recovery, "_cwp_device_id", lambda: "device-id")
   monkeypatch.setattr(recovery.time, "sleep", lambda _seconds: None)
@@ -62,6 +76,28 @@ def test_cwp_boot_sends_recovery_port(monkeypatch):
   recovery._cwp_boot_worker(6999)
 
   assert requests == [("/recovery/boot", {"deviceId": "device-id", "ip": "192.168.0.5", "port": 6999})]
+
+
+def test_recovery_cwp_fails_closed_without_community_consent(monkeypatch):
+  monkeypatch.setattr(
+    recovery,
+    "_read_param",
+    lambda key, default="": "1" if key == recovery.CWP_RECOVERY_BOOT_PARAM else default,
+  )
+  monkeypatch.setattr(
+    recovery.urllib.request,
+    "urlopen",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network request must be blocked")),
+  )
+
+  status = recovery._cwp_status()
+  assert status["ok"] is False
+  assert status["disabled_by_community_sharing"] is True
+  assert status["state"] == "community-sharing-disabled"
+
+  direct = recovery._cwp_request("/report", {"deviceId": "device-id"})
+  assert direct["ok"] is False
+  assert direct["disabled_by_community_sharing"] is True
 
 
 def test_recovery_page_has_short_cwp_toggle_states():

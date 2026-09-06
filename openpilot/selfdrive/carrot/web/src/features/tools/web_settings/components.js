@@ -83,7 +83,11 @@ globalThis.WebSettingsComponents.register("web-upload", {
         const response = await fetch("/api/dashcam/upload/test", { method: "POST" });
         const payload = await response.json();
         if (!response.ok || payload?.ok === false) throw new Error(payload?.error || `HTTP ${response.status}`);
-        if (status) status.textContent = getUIText("web_upload_test_ok") || "Connection OK";
+        if (status) {
+          status.textContent = payload?.mode === "validation-only"
+            ? (getUIText("web_upload_test_validation_only") || "DK NAS connected · automatic KA4 validation only")
+            : (getUIText("web_upload_test_ok") || "Connection OK");
+        }
       } catch (err) {
         if (status) status.textContent = `${getUIText("web_upload_test_failed") || "Connection failed"}: ${err?.message || err}`;
       } finally {

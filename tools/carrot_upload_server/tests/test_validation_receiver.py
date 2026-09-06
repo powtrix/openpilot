@@ -12,20 +12,24 @@ from typing import Any
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 import pytest
 
 from .. import server as receiver_server
 from ..server import (
   DEVICE_AUTH_VERSION,
+  DEVICE_PROOF_DOMAIN,
   RECEIPT_VERSION,
   VALIDATION_NAMESPACE,
-  CommaDeviceIdentityVerifier,
   Config,
-  IdentityVerificationRejected,
-  IdentityVerificationUnavailable,
+  DeviceProofVerificationRejected,
+  DeviceProofVerificationUnavailable,
+  PinnedDeviceProofVerifier,
   UploadService,
   create_app,
 )
+from openpilot.selfdrive.carrot import web_upload as client_web_upload
 from openpilot.selfdrive.carrot.web_upload import (
   validation_manifest_sha256 as client_validation_manifest_sha256,
   validation_receipt_id as client_validation_receipt_id,
@@ -39,12 +43,32 @@ DEVICE = "0123456789abcdef"
 OTHER_DEVICE = "fedcba9876543210"
 CLIENT_IP = "203.0.113.40"
 CAPTURE = "0123456789abcdef0123456789abcdef"
+RSA_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+EC_PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1())
+
+
+def _public_key_pem(private_key: Any) -> str:
+  return private_key.public_key().public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+  ).decode("ascii")
+
+
+def _public_key_fingerprint(private_key: Any) -> str:
+  public_der = private_key.public_key().public_bytes(
+    serialization.Encoding.DER,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+  )
+  return hashlib.sha256(public_der).hexdigest()
 
 
 def config(tmp_path: Path, *, quota: int = 1024 * 1024) -> Config:
   return Config(
     storage_root=tmp_path / "uploads",
     db_path=tmp_path / "state" / "uploads.sqlite3",
+    allowed_device_ids=frozenset({DEVICE}),
+    allowed_device_public_key_sha256={DEVICE: _public_key_fingerprint(RSA_PRIVATE_KEY)},
+    legacy_uploads_enabled=True,
     daily_device_quota=quota,
     daily_ip_quota=quota * 4,
     max_file_bytes=1024 * 1024,
@@ -56,8 +80,6 @@ def config(tmp_path: Path, *, quota: int = 1024 * 1024) -> Config:
     concurrent_global=16,
     validation_challenge_ttl_seconds=300,
     validation_session_ttl_seconds=300,
-    validation_identity_max_lifetime_seconds=600,
-    validation_identity_clock_skew_seconds=30,
     validation_audience="https://uploads.example.test/api/v1/validation",
   )
 
@@ -66,34 +88,40 @@ class FakeVerifier:
   def __init__(self, *, result: str | None = None, error: Exception | None = None):
     self.result = result
     self.error = error
-    self.calls: list[tuple[str, str]] = []
+    self.calls: list[dict[str, Any]] = []
 
-  async def verify(self, identity_token: str, expected_device_id: str) -> str:
-    self.calls.append((identity_token, expected_device_id))
+  async def verify(self, **kwargs: Any) -> str:
+    self.calls.append(kwargs)
     if self.error is not None:
       raise self.error
-    return self.result or expected_device_id
+    return self.result or str(kwargs["expected_device_id"])
 
 
-def _jwt(challenge: dict[str, Any], **overrides: Any) -> str:
-  now = int(datetime.now(UTC).timestamp())
-  payload = {
-    "identity": DEVICE,
-    "iat": now,
-    "nbf": now,
-    "exp": now + 300,
-    "carrotUploadChallenge": challenge["challengeId"],
-    "carrotUploadNonce": challenge["nonce"],
-    "carrotUploadPurpose": "validation",
-    "carrotUploadAudience": challenge["audience"],
-    **overrides,
+def _proof(
+  challenge: dict[str, Any],
+  *,
+  private_key: Any = RSA_PRIVATE_KEY,
+  algorithm: str = "RS256",
+  device: str = DEVICE,
+  challenge_id: str | None = None,
+  nonce: str | None = None,
+  audience: str | None = None,
+) -> dict[str, str]:
+  message = DEVICE_PROOF_DOMAIN + b"\0".join(value.encode("utf-8") for value in (
+    device,
+    challenge_id or str(challenge["challengeId"]),
+    nonce or str(challenge["nonce"]),
+    audience or str(challenge["audience"]),
+  ))
+  if algorithm == "RS256":
+    signature = private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+  else:
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+  return {
+    "deviceKeyAlgorithm": algorithm,
+    "devicePublicKey": _public_key_pem(private_key),
+    "deviceProof": base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii"),
   }
-
-  def encode(value: Any) -> str:
-    data = json.dumps(value, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-  return f"{encode({'alg': 'ES256', 'typ': 'JWT'})}.{encode(payload)}.signed-by-device"
 
 
 async def _challenge(client: TestClient, *, device: str = DEVICE) -> dict[str, Any]:
@@ -110,14 +138,14 @@ async def _validation_session(
   client: TestClient,
   challenge: dict[str, Any],
   *,
-  identity_token: str | None = None,
+  proof: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
   response = await client.post(
     "/api/v1/validation/session",
     json={
       "deviceId": DEVICE,
       "challengeId": challenge["challengeId"],
-      "identityToken": identity_token or _jwt(challenge),
+      **(proof or _proof(challenge)),
       "carName": "KIA CARNIVAL 4TH GEN",
       "branch": "carrot-wip",
     },
@@ -215,7 +243,7 @@ def _json_bytes(value: Any) -> bytes:
   return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def test_challenge_device_jwt_session_is_one_time_and_persistent(tmp_path: Path):
+def test_challenge_device_proof_session_is_one_time_and_persistent(tmp_path: Path):
   async def run():
     verifier = FakeVerifier()
     cfg = config(tmp_path)
@@ -229,14 +257,17 @@ def test_challenge_device_jwt_session_is_one_time_and_persistent(tmp_path: Path)
       duplicate_challenge = await _challenge(client)
       assert duplicate_challenge["challengeId"] == challenge["challengeId"]
       assert duplicate_challenge["nonce"] == challenge["nonce"]
-      token = _jwt(challenge)
-      status, body = await _validation_session(client, challenge, identity_token=token)
+      device_proof = _proof(challenge)
+      status, body = await _validation_session(client, challenge, proof=device_proof)
       assert status == 200
       assert body["verifiedDeviceId"] == DEVICE
       assert body["deviceAuthVersion"] == DEVICE_AUTH_VERSION
-      assert verifier.calls == [(token, DEVICE)]
+      assert len(verifier.calls) == 1
+      assert verifier.calls[0]["expected_device_id"] == DEVICE
+      assert verifier.calls[0]["algorithm"] == "RS256"
+      assert verifier.calls[0]["proof"] == device_proof["deviceProof"]
 
-      replay_status, replay = await _validation_session(client, challenge, identity_token=token)
+      replay_status, replay = await _validation_session(client, challenge, proof=device_proof)
       assert replay_status == 409
       assert "consumed" in replay["error"]
 
@@ -249,37 +280,113 @@ def test_challenge_device_jwt_session_is_one_time_and_persistent(tmp_path: Path)
       ).fetchone()
       assert challenge_row[0] is not None
       assert challenge_row[1]
-      purpose = connection.execute(
-        "SELECT purpose FROM sessions WHERE token_hash=?", (challenge_row[1],),
-      ).fetchone()[0]
+      purpose, device_key_sha256 = connection.execute(
+        "SELECT purpose, device_key_sha256 FROM sessions WHERE token_hash=?", (challenge_row[1],),
+      ).fetchone()
       assert purpose == "validation"
+      assert device_key_sha256 == _public_key_fingerprint(RSA_PRIVATE_KEY)
       assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
   asyncio.run(run())
 
 
-def test_wrong_claims_identity_timeout_and_failed_verification_do_not_consume(tmp_path: Path):
+def test_allowlist_revocation_blocks_validation_entrypoints_and_existing_session(tmp_path: Path):
   async def run():
     verifier = FakeVerifier()
     cfg = config(tmp_path)
     async with TestClient(TestServer(create_app(
       cfg, start_cleanup=False, validation_verifier=verifier,
     ))) as client:
-      wrong_claim_challenge = await _challenge(client)
-      status, _body = await _validation_session(
-        client,
-        wrong_claim_challenge,
-        identity_token=_jwt(wrong_claim_challenge, carrotUploadNonce="wrong"),
-      )
-      assert status == 401
-      assert verifier.calls == []
+      token = await _token(client)
+      pending_challenge = await _challenge(client)
 
-      verifier.result = OTHER_DEVICE
+    revoked = replace(cfg, allowed_device_ids=frozenset({OTHER_DEVICE}))
+    async with TestClient(TestServer(create_app(
+      revoked, start_cleanup=False, validation_verifier=verifier,
+    ))) as client:
+      challenge = await client.post(
+        "/api/v1/validation/challenge",
+        json={"deviceId": DEVICE},
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert challenge.status == 403
+
+      validation_session = await client.post(
+        "/api/v1/validation/session",
+        json={
+          "deviceId": DEVICE,
+          "challengeId": pending_challenge["challengeId"],
+          **_proof(pending_challenge),
+        },
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert validation_session.status == 403
+
+      content = b"must not be accepted after allowlist revocation"
+      upload = await client.put(
+        f"/api/v1/validation/upload/{CAPTURE}/route--0/rlog.zst",
+        data=content,
+        headers=_file_headers(token, content),
+      )
+      complete = await client.post(
+        "/api/v1/validation/complete",
+        json=_completion_body([{
+          "segment": "route--0",
+          "name": "rlog.zst",
+          "size": len(content),
+          "sha256": hashlib.sha256(content).hexdigest(),
+        }]),
+        headers=_auth(token),
+      )
+      assert upload.status == 403
+      assert complete.status == 403
+      for response in (challenge, validation_session, upload, complete):
+        assert "not allowed" in (await response.json())["error"]
+
+    assert len(verifier.calls) == 1
+    assert verifier.calls[0]["expected_device_id"] == DEVICE
+    assert not (tmp_path / "uploads" / VALIDATION_NAMESPACE / DEVICE / CAPTURE).exists()
+
+  asyncio.run(run())
+
+
+def test_device_key_pin_rotation_revokes_existing_validation_session(tmp_path: Path):
+  async def run():
+    cfg = config(tmp_path)
+    async with TestClient(TestServer(create_app(
+      cfg, start_cleanup=False, validation_verifier=FakeVerifier(),
+    ))) as client:
+      token = await _token(client)
+
+    rotated = replace(cfg, allowed_device_public_key_sha256={DEVICE: "2" * 64})
+    async with TestClient(TestServer(create_app(
+      rotated, start_cleanup=False, validation_verifier=FakeVerifier(),
+    ))) as client:
+      content = b"must not survive a receiver pin change"
+      upload = await client.put(
+        f"/api/v1/validation/upload/{CAPTURE}/route--0/rlog.zst",
+        data=content,
+        headers=_file_headers(token, content),
+      )
+      assert upload.status == 403
+      assert "key pin changed" in (await upload.json())["error"]
+
+  asyncio.run(run())
+
+
+def test_mismatched_identity_timeout_and_failed_verification_do_not_consume(tmp_path: Path):
+  async def run():
+    verifier = FakeVerifier(result=OTHER_DEVICE)
+    cfg = config(tmp_path)
+    async with TestClient(TestServer(create_app(
+      cfg, start_cleanup=False, validation_verifier=verifier,
+    ))) as client:
+      wrong_claim_challenge = await _challenge(client)
       status, _body = await _validation_session(client, wrong_claim_challenge)
       assert status == 401
 
       # Definitive authentication failures cool the challenge down before any
-      # further official-API request is allowed.
+      # further proof verification is allowed.
       status, _body = await _validation_session(client, wrong_claim_challenge)
       assert status == 429
       assert len(verifier.calls) == 1
@@ -290,7 +397,7 @@ def test_wrong_claims_identity_timeout_and_failed_verification_do_not_consume(tm
         )
 
       verifier.result = None
-      verifier.error = IdentityVerificationUnavailable("timeout")
+      verifier.error = DeviceProofVerificationUnavailable("timeout")
       status, _body = await _validation_session(client, wrong_claim_challenge)
       assert status == 503
 
@@ -308,157 +415,206 @@ def test_wrong_claims_identity_timeout_and_failed_verification_do_not_consume(tm
       assert status == 200, body
 
       expired_challenge = await _challenge(client)
-      expired = _jwt(expired_challenge, iat=1, nbf=1, exp=2)
-      status, _body = await _validation_session(client, expired_challenge, identity_token=expired)
+      with sqlite3.connect(cfg.db_path) as connection:
+        connection.execute(
+          "UPDATE validation_challenges SET expires_at=1 WHERE challenge_id=?",
+          (expired_challenge["challengeId"],),
+        )
+      status, _body = await _validation_session(client, expired_challenge)
       assert status == 401
 
   asyncio.run(run())
 
 
-class FakeContent:
-  def __init__(self, body: bytes):
-    self.body = body
-
-  async def iter_chunked(self, _size: int):
-    yield self.body
-
-
-class FakeResponse:
-  def __init__(self, status: int, body: dict[str, Any]):
-    encoded = json.dumps(body).encode()
-    self.status = status
-    self.content_length = len(encoded)
-    self.content = FakeContent(encoded)
-
-  async def __aenter__(self):
-    return self
-
-  async def __aexit__(self, *_args: Any):
-    return None
-
-
-class FakeClientSession:
-  def __init__(self, factory: "FakeSessionFactory", timeout: Any):
-    self.factory = factory
-    self.factory.timeout = timeout
-
-  async def __aenter__(self):
-    return self
-
-  async def __aexit__(self, *_args: Any):
-    return None
-
-  def get(self, url: str, **kwargs: Any):
-    self.factory.calls.append((url, kwargs))
-    if self.factory.error is not None:
-      return RaisingContext(self.factory.error)
-    return FakeResponse(self.factory.status, self.factory.body)
-
-
-class RaisingContext:
-  def __init__(self, error: Exception):
-    self.error = error
-
-  async def __aenter__(self):
-    raise self.error
-
-  async def __aexit__(self, *_args: Any):
-    return None
-
-
-class FakeSessionFactory:
-  def __init__(self, *, status: int = 200, body: dict[str, Any] | None = None, error: Exception | None = None):
-    self.status = status
-    self.body = body or {"dongle_id": DEVICE}
-    self.error = error
-    self.calls: list[tuple[str, dict[str, Any]]] = []
-    self.timeout: Any = None
-
-  def __call__(self, *, timeout: Any):
-    return FakeClientSession(self, timeout)
-
-
-def test_official_verifier_uses_fixed_device_url_jwt_header_and_no_redirects():
+def test_pinned_device_proof_verifier_accepts_rsa_and_es256_and_rejects_mismatches():
   async def run():
-    factory = FakeSessionFactory(body={"id": DEVICE})
-    verifier = CommaDeviceIdentityVerifier(
-      "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      timeout_seconds=4,
-      connect_timeout_seconds=2,
-      session_factory=factory,
+    verifier = PinnedDeviceProofVerifier()
+    challenge = {
+      "challengeId": "challenge_01234567890123456789",
+      "nonce": "nonce_012345678901234567890123",
+      "audience": "https://uploads.example.test/api/v1/validation",
+    }
+    assert UploadService._validation_device_proof_message(
+      DEVICE,
+      challenge["challengeId"],
+      challenge["nonce"],
+      challenge["audience"],
+    ) == (
+      b"dk-carrot-validation-device-proof-v2\0"
+      + DEVICE.encode()
+      + b"\0challenge_01234567890123456789"
+      + b"\0nonce_012345678901234567890123"
+      + b"\0https://uploads.example.test/api/v1/validation"
     )
-    assert await verifier.verify("device.jwt.token", DEVICE) == DEVICE
-    assert factory.calls == [(
-      f"https://api.commadotai.com/v1.1/devices/{DEVICE}/",
-      {
-        "headers": {"Authorization": "JWT device.jwt.token", "Accept": "application/json"},
-        "allow_redirects": False,
-      },
-    )]
-    assert factory.timeout.total == 4
-    assert factory.timeout.connect == 2
 
-    no_identity = FakeSessionFactory(body={"is_paired": True, "prime_type": 1})
-    no_identity_verifier = CommaDeviceIdentityVerifier(
-      "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      timeout_seconds=4,
-      connect_timeout_seconds=2,
-      session_factory=no_identity,
-    )
-    assert await no_identity_verifier.verify("device.jwt.token", DEVICE) == DEVICE
+    async def verify(private_key: Any, algorithm: str, **overrides: Any) -> str:
+      signed = _proof(challenge, private_key=private_key, algorithm=algorithm)
+      message = DEVICE_PROOF_DOMAIN + b"\0".join(value.encode() for value in (
+        DEVICE, challenge["challengeId"], challenge["nonce"], challenge["audience"],
+      ))
+      return await verifier.verify(
+        algorithm=algorithm,
+        public_key_pem=signed["devicePublicKey"],
+        proof=signed["deviceProof"],
+        message=message,
+        expected_fingerprint=_public_key_fingerprint(private_key),
+        expected_device_id=DEVICE,
+        **overrides,
+      )
 
-    redirect = FakeSessionFactory(status=302, body={"dongle_id": DEVICE})
-    redirect_verifier = CommaDeviceIdentityVerifier(
-      "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      timeout_seconds=4,
-      connect_timeout_seconds=2,
-      session_factory=redirect,
-    )
-    try:
-      await redirect_verifier.verify("device.jwt.token", DEVICE)
-      raise AssertionError("redirect must not authenticate")
-    except IdentityVerificationRejected:
-      pass
-    assert redirect.calls[0][1]["allow_redirects"] is False
+    assert await verify(RSA_PRIVATE_KEY, "RS256") == DEVICE
+    assert await verify(EC_PRIVATE_KEY, "ES256") == DEVICE
 
-    unavailable = FakeSessionFactory(status=503, body={})
-    unavailable_verifier = CommaDeviceIdentityVerifier(
-      "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      timeout_seconds=4,
-      connect_timeout_seconds=2,
-      session_factory=unavailable,
-    )
-    try:
-      await unavailable_verifier.verify("device.jwt.token", DEVICE)
-      raise AssertionError("temporary upstream failure must not reject the identity permanently")
-    except IdentityVerificationUnavailable:
-      pass
+    rsa_proof = _proof(challenge)
+    canonical = DEVICE_PROOF_DOMAIN + b"\0".join(value.encode() for value in (
+      DEVICE, challenge["challengeId"], challenge["nonce"], challenge["audience"],
+    ))
+    common = {
+      "algorithm": "RS256",
+      "public_key_pem": rsa_proof["devicePublicKey"],
+      "proof": rsa_proof["deviceProof"],
+      "message": canonical,
+      "expected_fingerprint": _public_key_fingerprint(RSA_PRIVATE_KEY),
+      "expected_device_id": DEVICE,
+    }
+    with pytest.raises(DeviceProofVerificationRejected, match="receiver pin"):
+      await verifier.verify(**{**common, "expected_fingerprint": "0" * 64})
+    with pytest.raises(DeviceProofVerificationRejected, match="signature"):
+      await verifier.verify(**{**common, "message": canonical + b"tampered"})
+    with pytest.raises(DeviceProofVerificationRejected, match="P-256"):
+      await verifier.verify(**{**common, "algorithm": "ES256"})
+    with pytest.raises(DeviceProofVerificationRejected, match="base64url"):
+      await verifier.verify(**{**common, "proof": rsa_proof["deviceProof"] + "="})
+    pkcs1_pem = RSA_PRIVATE_KEY.public_key().public_bytes(
+      serialization.Encoding.PEM,
+      serialization.PublicFormat.PKCS1,
+    ).decode("ascii")
+    with pytest.raises(DeviceProofVerificationRejected, match="PEM"):
+      await verifier.verify(**{**common, "public_key_pem": pkcs1_pem})
 
-    timeout = FakeSessionFactory(error=TimeoutError())
-    timeout_verifier = CommaDeviceIdentityVerifier(
-      "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      timeout_seconds=4,
-      connect_timeout_seconds=2,
-      session_factory=timeout,
-    )
-    try:
-      await timeout_verifier.verify("device.jwt.token", DEVICE)
-      raise AssertionError("timeout must fail closed")
-    except IdentityVerificationUnavailable:
-      pass
+  asyncio.run(run())
 
-    wrong_identity = FakeSessionFactory(body={"dongle_id": OTHER_DEVICE})
-    wrong_verifier = CommaDeviceIdentityVerifier(
-      "https://api.commadotai.com/v1.1/devices/{device_id}/",
-      timeout_seconds=4,
-      connect_timeout_seconds=2,
-      session_factory=wrong_identity,
+
+def test_default_validation_session_verifies_the_pinned_proof_locally(tmp_path: Path):
+  async def run():
+    cfg = config(tmp_path)
+    async with TestClient(TestServer(create_app(cfg, start_cleanup=False))) as client:
+      challenge = await _challenge(client)
+      status, body = await _validation_session(client, challenge)
+      assert status == 200, body
+      assert body["verifiedDeviceId"] == DEVICE
+
+      tampered_challenge = await _challenge(client)
+      legacy_jwt = await client.post(
+        "/api/v1/validation/session",
+        json={
+          "deviceId": DEVICE,
+          "challengeId": tampered_challenge["challengeId"],
+          "identityToken": "generic.comma.jwt",
+        },
+        headers={"X-Forwarded-For": CLIENT_IP},
+      )
+      assert legacy_jwt.status == 400
+      assert "not accepted" in (await legacy_jwt.json())["error"]
+
+      status, body = await _validation_session(
+        client,
+        tampered_challenge,
+        proof=_proof(tampered_challenge, nonce="not-the-server-nonce"),
+      )
+      assert status == 401
+      assert "proof" in body["error"]
+
+  asyncio.run(run())
+
+
+@pytest.mark.parametrize(("algorithm", "private_key"), [
+  ("RS256", RSA_PRIVATE_KEY),
+  ("ES256", EC_PRIVATE_KEY),
+])
+def test_actual_client_v2_proof_upload_and_manifest_contract(
+  tmp_path: Path,
+  monkeypatch,
+  algorithm: str,
+  private_key: Any,
+):
+  """Exercise the production client and receiver contract over loopback only."""
+  private_pem = private_key.private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.PKCS8,
+    serialization.NoEncryption(),
+  ).decode("ascii")
+  public_pem = _public_key_pem(private_key)
+  monkeypatch.setattr(
+    client_web_upload,
+    "get_key_pair",
+    lambda: (algorithm, private_pem, public_pem),
+  )
+
+  async def run():
+    cfg = replace(
+      config(tmp_path),
+      allowed_device_public_key_sha256={DEVICE: _public_key_fingerprint(private_key)},
     )
-    try:
-      await wrong_verifier.verify("device.jwt.token", DEVICE)
-      raise AssertionError("wrong identity must fail closed")
-    except IdentityVerificationRejected:
-      pass
+    async with TestServer(create_app(cfg, start_cleanup=False)) as server:
+      base_url = str(server.make_url("/")).rstrip("/")
+      token = await client_web_upload.create_validation_upload_session(
+        base_url,
+        {
+          "dongleId": DEVICE,
+          "carName": "KIA CARNIVAL 4TH GEN",
+          "branch": "dkcarrot-wip",
+        },
+      )
+      assert token
+
+      segment = "2026-09-06--12-34-56--0"
+      content = f"actual-{algorithm}-client-rlog".encode()
+      segment_dir = tmp_path / f"client-{algorithm}"
+      segment_dir.mkdir()
+      (segment_dir / "rlog.zst").write_bytes(content)
+      files = [{
+        "segment": segment,
+        "name": "rlog.zst",
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+      }]
+      assert await client_web_upload.upload_validation_folder_to_web(
+        str(segment_dir),
+        segment,
+        CAPTURE,
+        base_url,
+        token,
+        files,
+      ) is True
+
+      validation_capture = _capture_metadata(files)
+      receipt = await client_web_upload.send_validation_upload_complete(
+        base_url,
+        token,
+        {
+          "deviceId": DEVICE,
+          "captureId": CAPTURE,
+          "files": files,
+          "validationCapture": validation_capture,
+        },
+      )
+      expected_manifest_sha256 = client_web_upload.validation_manifest_sha256(
+        DEVICE,
+        CAPTURE,
+        files,
+        validation_capture,
+      )
+      assert receipt["ok"] is True, receipt
+      assert receipt["manifestSha256"] == expected_manifest_sha256
+      assert receipt["receiptId"] == client_web_upload.validation_receipt_id(
+        expected_manifest_sha256,
+      )
+
+      manifest_path = (
+        cfg.storage_root / VALIDATION_NAMESPACE / DEVICE / CAPTURE / "manifest.json"
+      )
+      assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == expected_manifest_sha256
 
   asyncio.run(run())
 
@@ -1757,11 +1913,11 @@ class BlockingVerifier(FakeVerifier):
     self.started = asyncio.Event()
     self.release = asyncio.Event()
 
-  async def verify(self, identity_token: str, expected_device_id: str) -> str:
-    self.calls.append((identity_token, expected_device_id))
+  async def verify(self, **kwargs: Any) -> str:
+    self.calls.append(kwargs)
     self.started.set()
     await self.release.wait()
-    return expected_device_id
+    return str(kwargs["expected_device_id"])
 
 
 def test_validation_verification_is_single_flight_per_challenge(tmp_path: Path):
@@ -1791,7 +1947,7 @@ def test_validation_verification_attempt_limit_is_persistent(tmp_path: Path):
       validation_verify_attempt_limit=2,
       validation_verify_cooldown_seconds=1,
     )
-    verifier = FakeVerifier(error=IdentityVerificationRejected("bad signature"))
+    verifier = FakeVerifier(error=DeviceProofVerificationRejected("bad signature"))
     async with TestClient(TestServer(create_app(
       cfg, start_cleanup=False, validation_verifier=verifier,
     ))) as client:
@@ -1809,7 +1965,7 @@ def test_validation_verification_attempt_limit_is_persistent(tmp_path: Path):
         json={
           "deviceId": DEVICE,
           "challengeId": challenge["challengeId"],
-          "identityToken": _jwt(challenge),
+          **_proof(challenge),
         },
         headers={"X-Forwarded-For": CLIENT_IP},
       )
@@ -1934,6 +2090,21 @@ def test_startup_reconciles_stale_parts_leases_and_missing_incomplete_rows(tmp_p
     ).fetchall()
     assert usage == [(9, 0, 4), (9, 0, 4)]
     assert connection.execute("SELECT COUNT(*) FROM validation_files").fetchone()[0] == 0
+
+
+def test_validation_only_cleanup_never_scans_legacy_routes(tmp_path: Path):
+  cfg = replace(config(tmp_path), legacy_uploads_enabled=False)
+  service = UploadService(cfg, validation_verifier=FakeVerifier())
+  validation_part = cfg.storage_root / VALIDATION_NAMESPACE / DEVICE / f".rlog.{('a' * 32)}.part"
+  legacy_part = cfg.storage_root / "routes" / DEVICE / f".qlog.{('b' * 32)}.part"
+  validation_part.parent.mkdir(parents=True)
+  legacy_part.parent.mkdir(parents=True)
+  validation_part.write_bytes(b"validation")
+  legacy_part.write_bytes(b"legacy-must-not-be-scanned")
+
+  assert service._cleanup_stale_parts_sync(int(datetime.now(UTC).timestamp()), startup=True) == 1
+  assert not validation_part.exists()
+  assert legacy_part.read_bytes() == b"legacy-must-not-be-scanned"
 
 
 def test_restart_reconciles_fresh_reservation_and_owned_parts_immediately(tmp_path: Path):

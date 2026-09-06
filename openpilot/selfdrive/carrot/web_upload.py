@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -11,12 +12,16 @@ from contextlib import ExitStack
 from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout
-from openpilot.common.api import Api
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+
+from openpilot.common.api import get_key_pair
 
 
-DEFAULT_WEB_UPLOAD_URL = "https://upload.shind0.synology.me"
+DEFAULT_WEB_UPLOAD_URL = "https://adot.synology.me"
 DEFAULT_TMUX_WEB_UPLOAD_URL = "https://tmux.carrotpilot.app/upload"
-VALIDATION_IDENTITY_TOKEN_TTL_SECONDS = 120
+VALIDATION_DEVICE_AUTH_VERSION = 2
+VALIDATION_DEVICE_PROOF_DOMAIN = b"dk-carrot-validation-device-proof-v2\0"
 VALIDATION_COMPLETION_CONNECT_TIMEOUT_SECONDS = 20
 # Completion makes the receiver re-hash as many as three rlogs (up to 750 MiB).
 # Bound connection establishment, but allow the authenticated integrity check
@@ -31,6 +36,69 @@ def normalize_base_url(value: Any, default: str = "") -> str:
   if url and not url.startswith(("http://", "https://")):
     raise ValueError("web upload URL must start with http:// or https://")
   return url
+
+
+def validation_device_proof_message(
+  device_id: str,
+  challenge_id: str,
+  nonce: str,
+  audience: str,
+) -> bytes:
+  values = (device_id, challenge_id, nonce, audience)
+  if any(not value or len(value) > 256 or "\0" in value for value in values):
+    raise RuntimeError("validation challenge contains invalid proof fields")
+  return VALIDATION_DEVICE_PROOF_DOMAIN + b"\0".join(value.encode("utf-8") for value in values)
+
+
+def _validation_device_key_material() -> tuple[str, Any, str, str]:
+  algorithm, private_pem, _public_pem = get_key_pair()
+  if algorithm not in {"RS256", "ES256"} or not private_pem:
+    raise RuntimeError("registered device signing key is unavailable")
+  try:
+    private_key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+  except Exception as exc:
+    raise RuntimeError("registered device signing key is invalid") from exc
+
+  if algorithm == "RS256":
+    if not isinstance(private_key, rsa.RSAPrivateKey) or private_key.key_size < 2048:
+      raise RuntimeError("registered RSA device key is invalid")
+  elif not isinstance(private_key, ec.EllipticCurvePrivateKey) or not isinstance(private_key.curve, ec.SECP256R1):
+    raise RuntimeError("registered EC device key is invalid")
+
+  public_key = private_key.public_key()
+  public_der = public_key.public_bytes(
+    serialization.Encoding.DER,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+  )
+  public_pem = public_key.public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+  ).decode("ascii")
+  return algorithm, private_key, public_pem, hashlib.sha256(public_der).hexdigest()
+
+
+def validation_device_key_fingerprint() -> dict[str, str]:
+  algorithm, _private_key, _public_pem, fingerprint = _validation_device_key_material()
+  return {"algorithm": algorithm, "sha256": fingerprint}
+
+
+def create_validation_device_proof(
+  device_id: str,
+  challenge_id: str,
+  nonce: str,
+  audience: str,
+) -> dict[str, str]:
+  algorithm, private_key, public_pem, _fingerprint = _validation_device_key_material()
+  message = validation_device_proof_message(device_id, challenge_id, nonce, audience)
+  if algorithm == "RS256":
+    signature = private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+  else:
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+  return {
+    "deviceKeyAlgorithm": algorithm,
+    "devicePublicKey": public_pem,
+    "deviceProof": base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii"),
+  }
 
 
 def web_upload_settings(settings: Mapping[str, Any] | None = None) -> tuple[str, str]:
@@ -100,7 +168,7 @@ def validation_manifest_sha256(
   files: Sequence[Mapping[str, Any]],
   validation_capture: Mapping[str, Any] | None = None,
 ) -> str:
-  """Hash the exact canonical manifest persisted by receiver protocol v1."""
+  """Hash the exact canonical manifest persisted by the validation receiver."""
   normalized_files = sorted(({
     "segment": str(item.get("segment") or ""),
     "name": str(item.get("name") or ""),
@@ -109,7 +177,7 @@ def validation_manifest_sha256(
   } for item in files), key=lambda item: (item["segment"], item["name"]))
   manifest = {
     "captureId": str(capture_id),
-    "deviceAuthVersion": 1,
+    "deviceAuthVersion": VALIDATION_DEVICE_AUTH_VERSION,
     "deviceId": str(device_id),
     "files": normalized_files,
     "receiptVersion": 1,
@@ -187,7 +255,7 @@ async def create_validation_upload_session(
   metadata: Mapping[str, Any],
   should_continue: Callable[[], bool] | None = None,
 ) -> str:
-  """Authenticate a validation upload with the device's registered comma key."""
+  """Authenticate with a receiver-pinned proof from the device registration key."""
   device_id = upload_device_id(metadata)
   if device_id == "unknown":
     raise RuntimeError("registered device id is required for validation upload")
@@ -208,7 +276,7 @@ async def create_validation_upload_session(
         not 200 <= response.status < 300
         or not isinstance(challenge, dict)
         or challenge.get("ok") is not True
-        or challenge.get("deviceAuthVersion") != 1
+        or challenge.get("deviceAuthVersion") != VALIDATION_DEVICE_AUTH_VERSION
         or challenge.get("receiptVersion") != 1
       ):
         error = str((challenge or {}).get("error") or text or "validation authentication unavailable")[:300]
@@ -220,24 +288,17 @@ async def create_validation_upload_session(
     audience = str(challenge.get("audience") or "")
     if not challenge_id or not nonce or not audience:
       raise RuntimeError("validation challenge is incomplete")
-    claims = {
-      "carrotUploadChallenge": challenge_id,
-      "carrotUploadNonce": nonce,
-      "carrotUploadPurpose": "validation",
-      "carrotUploadAudience": audience,
-    }
-    identity_token = await asyncio.to_thread(
-      Api(device_id).get_token,
-      payload_extra=claims,
-      # This general comma device JWT is needed only for the one-time receiver
-      # verification exchange. Keep its replay window much shorter than the
-      # receiver session used for the actual rlog upload.
-      expiry_hours=VALIDATION_IDENTITY_TOKEN_TTL_SECONDS / 3600,
+    proof = await asyncio.to_thread(
+      create_validation_device_proof,
+      device_id,
+      challenge_id,
+      nonce,
+      audience,
     )
     session_payload = _session_payload(metadata, "validation")
     session_payload.update({
       "challengeId": challenge_id,
-      "identityToken": identity_token,
+      **proof,
     })
     _ensure_validation_request_safe(should_continue)
     async with session.post(
@@ -254,7 +315,7 @@ async def create_validation_upload_session(
         not 200 <= response.status < 300
         or not isinstance(body, dict)
         or body.get("ok") is not True
-        or body.get("deviceAuthVersion") != 1
+        or body.get("deviceAuthVersion") != VALIDATION_DEVICE_AUTH_VERSION
         or body.get("receiptVersion") != 1
         or body.get("verifiedDeviceId") != device_id
       ):
@@ -268,7 +329,10 @@ def create_web_upload_session_sync(
   metadata: Mapping[str, Any],
   post: Callable[..., Any],
   purpose: str = "tmux",
+  request_allowed: Callable[[], bool] | None = None,
 ) -> str:
+  if request_allowed is not None and not request_allowed():
+    raise PermissionError("upload request is no longer allowed")
   response = post(
     api_url(base_url, "session"),
     json=_session_payload(metadata, purpose),
@@ -293,6 +357,7 @@ def post_tmux_web(
   tmux_path: str,
   settings_path: str | None = None,
   post: Callable[..., Any] | None = None,
+  request_allowed: Callable[[], bool] | None = None,
 ):
   if post is None:
     raise ValueError("web POST function is required")
@@ -302,6 +367,8 @@ def post_tmux_web(
     if settings_path and os.path.isfile(settings_path):
       settings_file = stack.enter_context(open(settings_path, "rb"))
       files.append(("files[1]", ("toggle_values.json", settings_file, "application/json")))
+    if request_allowed is not None and not request_allowed():
+      raise PermissionError("upload request is no longer allowed")
     return post(
       url,
       headers=dict(headers),
@@ -327,7 +394,26 @@ async def check_web_upload_health(base_url: str, token: str) -> dict[str, Any]:
       ) as resp:
         text = await resp.text()
         if resp.status == 200:
-          return {"ok": True, "status": resp.status, "elapsed_ms": elapsed_ms()}
+          result: dict[str, Any] = {"ok": True, "status": resp.status, "elapsed_ms": elapsed_ms()}
+          try:
+            payload = json.loads(text)
+          except (TypeError, ValueError):
+            payload = None
+          if isinstance(payload, dict):
+            if payload.get("ok") is False:
+              return {
+                "ok": False,
+                "status": resp.status,
+                "error": str(payload.get("error") or "receiver is not ready")[:300],
+                "elapsed_ms": elapsed_ms(),
+              }
+            service = payload.get("service")
+            if isinstance(service, str) and len(service) <= 64:
+              result["service"] = service
+            for key in ("deviceAllowlistConfigured", "legacyUploadsEnabled"):
+              if isinstance(payload.get(key), bool):
+                result[key] = payload[key]
+          return result
         return {"ok": False, "status": resp.status, "error": text[:300], "elapsed_ms": elapsed_ms()}
   except Exception as e:
     return {"ok": False, "error": str(e), "elapsed_ms": elapsed_ms()}

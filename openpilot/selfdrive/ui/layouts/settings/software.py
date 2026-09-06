@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 from openpilot.common.time_helpers import system_time_valid
+from openpilot.selfdrive.ui.layouts.settings.software_helpers import visible_target_branches
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, trn
@@ -20,7 +21,6 @@ STATE_TO_DISPLAY_TEXT = {
   "downloading...": tr("downloading..."),
   "finalizing update...": tr("finalizing update..."),
 }
-
 
 def time_ago(date: datetime.datetime | None) -> str:
   if not date:
@@ -179,16 +179,9 @@ class SoftwareLayout(Widget):
 
   def _on_select_branch(self):
     # Get available branches and order
-    current_git_branch = ui_state.params.get("GitBranch") or ""
     branches_str = ui_state.params.get("UpdaterAvailableBranches") or ""
-    branches = [b for b in branches_str.split(",") if b]
-
-    for b in [current_git_branch, "devel-staging", "devel", "nightly", "nightly-dev", "master"]:
-      if b in branches:
-        branches.remove(b)
-        branches.insert(0, b)
-
     current_target = ui_state.params.get("UpdaterTargetBranch") or ""
+    branches = visible_target_branches([b for b in branches_str.split(",") if b], current_target)
 
     def handle_selection(result: DialogResult):
       # Confirmed selection

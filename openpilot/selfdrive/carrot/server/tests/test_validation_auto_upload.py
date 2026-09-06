@@ -20,6 +20,8 @@ from openpilot.system.loggerd.deleter import (
 
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
+TEST_DONGLE_ID = "test-dk-validation-device"
+
 
 class FakeParams:
   def __init__(self, values=None):
@@ -41,6 +43,11 @@ class FakeParams:
 @pytest.fixture(autouse=True)
 def trusted_validation_receiver(monkeypatch):
   monkeypatch.setattr(auto_upload, "VALIDATION_UPLOAD_BASE_URL", "https://upload.example")
+  monkeypatch.setattr(
+    auto_upload,
+    "DK_VALIDATION_ALLOWED_DEVICE_ID_SHA256",
+    frozenset({auto_upload.hashlib.sha256(TEST_DONGLE_ID.encode("utf-8")).hexdigest()}),
+  )
 
 
 def safe_device_state() -> bool:
@@ -436,10 +443,12 @@ def _car_params_bytes(*, fingerprint=str(CAR.KIA_CARNIVAL_4TH_GEN), openpilot_lo
 
 def test_vehicle_gate_accepts_only_ka4_stock_radar_scc_without_longitudinal():
   accepted, metadata = auto_upload.ka4_stock_scc_gate(FakeParams({
+    "DongleId": TEST_DONGLE_ID,
     "CarParamsPersistent": _car_params_bytes(),
   }))
   assert accepted is True
   assert metadata["gatePassed"] is True
+  assert metadata["deviceAllowed"] is True
   assert metadata["safetyConfigs"]
 
   for kwargs in (
@@ -448,9 +457,19 @@ def test_vehicle_gate_accepts_only_ka4_stock_radar_scc_without_longitudinal():
     {"camera_scc": True},
   ):
     accepted, _metadata = auto_upload.ka4_stock_scc_gate(FakeParams({
+      "DongleId": TEST_DONGLE_ID,
       "CarParamsPersistent": _car_params_bytes(**kwargs),
     }))
     assert accepted is False
+
+  for device_id in (None, "", "another-device"):
+    accepted, metadata = auto_upload.ka4_stock_scc_gate(FakeParams({
+      "DongleId": device_id,
+      "CarParamsPersistent": _car_params_bytes(),
+    }))
+    assert accepted is False
+    assert metadata["reason"] == "device_not_allowed"
+    assert metadata["deviceAllowed"] is False
 
 
 def _make_segment(root: Path, route: str, index: int, *, locked=False, size=8) -> str:

@@ -29,7 +29,7 @@ For example, if the device IP is `192.168.0.25`, open:
 
 See [Carrot Web](https://github.com/ajouatom/openpilot/wiki/Guide-Carrot-Web) for connection troubleshooting and an overview of the other screens.
 
-Carrot Web has no user login and trusts devices on the local network. Use a private WPA2/WPA3 tether or hotspot with a strong unique password; do not expose ports 7000 or 6999 to the internet or use Carrot Web on public Wi-Fi. Phone tethering can use mobile data for automatic uploads.
+Carrot Web has no user login and trusts devices on the local network. Use a private WPA2/WPA3 tether or hotspot with a strong unique password; do not expose ports 7000 or 6999 to the internet or use Carrot Web on public Wi-Fi. Enabling either high-risk data-sharing setting requires an exact same-origin request from a private IP plus a fresh short-lived one-use Web session. This mitigates browser CSRF and public-host DNS rebinding, but does not authenticate another client already on that network. Phone tethering can use mobile data for automatic uploads.
 
 ## Using the Settings screen
 
@@ -99,14 +99,14 @@ Ignoring `x0.01`, `x0.001`, `cm`, `km/h`, or `%` can make a value appear one hun
 
 ## Settings map
 
-The current `carrot_settings.json` contains **176 parameters**. Every entry is assigned to one of these menus:
+The current `carrot_settings.json` contains **177 parameters**. Every entry is assigned to one of these menus:
 
 | Category | Count | Groups |
 |---|---:|---|
 | Driving control | 112 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
 | Vehicle and hardware | 14 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
 | Display | 37 | Information, path, brightness/on-road view, external HUD |
-| System | 13 | Recording/power, camera, network/map, sound, software |
+| System | 14 | Recording/power, camera, network/map, sound, software |
 
 ## Driving control
 
@@ -196,6 +196,8 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 
 `LongTuning*`, `LongActuatorDelay`, and `StoppingAccel` are advanced settings that directly affect vehicles using openpilot longitudinal control. Hyundai, Kia, and Genesis fix `LongTuningKpV`, `LongTuningKiV`, and `LongTuningKf` at the safe `100/0/100` values and hide them from settings. Some parameters have no effect when stock ACC remains responsible for acceleration and braking.
 
+For Hyundai, Kia, and Genesis, a saved `StoppingAccel=0` is automatically restored to `-50` (-0.50 m/s²) when vehicle control initializes after boot. Existing negative values are preserved, and other brands retain the traditional stop behavior for `0`.
+
 <a id="vehicle-hardware"></a>
 ## Vehicle and hardware
 
@@ -215,7 +217,7 @@ These 14 settings describe the car, harness, and device hardware configuration. 
 
 See [Radar tracks and corner radar](radar.md) before changing radar modes.
 
-For dPath RadarD, `EnableRadarTracks=-2` is the vision-only experiment; `-1` always uses SCC without vision matching; `0` matches SCC to vision; `1` matches front radar without SCC; `2` matches front radar plus low-speed SCC; and `3` uses SCC unconditionally after front-radar/vision matching fails. Matching modes use central vision at probability `0.40` or higher when matching fails. Modes `-1` and `3` use vision only when SCC is absent, and ignore the lateral coordinate of an SCC selected unconditionally. Legacy Mando radar variants with 32 or 64 slots are handled automatically. A new stationary front lead requires vision or a matching corner detection; continuous front-radar observation alone cannot authorize it. When a separate measured moving target agrees with the visual position and speed, that vision cannot authorize or retain a different stationary reflection. Corner corroboration must match the selected stationary object itself. For a front candidate without corresponding corner corroboration, a vision-support interruption beyond the permitted brief hold resets both the pending object and its confirmation time before confirmation starts again. An already selected moving front can remain L1 within a bounded vision-uncertainty range while the same measured track stays physically continuous; a fixed 8 m difference alone no longer discards it. A new nearer match can replace it immediately, and gaps or physical jumps reset this allowance.
+For dPath RadarD, `EnableRadarTracks=-2` is the vision-only experiment; `-1` always uses SCC without vision matching; `0` matches SCC to vision; `1` matches front radar without SCC; `2` matches front radar plus low-speed SCC; and `3` uses SCC unconditionally after front-radar/vision matching fails. Matching modes use central vision at probability `0.40` or higher when matching fails. Modes `-1` and `3` use vision only when SCC is absent, and ignore the lateral coordinate of an SCC selected unconditionally. Legacy Mando radar variants with 32 or 64 slots are handled automatically. A new stationary front lead requires vision or a matching corner detection; continuous front-radar observation alone cannot authorize it. When a separate measured moving target agrees with the visual position and speed, that vision cannot authorize or retain a different stationary reflection. Corner corroboration must match the selected stationary object itself. For a front candidate without corresponding corner corroboration, a vision-support interruption beyond the permitted brief hold resets both the pending object and its confirmation time before confirmation starts again. An already selected moving front can remain L1 within a bounded vision-uncertainty range while the same measured track stays physically continuous; a fixed 8 m difference alone no longer discards it. A new nearer match can replace it immediately, and gaps or physical jumps reset this allowance. A distant stopped front can qualify on a gentle curve through continuous measured radar history and repeated visual position agreement. Continuous corner position/speed evidence participates in that decision. Confirmed stationary fronts can bridge visual-range noise within distance and time limits while publishing radar distance and speed.
 
 `HardwareC3xLite` must remain off on standard C3 and C3X hardware. Enable it only on a C3X Lite, then reboot the device. The setting skips the unavailable amplifier so startup is not delayed by I2C retries, uses the GPIO buzzer for alerts, disables `micd`, `soundd`, and `loggerd`, and turns off `RecordAudio`. Normal route logging is unavailable while this hardware mode is enabled.
 
@@ -251,7 +253,7 @@ The final `ClusterHudScreenMode` layout is:
 - `4` fits the 3D world and driving HUD into the same 1124 px driving region as mode `0` and uses the complete opposite 792 px information region for the graph. The acceleration, steering, fuel, and DEF gauges plus TPMS remain inside the driving region's right edge. Swapping the panel layout exchanges the graph and driving regions together.
 - `5` always shows the driving report.
 
-`ClusterHudScreenMode=5` shows a live driving report in the information panel. In default screen mode (`0`), the same report is shown automatically while no live navigation is being received, and the navigation panel returns when reception starts. The report background, cards, outlines, primary text, secondary text, and unavailable-value colors follow the active `ClusterHudTheme`, including Auto, Dark, and Light modes. Its large card summarizes driving time, distance, average and maximum speed, the automated-driving ratio, maximum acceleration/deceleration, and hard acceleration/braking/corner counts. The small card presents CPU load, temperature, memory, and disk use as a 2×2 set of circular gauges. Its lower target plots the stored device pitch (P) vertically and yaw (Y) horizontally relative to the calibrated center while retaining the numeric angles. The driving area retains the branch, network address, and frame-rate status; the core-usage text is omitted when it would overlap the report. In road-camera view, detected vehicles are enclosed by transparent rounded frames whose border retains the existing detection color; ungrouped radar detections use smaller transparent rounded markers in their source color. Vehicle frames use one lightweight outline, and frames that would be partially projected at the screen edge or stretched by a noisy radar heading are omitted.
+`ClusterHudScreenMode=5` shows a live driving report in the information panel. In default screen mode (`0`), the same report is shown automatically while no live navigation is being received, and the navigation panel returns when reception starts. The report background, cards, outlines, primary text, secondary text, and unavailable-value colors follow the active `ClusterHudTheme`, including Auto, Dark, and Light modes. Its large card summarizes driving time, distance, average and maximum speed, the automated-driving ratio, maximum acceleration/deceleration, and hard acceleration/braking/corner counts. The small card presents CPU load, temperature, memory, and disk use as a 2×2 set of circular gauges. Its lower target plots the stored device pitch (P) vertically and yaw (Y) horizontally relative to the calibrated center while retaining the numeric angles. The driving area retains the branch, network address, and frame-rate status; the core-usage text is omitted when it would overlap the report. The branch update indicator reads the advertised remote head without writing to the running repository; until a new commit has been downloaded, it conservatively reports at least one available update rather than an exact count. In road-camera view, detected vehicles are enclosed by transparent rounded frames whose border retains the existing detection color; ungrouped radar detections use smaller transparent rounded markers in their source color. Vehicle frames use one lightweight outline, and frames that would be partially projected at the screen edge or stretched by a noisy radar heading are omitted.
 
 The external HUD follows the device `LanguageSetting` and updates driving-report, driving-mode, and navigation status labels live in Korean (`ko`) or English (`en`). Other language values, including Chinese, fall back to English. With `IsMetric` enabled, vehicle/cruise/limit speeds, navigation, radar labels, and the driving report use `km/h`, `m`, and `km`; with it disabled they are converted to `mph`, `ft`, and `mi`. Acceleration and temperature remain `m/s²` and `°C`. Both settings are polled about once per second and do not require a HUD restart.
 
@@ -274,20 +276,22 @@ The Replay event timeline also identifies Carrot Navi connection and route-sessi
 <a id="system"></a>
 ## System
 
-The 13 system settings cover recording, power, cameras, network, maps, sound, and software menus.
+The 14 system settings cover recording, power, cameras, network, maps, sound, and software menus.
 
 | Group | Parameters | Purpose |
 |---|---|---|
-| Recording and power | `RecordRoadCam`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | Road-camera storage, automatic KA4 validation-log upload, and delayed shutdown |
+| Recording and power | `RecordRoadCam`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | Road-camera storage, Carrot community data sharing, automatic KA4 validation-log upload, and delayed shutdown |
 | YouTube Live | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | Video streaming, quality, and timestamp |
 | Camera | `UseWideCamera` | Input fallback for a failed wide road camera |
 | Network and map | `HotspotOnBoot`, `MapboxStyle` | Boot hotspot and map background style |
 | Sound | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | Prompt language and volume |
 | Software | `SoftwareMenu` | Software-update menu availability |
 
-`CarrotValidationAutoUpload` is off by default. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It can handle at most 3 full rlogs per event capture and 14 captures / 42 full rlogs per campaign, with at most 5 captures / 750 MiB pending at once. The 750 MiB concurrent-pending cap does not limit cumulative uploads or retry traffic; after the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. Uploads use only the receiver built into the branch or fixed at deployment time; the ordinary Web upload destination cannot redirect them. The setting row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
+`CarrotCommunityDataSharing` is off by default. Explicitly enabling it while parked permits Carrot community services to receive device identifiers, vehicle name, branch/commit, local network address and heartbeat status, all setting values and the catalog, automatic onroad/exception tmux diagnostics, and setting snapshots. It also permits popular-setting downloads, CWP address registration, and bundled Discord notifications for Support Terminal, Vision diagnostics, and manual dashcam-upload completion. Turning it off immediately blocks new community requests and automatic tmux collection/retries, and discards pending automatic exception uploads. A user-configured NAS or Discord URL and an explicitly started manual dashcam upload itself remain independent, but its bundled Discord completion notification is blocked. `CarrotValidationAutoUpload` below is also independent because it has separate consent and a fixed private-NAS receiver. This consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically.
 
-`SoftwareMenu` shows the software-update menu. A user-requested `CHECK`, `DOWNLOAD`, or `INSTALL` is available while vehicle power is on without a gear, motion, or openpilot-engagement gate. Periodic automatic update work remains paused onroad. Disable this setting if the software menu causes a memory problem.
+`CarrotValidationAutoUpload` is off by default, and this experimental campaign arms only on the owner's allowlisted DK device; the branch stores only a one-way hash of its identifier. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It can handle at most 3 full rlogs per event capture and 14 captures / 42 full rlogs per campaign, with at most 5 captures / 750 MiB pending at once. The 750 MiB concurrent-pending cap does not limit cumulative uploads or retry traffic; after the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. Uploads use only the receiver built into the branch or fixed at deployment time; the ordinary Web upload destination cannot redirect them. The setting row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
+
+`SoftwareMenu` shows the software-update menu. A user-requested `CHECK`, `DOWNLOAD`, or `INSTALL` is available while vehicle power is on without a gear, motion, or openpilot-engagement gate. The `Target Branch` picker shows only this user fork's `dkcarrot-wip`, compatibility `carrot-wip`, and `carrot` branches, while keeping an already installed model-specific branch visible as the current target. Periodic automatic update work remains paused onroad. Disable this setting if the software menu causes a memory problem.
 
 Check storage use for recording and network use, heat, and privacy before enabling live streaming.
 

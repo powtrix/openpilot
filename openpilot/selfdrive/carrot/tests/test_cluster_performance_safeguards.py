@@ -5,6 +5,7 @@ import importlib
 import os
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import types
 
@@ -356,6 +357,63 @@ def test_git_status_remote_enabled_starts_background_refresh(tmp_path, monkeypat
   assert provider._worker is not None
   provider._worker.join(timeout=1.0)
   assert refreshed == [True]
+
+
+def test_cluster_git_behind_count_reads_remote_without_writing_git_dir(tmp_path):
+  def git(cwd, *args):
+    return subprocess.run(
+      ["git", *args],
+      cwd=cwd,
+      check=True,
+      capture_output=True,
+      text=True,
+    )
+
+  remote = tmp_path / "remote.git"
+  repo = tmp_path / "repo"
+  publisher = tmp_path / "publisher"
+  git(None, "init", "--bare", str(remote))
+  git(None, "init", str(repo))
+  git(repo, "config", "user.email", "test@example.com")
+  git(repo, "config", "user.name", "test")
+  (repo / "initial.txt").write_text("initial\n", encoding="utf-8")
+  git(repo, "add", "initial.txt")
+  git(repo, "commit", "-m", "initial")
+  git(repo, "branch", "-M", "main")
+  git(repo, "remote", "add", "origin", str(remote))
+  git(repo, "push", "-u", "origin", "main")
+
+  git(None, "clone", "--branch", "main", str(remote), str(publisher))
+  git(publisher, "config", "user.email", "test@example.com")
+  git(publisher, "config", "user.name", "test")
+  for index in range(2):
+    (publisher / f"remote-{index}.txt").write_text(f"{index}\n", encoding="utf-8")
+    git(publisher, "add", f"remote-{index}.txt")
+    git(publisher, "commit", "-m", f"remote {index}")
+  git(publisher, "push", "origin", "main")
+
+  provider = GitBranchStatusProvider(repo)
+  git_dir = repo / ".git"
+
+  def git_file_mtimes():
+    return {
+      path.relative_to(repo): path.stat().st_mtime_ns
+      for path in (git_dir, *git_dir.rglob("*"))
+    }
+
+  before = git_file_mtimes()
+  assert provider._behind_count("origin", "main") == 1
+  assert git_file_mtimes() == before
+
+  git(repo, "fetch", "origin", "main")
+  before = git_file_mtimes()
+  assert provider._behind_count("origin", "main") == 2
+  assert git_file_mtimes() == before
+
+  git(repo, "reset", "--hard", "FETCH_HEAD")
+  before = git_file_mtimes()
+  assert provider._behind_count("origin", "main") == 0
+  assert git_file_mtimes() == before
 
 
 def test_lfa_icon_uses_active_color_rotation_and_c4_lane_overlay(monkeypatch):

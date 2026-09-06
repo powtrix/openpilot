@@ -1,77 +1,82 @@
-# Carrot web upload
+# DK private log receiver
 
-Carrot diagnostics and dashcam logs use HTTP(S) only. The runtime contains no
-FTP connection, account, password, port, or fallback path.
+The `dkcarrot-wip` production receiver is the owner's private, authenticated
+KA4 automatic-validation endpoint. It uses HTTP(S) only; no FTP, DSM account,
+password, WebDAV, or shared storage credential is present on the vehicle.
 
-## User experience
+## Production behavior
 
-There is no account setup and no token field. A device requests a short-lived
-upload session automatically using its Dongle ID, and the server binds that
-session to the Dongle ID and source IP. The same server handles dashcam files
-and tmux diagnostics.
+- The built-in destination is `https://adot.synology.me`.
+- `CarrotValidationAutoUpload` is an independent, default-off consent. It is
+  restricted on both client and server to the owner's allowlisted DK device and the
+  KA4 stock radar-SCC/no-openpilot-longitudinal topology.
+- The receiver exchanges a one-time challenge and verifies a domain-separated
+  signature made by the device registration key against a privately pinned
+  public-key fingerprint. No reusable comma API bearer leaves the device.
+  Every upload session is also bound to its source IP.
+- The production DSM configuration sets
+  `CARROT_LEGACY_UPLOADS_ENABLED=false`. Therefore the unauthenticated legacy
+  dashcam/tmux session API is deliberately unavailable on the public endpoint.
+- `CarrotCommunityDataSharing` is a separate default-off switch for Carrot
+  community heartbeat, settings statistics, CWP, automatic tmux diagnostics,
+  and bundled Discord destinations. It does not authorize or redirect the
+  private KA4 validation path.
 
-Tmux diagnostics are also sent independently to
-`https://tmux.carrotpilot.app/upload`, which creates the Discord `carrot_logs`
-forum entry. The automatic onroad report includes both `tmux.log` and
-`toggle_values.json`; exception and manual reports include the tmux log. A DSM
-failure does not redirect or suppress this independent Carrot Logs copy.
+The normal Carrot Web dashcam/tmux client remains useful with an explicitly
+configured private receiver that implements its session API. The public DK
+receiver does not accept that legacy protocol: a manual upload to its default
+URL fails closed with HTTP 403. Local log browsing, download, tmux capture, and
+KA4 automatic validation are unaffected. Do not enable the legacy protocol on
+the Internet merely to make manual upload work; a Dongle ID is not a secret.
 
-In Carrot Web, **Tools > Web settings > Web upload** contains only:
+## Validation API and protection policy
 
-- Upload server (default: `https://upload.shind0.synology.me`)
-- Test connection
+- `GET /api/v1/health` is public and reports readiness plus non-sensitive
+  policy flags. It returns HTTP 503 when the device allowlist is empty.
+- `POST /api/v1/validation/challenge` issues a persisted one-time nonce only
+  for the allowed Dongle ID.
+- `POST /api/v1/validation/session` verifies the challenge-bound signature
+  locally against the device's pinned public-key fingerprint and returns a
+  random validation-only bearer session.
+- `PUT /api/v1/validation/upload/{captureId}/{segment}/{filename}` accepts only
+  immutable `rlog`, `rlog.zst`, or `rlog.bz2` objects with exact size and SHA-256.
+- `POST /api/v1/validation/complete` re-hashes all files and atomically writes
+  the canonical receipt manifest.
+- `/api/v1/session`, ordinary dashcam upload/completion, and tmux upload return
+  HTTP 403 in the production validation-only policy.
 
-An operator may override the base URL with `CARROT_WEB_UPLOAD_URL`. The
-`CARROT_WEB_UPLOAD_TOKEN` environment variable remains an operator-only escape
-hatch for a private server; it is not stored or shown in Carrot Web.
+The deployed limits include a 1 GiB per-device UTC-day network quota, 512 MiB
+per file, two validation uploads per device, eight globally, and a 10 GiB
+free-space floor. Partial files and reservations are reconciled after restart;
+published files and unrelated NAS content are never overwritten or deleted.
 
-Uploads use three concurrent HTTPS streams per device by default, configurable
-from one to six with `CARROT_WEB_UPLOAD_CONCURRENCY`. There is no bandwidth
-throttle.
+## DSM deployment and exposure
 
-## API and protection policy
+The hardened receiver lives in `tools/carrot_upload_server`. Deploy the exact
+reviewed commit with `deploy_dsm.sh` from DSM Task Scheduler. The script builds
+`dk-upload`, starts it as a dedicated numeric UID/GID `10001:10001` without
+Linux capabilities or a DSM administrators group, checks the fail-closed
+health response, and restores the previous container if the new one fails or
+the deployment is interrupted.
 
-- `GET /api/v1/health` is public and reports readiness and limits.
-- `POST /api/v1/session` validates a Dongle ID and returns a random,
-  short-lived session bound to that device and source IP.
-- `PUT /api/v1/upload/{device}/{segment}/{filename}` streams one file. The
-  client sends `X-File-Size`; the server writes to a temporary file, verifies
-  the exact size, fsyncs it, and atomically renames it.
-- `POST /api/v1/complete` stores the completed dashcam-upload manifest.
-- `POST /api/v1/tmux/upload` accepts the tmux log and optional settings file as
-  multipart data.
+The container binds only `127.0.0.1:18080` and can see only these two writable
+host paths; the rest of `/volume1/openpilot` is not mounted at all:
 
-The deployed defaults are:
+- `/volume1/openpilot/.carrot-validation-v1` — completed captures and manifests
+- `/volume1/docker/dk-upload/state` — sessions, quotas, and receiver state
 
-- 1 GiB per Dongle ID per UTC day
-- 8 GiB per source IP per UTC day
-- no transfer-speed limit
-- 3 concurrent uploads per device and 16 globally
-- 512 MiB maximum per dashcam file and 16 MiB per tmux request
-- 10 GiB free-space floor; existing files are never deleted automatically
-- strict device, segment, filename, file-type, and path-confinement checks
+DSM should expose the service through one reverse-proxy rule from
+`https://adot.synology.me:443` to `http://127.0.0.1:18080`, using the trusted
+certificate for that hostname. Forward only router TCP 443 to NAS TCP 443. Do
+not expose port 18080, DSM management, SMB, FTP, WebDAV, or a file-download
+route.
 
-Uploaded content has no public download route and is never executed. The DSM
-container runs without root privileges, with a read-only root filesystem and a
-single writable data volume.
+Before enabling collection, verify all of the following from a genuinely
+external network:
 
-## DSM deployment and cutover
-
-The receiver and hardened Container Manager configuration live in
-`tools/carrot_upload_server`. DSM should expose it only through an HTTPS reverse
-proxy:
-
-1. Run the container on loopback `127.0.0.1:18080`.
-2. Proxy `https://upload.shind0.synology.me:443` to
-   `http://127.0.0.1:18080` and assign a trusted certificate.
-3. Verify public health, automatic session creation, a real segment upload,
-   exact returned file sizes, completion manifest, and a tmux upload.
-4. Then delete the old transfer account, disable the DSM FTP service, and
-   remove its router/firewall rule if nothing else uses it.
-
-The application does not need DSM FTP, WebDAV, or a shared user credential.
-DSM keeps the original remote layout. Dashcam files go to
-`/volume1/openpilot/routes/<CarName> <DongleID>/<segment>`, while tmux files go
-to `/volume1/openpilot/<GitBranch>/<CarName> <DongleID>/`. The private
-`/volume1/openpilot/tmux/.state` directory holds manifests, sessions, and quota
-state. The web receiver never scans or deletes the existing Openpilot tree.
+1. health is HTTP 200 with `service=dk-upload`, allowlist and writable storage
+   confirmed, and legacy uploads disabled;
+2. the allowed device receives a challenge and another device gets HTTP 403;
+3. the legacy session endpoint gets HTTP 403;
+4. one authenticated vehicle capture completes with matching hashes and a
+   canonical `manifest.json` under the exact Dongle-ID directory.
