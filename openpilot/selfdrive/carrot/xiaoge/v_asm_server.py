@@ -686,6 +686,13 @@ def create_server(
   params: Params | None = None,
   consent_generation: str | None = None,
 ) -> tuple[VASMService, ThreadingHTTPServer]:
+  # Camera wakeups can leave receivers on camerad's isolated CPU, where realtime
+  # driving tasks take precedence. Set affinity before OpenCV creates workers so
+  # both inference and camera threads stay on the background cores.
+  if sys.platform == "linux":
+    from openpilot.common.realtime import set_core_affinity
+    set_core_affinity([0, 1, 2, 3])
+  cv2.setNumThreads(2)
   service = VASMService(model_path, params, consent_generation)
   Handler.service = service
   server = ThreadingHTTPServer((host, port), Handler)
