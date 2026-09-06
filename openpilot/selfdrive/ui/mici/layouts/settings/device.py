@@ -216,10 +216,6 @@ class UpdateOpenpilotBigButton(BigButton):
   def _update_state(self):
     super()._update_state()
 
-    if ui_state.started:
-      self.set_enabled(False)
-      return
-
     updater_state = ui_state.params.get("UpdaterState") or ""
     failed_count = ui_state.params.get("UpdateFailedCount")
     failed = False if failed_count is None else int(failed_count) > 0
@@ -257,6 +253,7 @@ class UpdateOpenpilotBigButton(BigButton):
 
     elif self._state == UpdaterState.IDLE:
       self.set_rotate_icon(False)
+      self.set_enabled(True)
       if failed:
         if self.get_value() != "failed to update":
           self.set_value("failed to update")

@@ -283,9 +283,11 @@ The 13 system settings cover recording, power, cameras, network, maps, sound, an
 | Camera | `UseWideCamera` | Input fallback for a failed wide road camera |
 | Network and map | `HotspotOnBoot`, `MapboxStyle` | Boot hotspot and map background style |
 | Sound | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | Prompt language and volume |
-| Software | `SoftwareMenu` | Carrot Web software-menu availability |
+| Software | `SoftwareMenu` | Software-update menu availability |
 
 `CarrotValidationAutoUpload` is off by default. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It can handle at most 3 full rlogs per event capture and 14 captures / 42 full rlogs per campaign, with at most 5 captures / 750 MiB pending at once. The 750 MiB concurrent-pending cap does not limit cumulative uploads or retry traffic; after the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. Uploads use only the receiver built into the branch or fixed at deployment time; the ordinary Web upload destination cannot redirect them. The setting row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
+
+`SoftwareMenu` shows the software-update menu. A user-requested `CHECK`, `DOWNLOAD`, or `INSTALL` is available while vehicle power is on without a gear, motion, or openpilot-engagement gate. Periodic automatic update work remains paused onroad. Disable this setting if the software menu causes a memory problem.
 
 Check storage use for recording and network use, heat, and privacy before enabling live streaming.
 

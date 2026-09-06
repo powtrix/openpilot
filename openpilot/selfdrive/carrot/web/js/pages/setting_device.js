@@ -511,7 +511,7 @@ function renderDeviceGroupItems(groupId, values) {
   if (groupId === "Developer") return renderDeviceDeveloperItems(data);
   if (groupId === "Software") {
     let html = "";
-    html += renderDeviceInfoRow(getUIText("updates_offroad_only", "Updates are only downloaded while the car is off."), "");
+    html += renderDeviceInfoRow(getUIText("updates_offroad_only", "Manual updates are available while vehicle power is on."), "");
     html += renderDeviceVersionRow(getUIText("current_version", "Current Version"), data.UpdaterCurrentDescription || "-");
     html += renderDeviceActionRow(getUIText("download", "Download"), data.UpdaterState || "-", getUIText("check_upper", "CHECK"), "btnDeviceUpdateCheck", "smallBtn", true);
     html += renderDeviceActionRow(getUIText("install_update", "Install Update"), data.UpdaterNewDescription || "-", getUIText("install_upper", "INSTALL"), "btnDeviceInstallUpdate", "smallBtn", true);

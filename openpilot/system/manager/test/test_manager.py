@@ -7,7 +7,7 @@ from openpilot.cereal import car
 from openpilot.common.params import Params
 import openpilot.system.manager.manager as manager
 from openpilot.system.manager.process import ensure_running
-from openpilot.system.manager.process_config import enable_youtube_wide_encoder, managed_processes, procs
+from openpilot.system.manager.process_config import enable_updated, enable_youtube_wide_encoder, managed_processes, procs
 from openpilot.system.hardware import HARDWARE
 
 os.environ['FAKEUPLOAD'] = "1"
@@ -48,6 +48,18 @@ class TestManager:
 
     assert enable_youtube_wide_encoder(True, FakeParams(True), car.CarParams.new_message())
     assert not enable_youtube_wide_encoder(True, FakeParams(False), car.CarParams.new_message())
+
+  def test_updated_runs_onroad_and_offroad_when_software_menu_is_enabled(self):
+    params = Params()
+    CP = car.CarParams.new_message()
+
+    params.put_bool("SoftwareMenu", True)
+    assert enable_updated(False, params, CP)
+    assert enable_updated(True, params, CP)
+
+    params.put_bool("SoftwareMenu", False)
+    assert not enable_updated(False, params, CP)
+    assert not enable_updated(True, params, CP)
 
   def test_radard_is_always_carrot_radar(self):
     CP = car.CarParams.new_message()

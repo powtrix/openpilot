@@ -1178,8 +1178,8 @@ msgid "Unknown Vehicle Variant"
 msgstr "CAN 오류 : 장치를 점검하세요"
 
 #: openpilot/selfdrive/ui/layouts/settings/software.py
-msgid "Updates are only downloaded while the car is off."
-msgstr "업데이트는 차량 전원이 꺼져 있을 때만 다운로드됩니다."
+msgid "Manual updates are available while vehicle power is on."
+msgstr "차량 전원이 켜진 상태에서도 수동 업데이트를 사용할 수 있습니다."
 
 #: openpilot/selfdrive/ui/widgets/prime.py
 msgid "Upgrade Now"
@@ -1467,4 +1467,3 @@ msgstr "신호가바뀌었어요."
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "🔥 Firehose Mode 🔥"
 msgstr "🔥 파이어호스 모드 🔥"
-
