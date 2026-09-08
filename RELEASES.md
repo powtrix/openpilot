@@ -1,5 +1,6 @@
-dkcarrot-wip (2026-09-06)
+dkcarrot-wip (2026-09-08)
 ========================
+* Restore the earlier final-planned-speed resume criterion on dkcarrot-wip's stock-SCC HDA1 KA4 path so the near-term shouldStop threshold does not additionally block slow departure requests; retain steering, controller interlocks, and OEM fault warnings
 * Keep prepared branch updates installable while Carrot Web checks Git status
 * Focus the device target-branch picker on dkcarrot-wip and compatibility branches
 * Add powered manual updates and passive KA4 stock-SCC validation support

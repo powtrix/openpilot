@@ -124,7 +124,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 - `AutoEngage`: `0` 끄기, `1` 조향 ON, `2` 조향 ON과 크루즈 대기입니다.
 - `AutoCruiseControl`: 현대·기아 차량용 오토크루즈와 소프트홀드 관련 설정입니다.
 - `SoftHoldOnCancel`: 크루즈가 취소된 상태에서도 정차 후 소프트홀드를 허용할지 정합니다.
-- 2023년식 KA4 순정 SCC 정차 동작은 별도 스위치 없이 차량 구성에 따라 자동 적용됩니다. 범위와 제한은 [버튼·프리셋의 KA4 시험 설명](buttons-presets.md#ka4-stock-scc-standstill)을 확인하세요.
+- `dkcarrot-wip`의 KA4 HDA1 순정 레이더 SCC·비롱컨 및 CRC 보호 대체 `0x1AA` 버튼 구성에는 정차 중 일반 속도동기화 버튼 차단과 제한된 30초 재출발 유지 시험이 별도 스위치 없이 적용됩니다. 정상 재출발 요청은 유효한 최종 계획속도 `0.1 m/s` 초과라는 예전 기준을 복원하여, 느린 출발을 막을 수 있는 `shouldStop=false` 추가 조건을 사용하지 않습니다. 비교·복구용 브랜치와 다른 차량 구성의 동작은 바꾸지 않습니다. 대상은 2023 KA4이며 범위와 실차 검증 한계는 [버튼·프리셋의 KA4 설명](buttons-presets.md#ka4-stock-scc-standstill)을 확인하세요.
 - `DisableMinSteerSpeed`: SMDPS 장착 차량의 저속 조향 제한과 관련된 차량별 설정입니다.
 
 ### 버튼·프리셋 — 15개

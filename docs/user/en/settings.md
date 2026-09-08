@@ -124,7 +124,7 @@ These 111 settings can affect vehicle motion. Change one item at a time.
 - `AutoEngage`: `0` off, `1` lateral on, `2` lateral on with cruise ready.
 - `AutoCruiseControl` covers Hyundai/Kia auto-cruise and soft-hold behavior.
 - `SoftHoldOnCancel` permits soft hold after stopping while cruise is canceled.
-- The 2023 KA4 stock-SCC standstill behavior is applied automatically by vehicle topology, without a separate switch. Its scope and limits are documented under [KA4 stock-SCC standstill extension](buttons-presets.md#ka4-stock-scc-standstill).
+- On `dkcarrot-wip`, ordinary speed-sync buttons are blocked at a stop and the bounded 30-second resume-retention experiment runs without a separate switch on the KA4 HDA1 stock-radar-SCC, non-longitudinal topology with the CRC-protected alternate `0x1AA` button layout. Normal departure requests restore the earlier valid final planned speed above `0.1 m/s` criterion, without the additional `shouldStop=false` condition that can block slow departures. Comparison/recovery branches and other vehicle configurations retain their existing behavior. The validation target is the 2023 KA4; scope and on-car validation limits are documented under [KA4 stock-SCC resume retention](buttons-presets.md#ka4-stock-scc-standstill).
 - `DisableMinSteerSpeed` is vehicle-specific and relates to low-speed steering restrictions on SMDPS-equipped cars.
 
 ### Buttons and presets — 15 settings

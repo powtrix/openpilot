@@ -46,19 +46,20 @@ def lane_mode_control_enabled(use_lane_lines: bool, v_turn_speed: int, curve_spe
 
 
 def standstill_resume_requested(enabled: bool, cruise_standstill: bool, speeds, should_stop: bool,
-                                require_departing_plan: bool) -> bool:
-  """Keep existing resume behavior, with an extra departure gate for KA4.
+                                use_legacy_ka4_resume: bool) -> bool:
+  """Restore the pre-4332faa7 resume criterion for the scoped DK KA4 path.
 
-  ``shouldStop`` alone can clear while the model horizon still ends at zero.
-  The stricter check is intentionally limited to the affected KA4 stock-SCC
-  path so other brands retain their established resume semantics.
+  ``shouldStop`` uses a near-term stopping threshold and can remain true for a
+  slowly departing plan. The stock-SCC resume request originally used the
+  final planned speed instead. Other vehicles and branches keep their current
+  ``shouldStop`` behavior; the controller still applies its button interlocks.
   """
-  if not (enabled and cruise_standstill and len(speeds) > 0 and not should_stop):
+  if not (enabled and cruise_standstill and len(speeds) > 0):
     return False
-  if not require_departing_plan:
-    return True
-  final_planned_speed = speeds[-1]
-  return math.isfinite(final_planned_speed) and final_planned_speed > STANDSTILL_RESUME_MIN_PLANNED_SPEED
+  if use_legacy_ka4_resume:
+    final_planned_speed = speeds[-1]
+    return math.isfinite(final_planned_speed) and final_planned_speed > STANDSTILL_RESUME_MIN_PLANNED_SPEED
+  return not should_stop
 
 
 def dk_ka4_stock_scc_resume_gate(branch, CP) -> bool:

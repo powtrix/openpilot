@@ -890,11 +890,10 @@ class CarController(CarControllerBase):
     target = int(set_speed_in_units+0.5)
     current = int(CS.out.cruiseState.speed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH) + 0.5)
     v_ego_kph = CS.out.vEgo * CV.MS_TO_KPH
-    # The KA4's set-speed synchronizer used to keep generating ordinary
-    # SET/RES traffic after the car was already stopped. That traffic is not a
-    # standstill keepalive and can make the stock SCC enter its
-    # switch-or-pedal state immediately. At a physical stop, allow only the
-    # planner-qualified departure RES or the separately bounded keepalive.
+    # Ordinary set-speed synchronization does not establish departure intent.
+    # At a physical KA4 stop, allow only the planner-qualified departure RES
+    # or the separately bounded keepalive. This restriction is not evidence
+    # that speed-sync traffic caused the reported on-car standstill failure.
     dk_ka4_supported = self.dk_ka4_runtime_branch and _ka4_stock_scc_standstill_supported(self.CP)
     ka4_physical_stop = (
       dk_ka4_supported and CS.out.standstill and
