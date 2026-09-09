@@ -3,6 +3,7 @@ import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.deceleration_source import deceleration_source_presentation
+from openpilot.selfdrive.ui.dk_deployment import load_dk_deployment_text
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.hardware.usbgpu import usbgpu_badge_state
@@ -205,6 +206,13 @@ class HudRenderer(Widget):
     self._date_time_minute_key: tuple[int, int, int, int, int] | None = None
     self._date_time_text = ""
     self._date_text = ""
+    # Keep this immutable for the running UI: an in-place update must not make
+    # the old process advertise the next deployment before it has restarted.
+    try:
+      deployment_branch = ui_state.params.get("GitBranch")
+    except Exception:
+      deployment_branch = None
+    self._dk_deployment_text = load_dk_deployment_text(deployment_branch)
 
   def _refresh_hud_params(self, now: float) -> None:
     if now < self._hud_params_next_refresh_time:
@@ -1011,10 +1019,12 @@ class HudRenderer(Widget):
 
   def _draw_date_time(self, rect: rl.Rectangle) -> None:
     show_datetime = self._show_date_time
-    if show_datetime <= 0:
+    deployment_text = getattr(self, "_dk_deployment_text", "")
+    if show_datetime <= 0 and not deployment_text:
       return
 
-    self._refresh_date_time_text(time.localtime())
+    if show_datetime > 0:
+      self._refresh_date_time_text(time.localtime())
 
     x = int(rect.x + 170)
     y = int(rect.y + 120)
@@ -1028,9 +1038,19 @@ class HudRenderer(Widget):
         align="center_bottom",
       )
 
+    has_clock = show_datetime in (1, 2)
+    if deployment_text:
+      draw_text_ui_style(
+        deployment_text, x, y + 44 if has_clock else y, 28, COLORS.WHITE_220,
+        font=self._font_display,
+        border_width=1.5,
+        shadow_offset=3.0,
+        align="center_bottom",
+      )
+
     if show_datetime in (1, 3):
       draw_text_ui_style(
-        self._date_text, x, y + 70, 60, rl.WHITE,
+        self._date_text, x, y + 70 + ((56 if has_clock else 16) if deployment_text else 0), 60, rl.WHITE,
         font=self._font_display,
         border_width=3.0,
         shadow_offset=8.0,

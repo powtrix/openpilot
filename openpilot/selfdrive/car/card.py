@@ -23,6 +23,7 @@ from openpilot.selfdrive.car.card_diagnostics import should_log_card_diagnostics
 from openpilot.selfdrive.car.cruise import VCruiseCarrot
 from openpilot.selfdrive.car.car_specific import MockCarState
 from openpilot.selfdrive.car.openpilot_toggle import CruiseMainOpenpilotToggle
+from openpilot.selfdrive.carrot.dk_vehicle_diagnostics import make_dk_vehicle_diagnostics
 from openpilot.selfdrive.carrot.xiaoge.xiaoge_vision import (
   XiaogeVisionResult,
   apply_xiaoge_vision_result,
@@ -76,7 +77,7 @@ class Car:
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
     self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents', 'carrotMan', 'longitudinalPlan',
-                                   'radarState', 'modelV2', 'drivingModelData', 'customReservedRawData0'])
+                                   'radarState', 'modelV2', 'drivingModelData', 'customReservedRawData0', 'lateralPlan', 'controlsState'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'liveTracks'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -188,6 +189,7 @@ class Car:
     self.card_diag_stage_current = dict.fromkeys(self.card_diag_stage_names, 0)
     self.card_diag_stage_sum_us = dict.fromkeys(self.card_diag_stage_names, 0)
     self.card_diag_stage_max_us = dict.fromkeys(self.card_diag_stage_names, 0)
+    self.dk_vehicle_diagnostics = make_dk_vehicle_diagnostics(self.CP, self.params)
 
   def state_update(self) -> tuple[car.CarState, structs.RadarDataT | None]:
     """carState update loop, driven by can"""
@@ -335,10 +337,22 @@ class Car:
       apply_start_ns = time.monotonic_ns()
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       model_v2 = self.sm['modelV2'] if self.sm.valid['modelV2'] and self.sm.alive['modelV2'] else None
+      dk_diagnostics = getattr(self, 'dk_vehicle_diagnostics', None)
+      dk_snapshot = None
+      if dk_diagnostics is not None:
+        try:
+          dk_snapshot = dk_diagnostics.begin(CS, CC, self.CI, apply_start_ns)
+        except Exception:
+          pass  # Observability must never prevent control application or CAN submission.
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos, model_v2)
       apply_done_ns = time.monotonic_ns()
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
       sendcan_done_ns = time.monotonic_ns()
+      if dk_diagnostics is not None:
+        try:
+          dk_diagnostics.finish(dk_snapshot, CS, CC, self.CI, self.sm, self.last_actuators_output, can_sends, sendcan_done_ns)
+        except Exception:
+          pass
 
       process_us = (sendcan_done_ns - self.card_diag_recv_ns) // 1000
       self.card_diag_stage_current['apply'] = (apply_done_ns - apply_start_ns) // 1000

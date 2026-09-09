@@ -620,6 +620,51 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   ]
 
 
+@pytest.mark.parametrize(("show_datetime", "expected"), (
+  (0, [("DK 배포 2026-09-09", 120, 28)]),
+  (1, [("12:34", 120, 100), ("DK 배포 2026-09-09", 164, 28), ("09-09(수)", 246, 60)]),
+  (2, [("12:34", 120, 100), ("DK 배포 2026-09-09", 164, 28)]),
+  (3, [("DK 배포 2026-09-09", 120, 28), ("09-09(수)", 206, 60)]),
+))
+def test_deployment_date_fits_below_clock_without_overlapping_calendar(hud_module, monkeypatch, show_datetime, expected):
+  module, _ = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  renderer._show_date_time = show_datetime
+  renderer._dk_deployment_text = "DK 배포 2026-09-09"
+  renderer._date_time_text = "12:34"
+  renderer._date_text = "09-09(수)"
+  renderer._font_display = object()
+  monkeypatch.setattr(renderer, "_refresh_date_time_text", lambda now: None)
+  monkeypatch.setattr(module, "load_dk_deployment_text", lambda *_args: pytest.fail("draw must not reread metadata"))
+  calls = []
+  monkeypatch.setattr(module, "draw_text_ui_style", lambda *args, **kwargs: calls.append((args, kwargs)))
+  if show_datetime == 0:
+    monkeypatch.setattr(module.time, "localtime", lambda: pytest.fail("deployment label is not the live date"))
+
+  renderer._draw_date_time(module.rl.Rectangle(10, 20, 1000, 600))
+
+  assert [(args[0], args[2] - 20, args[3]) for args, _kwargs in calls] == expected
+  assert all(args[1] == 180 and kwargs["align"] == "center_bottom" for args, kwargs in calls)
+
+
+def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, monkeypatch):
+  module, fake_ui_state = hud_module
+  fake_ui_state.params = SimpleNamespace(get=lambda key: "dkcarrot-wip" if key == "GitBranch" else None)
+  reads = []
+
+  def load_label(branch):
+    reads.append(branch)
+    return "DK 배포 2026-09-09"
+
+  monkeypatch.setattr(module, "load_dk_deployment_text", load_label)
+  renderer = module.HudRenderer()
+  renderer._draw_date_time(module.rl.Rectangle(0, 0, 1000, 600))
+  renderer._draw_date_time(module.rl.Rectangle(0, 0, 1000, 600))
+
+  assert reads == ["dkcarrot-wip"]
+  assert renderer._dk_deployment_text == "DK 배포 2026-09-09"
+
+
 def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):
   module, _ = hud_module
   sm = {

@@ -60,6 +60,13 @@ def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
 
+
+def dk_diagnostics_enabled(started: bool, params: Params, CP: car.CarParams) -> bool:
+  branch = params.get("GitBranch")
+  if isinstance(branch, bytes):
+    branch = branch.decode("utf-8", errors="replace")
+  return str(branch or "").strip() == "dkcarrot-wip"
+
 def enable_cweb_push(started: bool, params: Params, CP: car.CarParams) -> bool:
   return community_data_sharing_enabled(params)
 
@@ -148,6 +155,7 @@ procs = [
   NativeProcess("youtube_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube"], and_(only_onroad, enable_youtube_encoder)),
   NativeProcess("youtube_wide_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-wide"], and_(only_onroad, enable_youtube_wide_encoder)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
+  PythonProcess("dk_diagnosticsd", "openpilot.selfdrive.carrot.dk_diagnosticsd", dk_diagnostics_enabled),
 
   NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.tools.webcam.camerad", driverview, enabled=WEBCAM),
