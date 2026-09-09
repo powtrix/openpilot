@@ -1039,21 +1039,30 @@ class HudRenderer(Widget):
       )
 
     has_clock = show_datetime in (1, 2)
-    if deployment_text:
+    has_date = show_datetime in (1, 3)
+    date_font_size = 60
+    date_y = y + 70
+    if has_date:
       draw_text_ui_style(
-        deployment_text, x, y + 44 if has_clock else y, 28, COLORS.WHITE_220,
-        font=self._font_display,
-        border_width=1.5,
-        shadow_offset=3.0,
-        align="center_bottom",
-      )
-
-    if show_datetime in (1, 3):
-      draw_text_ui_style(
-        self._date_text, x, y + 70 + ((56 if has_clock else 16) if deployment_text else 0), 60, rl.WHITE,
+        self._date_text, x, date_y, date_font_size, rl.WHITE,
         font=self._font_display,
         border_width=3.0,
         shadow_offset=8.0,
+        align="center_bottom",
+      )
+
+    if deployment_text:
+      label_font_size = int(date_font_size * 0.8)
+      label_size = measure_text_cached(self._font_display, deployment_text, label_font_size)
+      # Measurements include the UI font scale. Keep the requested size while
+      # clearing the preceding line's outline/shadow and the left screen edge.
+      label_y = (date_y if has_date else y) + label_size.y + 20 if has_date or has_clock else y
+      label_x = max(x, rect.x + label_size.x * 0.5 + 8)
+      draw_text_ui_style(
+        deployment_text, label_x, label_y, label_font_size, COLORS.WHITE_220,
+        font=self._font_display,
+        border_width=1.5,
+        shadow_offset=3.0,
         align="center_bottom",
       )
 

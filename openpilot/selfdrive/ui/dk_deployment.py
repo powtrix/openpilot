@@ -41,4 +41,4 @@ def load_dk_deployment_text(branch: str | bytes | None, path: Path = DK_RELEASE_
     return ""
 
   # A deployment date is not the device's installation date or Git commit date.
-  return f"DK 배포 {deployed:%Y-%m-%d}"
+  return f"{deployed:%m%d} 로그버전"

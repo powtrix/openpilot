@@ -132,6 +132,6 @@ python3 tools/car_porting/dk_diagnostics_report.py --jsonl /path/to/diagnostics.
 
 ## 배포 날짜 표시
 
-설치본 루트의 `dk_release.json`은 `schema=1`, `deployed_at="YYYY-MM-DD HH:mm KST"`, 양의 정수 `diagnostics_version`을 가진다. 배포 준비 시 저장소에서 갱신하는 릴리스 표식이며, 실제 GitHub 푸시 시간을 자동 조회하는 기능이 아니다. comma3x 주행 UI는 설치된 파일을 시작할 때 한 번 읽어 `dkcarrot-wip`에서만 좌상단 시계 아래 `DK 배포 YYYY-MM-DD`를 표시한다. 현재 날짜, Git 커밋 날짜, AGNOS 업데이트 날짜 또는 그 장치의 설치 완료 시각이 아니다.
+설치본 루트의 `dk_release.json`은 `schema=1`, `deployed_at="YYYY-MM-DD HH:mm KST"`, 양의 정수 `diagnostics_version`을 가진다. 배포 준비 시 저장소에서 갱신하는 릴리스 표식이며, 실제 GitHub 푸시 시간을 자동 조회하는 기능이 아니다. comma3x 주행 UI는 설치된 파일을 시작할 때 한 번 읽어 `dkcarrot-wip`에서만 좌상단 날짜 아래 `MMDD 로그버전`(이번 배포: `0909 로그버전`)을 표시한다. 날짜 글자 크기 60의 80%인 48을 사용하며, 기존 `DK 배포 YYYY-MM-DD` 문구는 중복 표시하지 않는다. 현재 날짜, Git 커밋 날짜, AGNOS 업데이트 날짜 또는 그 장치의 설치 완료 시각이 아니다.
 
-메타데이터가 없거나 형식이 잘못되면 임의 날짜를 대신 표시하지 않는다. 별도 설정은 없고, 시계가 꺼져 있어도 배포 날짜는 좌상단에 표시한다. 이 표시와 로컬 테스트 통과만으로 실차 문제 해결·디바이스 업데이트 완료를 판정하지 않는다.
+메타데이터가 없거나 형식이 잘못되면 임의 날짜를 대신 표시하지 않는다. 별도 설정은 없다. 날짜를 숨기고 시간만 표시하면 시계 아래에, 시계·날짜를 모두 숨기면 좌상단에 로그버전만 표시한다. 이 표시와 로컬 테스트 통과만으로 실차 문제 해결·디바이스 업데이트 완료를 판정하지 않는다.

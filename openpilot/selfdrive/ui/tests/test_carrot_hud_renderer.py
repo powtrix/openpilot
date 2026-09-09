@@ -621,19 +621,20 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
 
 
 @pytest.mark.parametrize(("show_datetime", "expected"), (
-  (0, [("DK 배포 2026-09-09", 120, 28)]),
-  (1, [("12:34", 120, 100), ("DK 배포 2026-09-09", 164, 28), ("09-09(수)", 246, 60)]),
-  (2, [("12:34", 120, 100), ("DK 배포 2026-09-09", 164, 28)]),
-  (3, [("DK 배포 2026-09-09", 120, 28), ("09-09(수)", 206, 60)]),
+  (0, [("0909 로그버전", 120, 48)]),
+  (1, [("12:34", 120, 100), ("09-09(수)", 190, 60), ("0909 로그버전", 266, 48)]),
+  (2, [("12:34", 120, 100), ("0909 로그버전", 196, 48)]),
+  (3, [("09-09(수)", 190, 60), ("0909 로그버전", 266, 48)]),
 ))
-def test_deployment_date_fits_below_clock_without_overlapping_calendar(hud_module, monkeypatch, show_datetime, expected):
+def test_log_version_below_calendar_at_eighty_percent_font(hud_module, monkeypatch, show_datetime, expected):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)
   renderer._show_date_time = show_datetime
-  renderer._dk_deployment_text = "DK 배포 2026-09-09"
+  renderer._dk_deployment_text = "0909 로그버전"
   renderer._date_time_text = "12:34"
   renderer._date_text = "09-09(수)"
   renderer._font_display = object()
+  monkeypatch.setattr(module, "measure_text_cached", lambda *_args: module.rl.Vector2(347, 56))
   monkeypatch.setattr(renderer, "_refresh_date_time_text", lambda now: None)
   monkeypatch.setattr(module, "load_dk_deployment_text", lambda *_args: pytest.fail("draw must not reread metadata"))
   calls = []
@@ -644,7 +645,14 @@ def test_deployment_date_fits_below_clock_without_overlapping_calendar(hud_modul
   renderer._draw_date_time(module.rl.Rectangle(10, 20, 1000, 600))
 
   assert [(args[0], args[2] - 20, args[3]) for args, _kwargs in calls] == expected
-  assert all(args[1] == 180 and kwargs["align"] == "center_bottom" for args, kwargs in calls)
+  assert all(kwargs["align"] == "center_bottom" for _args, kwargs in calls)
+  assert all(args[1] == 180 for args, _kwargs in calls if args[0] != "0909 로그버전")
+  label = next(args for args, _kwargs in calls if args[0] == "0909 로그버전")
+  assert label[3] == 60 * 0.8
+  assert label[1] - 347 * 0.5 == 10 + 8
+  if show_datetime in (1, 3):
+    calendar = next(args for args, _kwargs in calls if args[0] == "09-09(수)")
+    assert label[2] - 56 == calendar[2] + 20
 
 
 def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, monkeypatch):
@@ -654,7 +662,7 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
 
   def load_label(branch):
     reads.append(branch)
-    return "DK 배포 2026-09-09"
+    return "0909 로그버전"
 
   monkeypatch.setattr(module, "load_dk_deployment_text", load_label)
   renderer = module.HudRenderer()
@@ -662,7 +670,7 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
   renderer._draw_date_time(module.rl.Rectangle(0, 0, 1000, 600))
 
   assert reads == ["dkcarrot-wip"]
-  assert renderer._dk_deployment_text == "DK 배포 2026-09-09"
+  assert renderer._dk_deployment_text == "0909 로그버전"
 
 
 def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):

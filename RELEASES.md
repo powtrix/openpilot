@@ -2,7 +2,7 @@ dkcarrot-wip (2026-09-09)
 ========================
 * Add passive, bounded KA4 diagnostic observations for standstill resume, engage-time driver-assistance warnings, curve tracking, steering unwind, and braking; candidate triggers and shadow comparisons are not vehicle diagnoses
 * Retain closed neighboring full rlogs locally for later analysis, with ten captures, two per topic, a 1 GiB budget, and a seven-day maximum; add local-network read-only downloads and an offline report tool without a new upload path
-* Show the installed DK deployment date below the comma3x on-road clock using tracked release metadata; no additional setting is required
+* Show the installed DK release as `MMDD 로그버전` below the comma3x on-road calendar date, at 80% of the date font size; no additional setting is required
 * Diagnostics-only release: preserve existing steering, braking, resume decisions, model selection, and OEM warnings; do not claim on-car symptom resolution from offline tests
 
 dkcarrot-wip (2026-09-08)
