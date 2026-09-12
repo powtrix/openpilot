@@ -12,18 +12,18 @@ def write_metadata(tmp_path, metadata):
 
 
 def release_metadata(**overrides):
-  return {"schema": 1, "deployed_at": "2026-09-09 01:23 KST", "diagnostics_version": 1, **overrides}
+  return {"schema": 1, "deployed_at": "2026-09-12 01:23 KST", "diagnostics_version": 1, **overrides}
 
 
 @pytest.mark.parametrize("branch", ["dkcarrot-wip", b"dkcarrot-wip", " dkcarrot-wip\n"])
 def test_installed_deployment_metadata_supplies_date(branch, tmp_path):
   path = write_metadata(tmp_path, release_metadata())
-  assert load_dk_deployment_text(branch, path) == "0909 로그버전"
+  assert load_dk_deployment_text(branch, path) == "0912 개선"
 
 
 def test_label_uses_installed_release_month_day_not_the_live_date(tmp_path):
   path = write_metadata(tmp_path, release_metadata(deployed_at="2026-01-02 03:04 KST"))
-  assert load_dk_deployment_text("dkcarrot-wip", path) == "0102 로그버전"
+  assert load_dk_deployment_text("dkcarrot-wip", path) == "0102 개선"
 
 
 @pytest.mark.parametrize("branch", [None, "", "carrot-wip", "carrot", "origin/dkcarrot-wip", b"\xff", 1])

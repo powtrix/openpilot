@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 TOPICS = ("resume", "engage_warning", "curve", "unwind", "braking")
 SERVICES = ("carControl", "controlsState", "longitudinalPlan", "lateralPlan", "radarState", "modelV2")
 RAW_SOURCES = ("scc_control", "adrv_0x161", "ccnc_0x162", "lfahda_cluster", "mdps", "tcs", "cruise_buttons_msg")
-TRANSITION_FIELDS = ("enabled", "lat_active", "standstill", "cruise_standstill", "resume", "steering_pressed",
+TRANSITION_FIELDS = ("enabled", "lat_active", "standstill", "cruise_standstill", "resume", "steering_pressed", "brake_pressed",
                      "steer_fault_temporary", "steer_fault_permanent", "acc_faulted", "scc_info_display",
                      "adrv_alert_5", "ccnc_fault_hda", "ccnc_fault_lfa",
                      "scc_SysFailState", "scc_TakeOverReq", "scc_DriverAlert",
@@ -45,6 +45,7 @@ CONFIG_KEYS = ("PathOffset", "AdjustLaneOffset", "UseLaneLineSpeed", "SteerActua
                "AutoCruiseControl", "SpeedFromPCM", "Ka4StockSccStandstillRearm")
 MAX_JSON_LINE = 1_048_576
 MAX_TIMELINE = 200
+BRAKING_CAPTURE_REASONS = ("driver_brake_intervention", "scc_takeover_request", "hard_deceleration")
 
 
 def get(data: Any, path: str, default=None):
@@ -114,11 +115,19 @@ class DiagnosticsReport:
     self.engage = Counter()
     self.transitions = Counter()
     self.braking = Counter()
+    self.capture_hints = Counter()
     self.closing_start_ns = None
     self.metrics = {name: Stats() for name in (
       "car.speed_mps", "car.accel_mps2", "car.jerk_mps3", "request.accel_mps2", "output.accel_mps2",
       "radar.d_rel_m", "radar.v_rel_mps", "shadow.gentle_decel_mps2",
       "raw_before.scc_control.aReqValue", "raw_before.scc_control.aReqRaw",
+      "output.torque_output_can", "controller_after.limits.STEER_MAX",
+      "controller_after.limits.STEER_DELTA_UP", "controller_after.limits.STEER_DELTA_DOWN",
+      "car.use_lane_line_speed_kph", "lateral.static_offset_m", "lateral.dynamic_offset_m",
+      "lateral.model_desired_curvature", "lateral.desired_curvature", "lateral.actual_curvature",
+      "lateral.controller.desiredLateralAccel", "lateral.controller.actualLateralAccel",
+      "lateral.accel_error_mps2",
+      "braking_observation.window_min_accel_mps2",
     )}
     self.braking_comparison = {name: Stats() for name in ("scc_minus_shadow_accel_mps2", "measured_minus_scc_accel_mps2")}
     self.lateral = {topic: {bucket: {field: Stats() for field in (
@@ -272,10 +281,34 @@ class DiagnosticsReport:
       key = "missing" if value is None else str(int(value)) if 0 <= value <= 255 and value.is_integer() else "out_of_range"
       self.state_counts[name][key] += 1
     self._resume_and_engage(record, previous, ns)
+    self._capture_observations(record, ns)
     self._lateral(record)
     self._braking(record, previous, ns)
     self.previous = {"mono_ns": ns, "request": record.get("request", {}), "car": record.get("car", {}),
                      "raw_before": record.get("raw_before", {})}
+
+  def _capture_observations(self, record, ns):
+    """Retain v2 collection hints without turning them into fault verdicts."""
+    capture = record.get("braking_capture")
+    if not isinstance(capture, dict):
+      self.capture_hints["braking_metadata_missing_samples"] += 1
+      return
+    self.capture_hints["braking_metadata_present_samples"] += 1
+    reasons = capture.get("reasons")
+    seen = set()
+    for item in reasons[:3] if isinstance(reasons, list) else ():
+      if not isinstance(item, dict):
+        continue
+      reason, event_ns, priority = item.get("reason"), item.get("mono_ns"), item.get("priority")
+      if (not isinstance(reason, str) or reason not in BRAKING_CAPTURE_REASONS or reason in seen
+          or type(event_ns) is not int or not 0 <= event_ns <= ns
+          or type(priority) is not int or priority not in (1, 2)):
+        continue
+      seen.add(reason)
+      self.capture_hints[reason] += 1
+      self._event("braking_capture_hint", event_ns, reason=reason, retention_priority=priority,
+                  lead_status=get(record, "radar.status"), driver_brake=get(record, "car.brake_pressed"),
+                  interpretation="retention_hint_not_collision_or_fault_diagnosis")
 
   def _resume_and_engage(self, record, previous, ns):
     requested = get(record, "request.resume")
@@ -324,6 +357,10 @@ class DiagnosticsReport:
         self._event(label, ns, speed_mps=get(record, "car.speed_mps"), resume_requested=requested)
 
   def _lateral(self, record):
+    for condition in ("torque_saturation_active", "lateral_accel_error_active", "torque_opposed_active"):
+      observed = get(record, "shadow." + condition)
+      suffix = "true_samples" if observed is True else "false_samples" if observed is False else "missing_samples"
+      self.counts[condition + "_" + suffix] += 1
     speed = number(get(record, "car.speed_mps"))
     bucket = "speed_missing" if speed is None else "below_30_kph" if speed * 3.6 < 30 else "30_to_80_kph" if speed * 3.6 < 80 else "80_kph_and_above"
     output, measured = number(get(record, "output.angle_deg")), number(get(record, "car.steering_angle_deg"))
@@ -421,6 +458,7 @@ class DiagnosticsReport:
             "source_quality": {k: dict(v) for k, v in self.quality.items()},
             "raw_source_quality": {k: dict(v) for k, v in self.raw_quality.items()},
             "topic_candidate_counts": dict(self.topic_counts),
+            "capture_hints_not_fault_counts": dict(self.capture_hints),
             "captured_transition_counts": dict(self.transitions),
             "resume": {**dict(self.resume), "scc_states": {k: dict(v) for k, v in self.state_counts.items()},
                        "observed_interlocks_not_causal_verdict": dict(self.interlock_observations)},

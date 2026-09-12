@@ -605,10 +605,13 @@ def create_adrv_messages(CP, packer, CAN, frame):
 
 ## carrot
 def alt_cruise_buttons(packer, CP, CAN, buttons, cruise_btns_msg, cnt):
-  cruise_btns_msg["CRUISE_BUTTONS"] = buttons
-  cruise_btns_msg["COUNTER"] = (cruise_btns_msg["COUNTER"] + 1 + cnt) % 256
+  # The received template is also used on subsequent control ticks. Encoding
+  # must not turn that source into a synthetic button or compound its counter.
+  values = cruise_btns_msg.copy()
+  values["CRUISE_BUTTONS"] = buttons
+  values["COUNTER"] = (values["COUNTER"] + 1 + cnt) % 256
   bus = CAN.ECAN if CP.flags & HyundaiFlags.CANFD_HDA2 else CAN.CAM
-  return packer.make_can_msg("CRUISE_BUTTONS_ALT", bus, cruise_btns_msg)
+  return packer.make_can_msg("CRUISE_BUTTONS_ALT", bus, values)
 
 def hkg_can_fd_checksum(address: int, sig, d: bytearray) -> int:
   crc = 0

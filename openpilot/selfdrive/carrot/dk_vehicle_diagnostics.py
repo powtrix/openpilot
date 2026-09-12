@@ -6,6 +6,7 @@ dongle/account ID, GPS, arbitrary Params, raw CAN payload or network IO is logge
 """
 import math
 import re
+from itertools import islice
 from numbers import Integral, Real
 
 from opendbc.car.hyundai.values import CAR
@@ -15,8 +16,10 @@ from openpilot.common.swaglog import cloudlog
 SAMPLE_NS = 100_000_000
 EDGE_NS = 50_000_000
 TOPIC_COOLDOWN_NS = 30_000_000_000
+BRAKING_REASON_COOLDOWN_NS = 20_000_000_000
+RECENT_CONTROL_NS = 5_000_000_000
 SESSION_NS = 60_000_000_000
-DIAGNOSTICS_VERSION = 'dk-vehicle-diag-v1'
+DIAGNOSTICS_VERSION = 'dk-vehicle-diag-v2'
 MAX_TRANSITIONS = 32
 PARAM_KEYS = (
   'PathOffset', 'AdjustLaneOffset', 'UseLaneLineSpeed', 'SteerActuatorDelay', 'SteerRatioRate',
@@ -39,6 +42,8 @@ CONTROLLER_FIELDS = (
   'stock_scc_keepalive_warning_recovery', 'stock_scc_warning_recovery_requested',
   'stock_scc_alert_abort_latched', 'stock_scc_resume_alert_suppressed', 'accel_last', 'accel_value_last',
 )
+CONTROLLER_LIMITS = ('STEER_MAX', 'STEER_DELTA_UP', 'STEER_DELTA_DOWN', 'STEER_DRIVER_ALLOWANCE',
+                     'STEER_DRIVER_FACTOR', 'STEER_DRIVER_MULTIPLIER')
 RAW_FIELDS = {
   'scc_control': ('SCC_CONTROL', ('COUNTER', 'ACCMode', 'MainMode_ACC', 'InfoDisplay', 'DriverAlert',
     'SysFailState', 'TakeOverReq', 'StopReq', 'aReqRaw', 'aReqValue', 'ACC_ObjDist', 'ACC_ObjRelSpd',
@@ -107,6 +112,12 @@ def raw_snapshot(carstate, now_ns):
       if last_ns > 0:
         sources.append({'parser': parser_name, 'bus': field(parser, 'bus'), 'mono_ns': int(last_ns),
                         'age_ms': (now_ns - last_ns) / 1e6 if now_ns >= last_ns else None})
+        if attr == 'lfahda_cluster':
+          # Preserve parser-local popup values separately from the controller's
+          # mutable CarState cache. Only subscribed buses exist here; use full
+          # rlog can for unsubscribed buses and actual host forwarding evidence.
+          source_cache = getattr(parser, 'vl', {}).get(message, {})
+          sources[-1]['decoded_values'] = {name: signal(source_cache, name) for name in names}
     result[attr] = {'values': values, 'message': message, 'missing': not bool(cache),
                     'missing_fields': [name for name, value in values.items() if value is None],
                     'packet_sources': sources,
@@ -133,7 +144,13 @@ def freshness(sm, now_ns):
 
 def actuators(obj):
   return {'angle_deg': field(obj, 'steeringAngleDeg'), 'torque': field(obj, 'torque'),
+          'torque_output_can': field(obj, 'torqueOutputCan'),
           'curvature': field(obj, 'curvature'), 'accel_mps2': field(obj, 'accel')}
+
+
+def controller_snapshot(controller):
+  return {**fields(controller, CONTROLLER_FIELDS),
+          'limits': fields(getattr(controller, 'params', None), CONTROLLER_LIMITS)}
 
 
 def make_dk_vehicle_diagnostics(CP, params, logger=None):
@@ -188,6 +205,14 @@ class DkVehicleDiagnostics:
     self.frames = self.samples = self.rate_skipped = self.errors = 0
     self.previous_motion = None
     self.unwind_until_ns = 0
+    self.last_control_ns = None
+    self.last_moving_ns = None
+    self.last_braking_reason_ns = {}
+    self.pending_braking_reasons = {}
+    self.braking_observation = {}
+    self.motion_window_start_ns = None
+    self.motion_window_min_accel = None
+    self.motion_window_min_accel_ns = None
 
   def _candidate(self, topic, now_ns):
     last = self.last_topic_ns.get(topic)
@@ -207,16 +232,59 @@ class DkVehicleDiagnostics:
     elif now_ns - self.dwell_start.setdefault(name, now_ns) >= dwell_ns:
       self._candidate(topic, now_ns)
 
+  def _braking_candidate(self, reason, priority, now_ns):
+    """Independent, bounded retention hints; never a braking decision."""
+    last = self.last_braking_reason_ns.get(reason)
+    if last is None or now_ns - last >= BRAKING_REASON_COOLDOWN_NS:
+      self.last_braking_reason_ns[reason] = now_ns
+      self.pending_braking_reasons[reason] = {'reason': reason, 'priority': priority, 'mono_ns': int(now_ns)}
+      # A mild lead-closing topic a few seconds ago must not hide intervention.
+      self.pending_topics.add('braking')
+
+  def _observe_braking(self, CS, CC, state, now_ns):
+    """100 Hz primitive observations survive lead loss and disengagement."""
+    speed, accel = field(CS, 'vEgo'), field(CS, 'aEgo')
+    brake = field(CS, 'brakePressed')
+    takeover = signal(getattr(state, 'scc_control', None), 'TakeOverReq')
+    if self.motion_window_start_ns is None:
+      self.motion_window_start_ns = int(now_ns)
+    if field(CC, 'enabled') is True or field(CS.cruiseState, 'enabled') is True:
+      self.last_control_ns = now_ns
+    if speed is not None and speed >= 3.0:
+      self.last_moving_ns = now_ns
+    recent_control = self.last_control_ns is not None and 0 <= now_ns - self.last_control_ns <= RECENT_CONTROL_NS
+    recent_moving = self.last_moving_ns is not None and 0 <= now_ns - self.last_moving_ns <= 3_000_000_000
+    if accel is not None and (self.motion_window_min_accel is None or accel < self.motion_window_min_accel):
+      self.motion_window_min_accel, self.motion_window_min_accel_ns = accel, int(now_ns)
+    if self.last_edge is not None:
+      if brake is True and self.last_edge['brake_pressed'] is False and recent_control and speed is not None and speed >= 3.0:
+        self._braking_candidate('driver_brake_intervention', 1, now_ns)
+      if takeover is not None and takeover > 0 and self.last_edge['scc_TakeOverReq'] != takeover and recent_moving:
+        self._braking_candidate('scc_takeover_request', 2, now_ns)
+    hard_deceleration = bool(recent_moving and accel is not None and accel <= -3.0)
+    if not hard_deceleration:
+      self.dwell_start.pop('hard_deceleration', None)
+    elif now_ns - self.dwell_start.setdefault('hard_deceleration', now_ns) >= 100_000_000:
+      self._braking_candidate('hard_deceleration', 2, now_ns)
+    self.braking_observation = {
+      'recent_control': recent_control, 'recent_moving': recent_moving,
+      'last_control_mono_ns': self.last_control_ns, 'hard_deceleration_active': hard_deceleration,
+      'takeover_request_cached': takeover, 'lead_required': False,
+      'interpretation': 'retention_hint_not_collision_or_fault_diagnosis',
+    }
+
   def begin(self, CS, CC, CI, now_ns):
     """Small primitive copy before apply; never log or access Params here."""
     try:
       self.frames += 1
       state = CI.CS
+      self._observe_braking(CS, CC, state, now_ns)
       cruise = getattr(CC, 'cruiseControl', None)
       edge = {
         'enabled': field(CC, 'enabled'), 'lat_active': field(CC, 'latActive'),
         'standstill': field(CS, 'standstill'), 'cruise_standstill': field(CS.cruiseState, 'standstill'),
         'resume': field(cruise, 'resume'), 'steering_pressed': field(CS, 'steeringPressed'),
+        'brake_pressed': field(CS, 'brakePressed'),
         'steer_fault_temporary': field(CS, 'steerFaultTemporary'), 'steer_fault_permanent': field(CS, 'steerFaultPermanent'),
         'acc_faulted': field(CS, 'accFaulted'),
         'scc_info_display': signal(getattr(state, 'scc_control', None), 'InfoDisplay'),
@@ -237,6 +305,8 @@ class DkVehicleDiagnostics:
         for name, value in edge.items():
           if value != self.last_edge[name]:
             topic = 'resume' if name in ('standstill', 'cruise_standstill', 'resume', 'scc_info_display', 'adrv_alert_5') else 'engage_warning'
+            if name == 'brake_pressed':
+              topic = 'braking'
             self._transition(name, self.last_edge[name], value, now_ns, topic)
       elif edge['enabled']:
         self._candidate('engage_warning', now_ns)
@@ -247,7 +317,7 @@ class DkVehicleDiagnostics:
         self.rate_skipped += 1
         return None
       self.last_sample_ns = now_ns
-      return {'mono_ns': int(now_ns), 'controller_before': fields(getattr(CI, 'CC', None), CONTROLLER_FIELDS),
+      return {'mono_ns': int(now_ns), 'controller_before': controller_snapshot(getattr(CI, 'CC', None)),
               'raw_before': raw_snapshot(state, now_ns)}
     except Exception:
       self.errors += 1
@@ -289,6 +359,9 @@ class DkVehicleDiagnostics:
       for topic in self.pending_topics:
         self.last_topic_ns[topic] = now_ns
       self.pending_topics.clear()
+      self.pending_braking_reasons.clear()
+      self.motion_window_start_ns = None
+      self.motion_window_min_accel = self.motion_window_min_accel_ns = None
       self.transitions.clear()
       self.tx_counts.clear()
       self.tx_buttons.clear()
@@ -310,6 +383,7 @@ class DkVehicleDiagnostics:
             'brake_hold_active': field(CS, 'brakeHoldActive'), 'parking_brake': field(CS, 'parkingBrake'),
             'steering_pressed': field(CS, 'steeringPressed'), 'steer_fault_temporary': field(CS, 'steerFaultTemporary'),
             'steer_fault_permanent': field(CS, 'steerFaultPermanent'), 'acc_faulted': field(CS, 'accFaulted')}
+    car['use_lane_line_speed_kph'] = field(CS, 'useLaneLineSpeed')
     plan = service(sm, 'longitudinalPlan')
     speeds = numbers(getattr(plan, 'speeds', None), 17)
     plan_source = getattr(plan, 'longitudinalPlanSource', None)
@@ -325,6 +399,11 @@ class DkVehicleDiagnostics:
     model = service(sm, 'modelV2')
     control = service(sm, 'controlsState')
     lateral = {'lane_width_m': field(lateral_plan, 'laneWidth'), 'use_lane_lines': field(lateral_plan, 'useLaneLines'),
+                'active_lane_line': field(control, 'activeLaneLine'),
+                'model_desired_curvature': field(getattr(model, 'action', None), 'desiredCurvature'),
+                'steer_control_type': self.metadata.get('cp', {}).get('steerControlType'),
+                'angle_semantics': ('actuator_angle_request' if self.metadata.get('cp', {}).get('steerControlType') == 'angle'
+                                    else 'not_an_eps_angle_command_when_torque_or_unknown'),
                 'static_offset_m': field(lateral_plan, 'staticPathOffset'), 'dynamic_offset_m': field(lateral_plan, 'dynamicLaneOffset'),
                 'path_y_m': numbers(getattr(lateral_plan, 'dPathPoints', None)),
                 'path_before_static_y_m': numbers(getattr(lateral_plan, 'pathBeforeStaticOffset', None)),
@@ -332,7 +411,7 @@ class DkVehicleDiagnostics:
                 'plan_curvature_rates': numbers(getattr(lateral_plan, 'curvatureRates', None)),
                 'lane_probabilities': numbers(getattr(model, 'laneLineProbs', None), 4),
                 'lane_lines': [{'x_m': numbers(getattr(line, 'x', None), 9), 'y_m': numbers(getattr(line, 'y', None), 9)}
-                               for line in list(getattr(model, 'laneLines', []))[:4]],
+                               for line in islice(getattr(model, 'laneLines', []), 4)],
                 'actual_curvature': field(control, 'curvature'), 'desired_curvature': field(control, 'desiredCurvature')}
     lateral_state = getattr(control, 'lateralControlState', None)
     if lateral_state is not None:
@@ -365,35 +444,67 @@ class DkVehicleDiagnostics:
         self._candidate('braking', now_ns)
     angle_error = abs(request['angle_deg'] - car['steering_angle_deg']) if request['angle_deg'] is not None and car['steering_angle_deg'] is not None else 0
     enabled = request['enabled'] is True
-    curve_active = bool(enabled and car['speed_mps'] is not None and car['speed_mps'] > 3 and
+    lateral_active = request['lat_active'] is True
+    moving_lateral = lateral_active and car['speed_mps'] is not None and car['speed_mps'] > 3
+    # AlwaysLateral may keep steering active while overall enabled is false.
+    # These are passive observation gates, not permission to activate steering.
+    curve_active = bool(moving_lateral and
                         ((request['curvature'] is not None and abs(request['curvature']) > 0.002) or angle_error > 5))
     self._dwell('curve', curve_active, now_ns, 300_000_000, 'curve')
     requested_angle, measured_angle = request['angle_deg'], car['steering_angle_deg']
-    if (enabled and previous is not None and requested_angle is not None and previous[2] is not None and
+    if (lateral_active and previous is not None and requested_angle is not None and previous[2] is not None and
         abs(previous[2]) > 5 and abs(requested_angle) < abs(previous[2])):
       self.unwind_until_ns = now_ns + 10_000_000_000
     # Keep observing a lagging return after a step to center, even when the
     # subsequent demand stays fixed at zero instead of declining every sample.
     centerward_lag = (requested_angle is not None and measured_angle is not None and
                      abs(requested_angle) + 3 < abs(measured_angle))
-    unwind_active = bool(enabled and now_ns <= self.unwind_until_ns and centerward_lag)
+    unwind_active = bool(lateral_active and now_ns <= self.unwind_until_ns and centerward_lag)
     self._dwell('unwind', unwind_active, now_ns, 200_000_000, 'unwind')
+    torque_mode = lateral['steer_control_type'] == 'torque'
+    torque_saturation_active = bool(moving_lateral and torque_mode and output_values['torque'] is not None
+                                    and abs(output_values['torque']) >= 0.95)
+    lateral_controller = lateral.get('controller', {})
+    actual_lat_accel, desired_lat_accel = (lateral_controller.get(name) for name in ('actualLateralAccel', 'desiredLateralAccel'))
+    lateral['accel_error_mps2'] = (desired_lat_accel - actual_lat_accel
+                                 if desired_lat_accel is not None and actual_lat_accel is not None else None)
+    lateral_accel_error_active = bool(moving_lateral and torque_mode and lateral['accel_error_mps2'] is not None
+                                     and abs(lateral['accel_error_mps2']) >= 0.75)
+    torque_opposed_active = bool(moving_lateral and torque_mode and request['torque'] is not None
+                                and output_values['torque'] is not None and abs(request['torque']) > 0.05
+                                and abs(output_values['torque']) > 0.05 and request['torque'] * output_values['torque'] < 0)
+    self._dwell('torque_saturation', torque_saturation_active, now_ns, 300_000_000, 'curve')
+    self._dwell('lateral_accel_error', lateral_accel_error_active, now_ns, 300_000_000, 'curve')
+    self._dwell('torque_opposed', torque_opposed_active, now_ns, 200_000_000, 'unwind')
     # Ongoing descriptive conditions, unlike topics which are cooldown-limited
     # capture triggers. They are hypotheses, not vehicle/controller state flags.
     shadow['curve_active'] = curve_active
     shadow['unwind_active'] = unwind_active
+    shadow['torque_saturation_active'] = torque_saturation_active
+    shadow['lateral_accel_error_active'] = lateral_accel_error_active
+    shadow['torque_opposed_active'] = torque_opposed_active
     self._dwell('closing', enabled and radar['status'] and distance is not None and relative is not None and
                 0 < distance < 50 and relative < -0.8, now_ns, 300_000_000, 'braking')
     self.previous_motion = (now_ns, car['accel_mps2'], request['angle_deg'], output_values['angle_deg'])
+    braking_reasons = list(self.pending_braking_reasons.values())
+    perception = {'interpretation': 'model_future_lead_hypotheses_not_independent_objects',
+                  'model_leads': [{**fields(hypothesis, ('prob', 'probTime')),
+                                   **{name: numbers(getattr(hypothesis, name, None), 6) for name in ('x', 'y', 'v', 'a')}}
+                                  for hypothesis in islice(getattr(model, 'leadsV3', []), 3)]}
     return {'event': 'dk_vehicle_diag', 'schema': 1, 'kind': 'sample', 'mono_ns': int(now_ns),
             'before_mono_ns': token['mono_ns'], 'topics': sorted(self.pending_topics),
             'interpretation': 'candidate_observation_not_diagnosis',
             'counters': {'frames': self.frames, 'samples': self.samples + 1, 'rate_skipped': self.rate_skipped,
                          'errors': self.errors, 'transitions_dropped': self.transitions_dropped},
             'transitions': list(self.transitions), 'car': car, 'request': request, 'output': output_values,
-            'controller_before': token['controller_before'], 'controller_after': fields(getattr(CI, 'CC', None), CONTROLLER_FIELDS),
+            'controller_before': token['controller_before'], 'controller_after': controller_snapshot(getattr(CI, 'CC', None)),
             'raw_before': token['raw_before'], 'raw_after': raw_snapshot(CI.CS, now_ns),
-            'planner': planner, 'radar': radar, 'lateral': lateral, 'freshness': freshness(sm, now_ns), 'shadow': shadow,
+            'planner': planner, 'radar': radar, 'perception': perception, 'lateral': lateral,
+            'freshness': freshness(sm, now_ns), 'shadow': shadow,
+            'braking_observation': {**self.braking_observation, 'window_start_mono_ns': self.motion_window_start_ns,
+                                    'window_min_accel_mps2': self.motion_window_min_accel,
+                                    'window_min_accel_mono_ns': self.motion_window_min_accel_ns},
+            'braking_capture': {'priority': max((r['priority'] for r in braking_reasons), default=0), 'reasons': braking_reasons},
             'submitted_can': {'interpretation': 'host_submission_not_panda_or_ecu_acceptance',
               'count': sum(self.tx_counts.values()), 'addresses': [
                 {'address': addr, 'bus': bus, 'count': count} for (addr, bus), count in sorted(self.tx_counts.items())],

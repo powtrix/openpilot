@@ -24,6 +24,9 @@ MAX_FILE_BYTES = 256 * 1024 ** 2
 MAX_RECORD_BYTES = 64 * 1024
 TTL_SECONDS = 7 * 86400
 TOPIC_COOLDOWN = 120
+BRAKING_EPISODE_SECONDS = 20
+MAX_BRAKING_OBSERVATIONS = 8
+BRAKING_REASONS = {"driver_brake_intervention": 1, "scc_takeover_request": 2, "hard_deceleration": 2}
 FINALIZE_AFTER = 180
 MIN_FREE_BYTES = 5 * 1024 ** 3
 CAPTURE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -85,6 +88,36 @@ def write_manifest(directory: Path, manifest: dict) -> None:
   temporary.replace(directory / "manifest.json")
 
 
+def braking_priority(record: dict) -> int:
+  """Only the observer's finite reason allowlist can promote local retention."""
+  capture = record.get("braking_capture", {})
+  if not isinstance(capture, dict) or not isinstance(capture.get("reasons"), list):
+    return 0
+  reasons = capture["reasons"]
+  if len(reasons) > len(BRAKING_REASONS):
+    return 0
+  return max((BRAKING_REASONS.get(item.get("reason"), 0) for item in reasons if isinstance(item, dict)
+              and isinstance(item.get("reason"), str)), default=0)
+
+
+def retention_priority(manifest: dict) -> int:
+  value = manifest.get("braking_priority", 0)
+  return value if isinstance(value, int) and 0 <= value <= 2 and "braking" in manifest["topics"] else 0
+
+
+def braking_observation(record: dict, now: float) -> dict:
+  capture = record.get("braking_capture", {})
+  mono_ns = record.get("mono_ns")
+  reasons = []
+  for item in capture.get("reasons", [])[:len(BRAKING_REASONS)]:
+    if isinstance(item, dict) and isinstance(item.get("reason"), str) and item["reason"] in BRAKING_REASONS:
+      timestamp = item.get("mono_ns")
+      reasons.append({"reason": item["reason"], "priority": BRAKING_REASONS[item["reason"]],
+                      "mono_ns": timestamp if isinstance(timestamp, int) else None})
+  return {"received_at": now, "mono_ns": mono_ns if isinstance(mono_ns, int) else None,
+          "priority": braking_priority(record), "reasons": reasons}
+
+
 class CaptureStore:
   def __init__(self, log_root: Path, root: Path, *, max_bytes=MAX_BYTES, min_free_bytes=MIN_FREE_BYTES):
     self.log_root = Path(log_root)
@@ -138,11 +171,13 @@ class CaptureStore:
       if now - created > TTL_SECONDS:
         self._remove(directory)
       else:
-        entries.append((directory, created))
-    entries.sort(key=lambda item: item[1])
+        entries.append((directory, created, retention_priority(manifest) if manifest else 0))
+    # Retain stronger observed interventions ahead of routine candidate windows.
+    # TTL and hard count/byte limits still apply, even to priority-two captures.
+    entries.sort(key=lambda item: (item[2], item[1]))
     while entries and (len(entries) > max_captures or self.size_bytes() > self.max_bytes):
       self._remove(entries.pop(0)[0])
-    kept = {directory.name for directory, _ in entries}
+    kept = {directory.name for directory, _, _ in entries}
     self.pending_seen = {key: value for key, value in self.pending_seen.items() if key in kept}
 
   def accept(self, record: dict, route: str, now: float) -> str | None:
@@ -160,11 +195,31 @@ class CaptureStore:
     topics = sorted(set(raw_topics) & TOPICS)
     if not topics:
       return None
+    self.prune(now)
     entries = self.entries()
+    priority = braking_priority(record) if "braking" in topics else 0
+    if priority:
+      # Independent braking hints bypass regular topic cooldowns. Keep only the
+      # braking tag here so this capture cannot displace unrelated topic quotas.
+      topics = ["braking"]
+      for directory, manifest in reversed(entries):
+        if (manifest["route"] == route and "braking" in manifest["topics"]
+            and 0 <= now - manifest["created_at"] < BRAKING_EPISODE_SECONDS):
+          # Same short episode: retain the first pre/post center, promote it,
+          # and append bounded trigger times instead of repeatedly copying logs.
+          observations = manifest.get("braking_observations", [])
+          if not isinstance(observations, list):
+            observations = []
+          if len(observations) < MAX_BRAKING_OBSERVATIONS:
+            observations.append(braking_observation(record, now))
+          manifest["braking_observations"] = observations
+          manifest["braking_priority"] = max(priority, retention_priority(manifest))
+          write_manifest(directory, manifest)
+          return directory.name
     for _, manifest in entries:
       for topic in manifest["topics"]:
         self.last_topic[topic] = max(self.last_topic.get(topic, 0), manifest["created_at"])
-    topics = [t for t in topics if now - self.last_topic.get(t, -TOPIC_COOLDOWN) >= TOPIC_COOLDOWN]
+    topics = [t for t in topics if priority or now - self.last_topic.get(t, -TOPIC_COOLDOWN) >= TOPIC_COOLDOWN]
     if not topics:
       return None
     candidates = []
@@ -174,16 +229,25 @@ class CaptureStore:
         candidates.append(int(suffix))
     if not candidates:
       return None
-    self.prune(now)
-    entries = self.entries()
     # Keep at most two candidate windows per topic and ten in total. Eviction
     # only removes our copies, never original loggerd data or driver bookmarks.
+    accepted_topics = []
     for topic in topics:
-      matches = [entry for entry in entries if topic in entry[1]["topics"]]
+      matches = sorted([entry for entry in entries if topic in entry[1]["topics"]],
+                       key=lambda item: (retention_priority(item[1]), item[1]["created_at"]))
+      if len(matches) >= MAX_PER_TOPIC and retention_priority(matches[0][1]) > priority:
+        continue
       while len(matches) >= MAX_PER_TOPIC:
         old = matches.pop(0)
         self._remove(old[0])
         entries.remove(old)
+      accepted_topics.append(topic)
+    topics = accepted_topics
+    if not topics:
+      return None
+    entries.sort(key=lambda item: (retention_priority(item[1]), item[1]["created_at"]))
+    if len(entries) >= MAX_CAPTURES and retention_priority(entries[0][1]) > priority:
+      return None
     while len(entries) >= MAX_CAPTURES:
       self._remove(entries.pop(0)[0])
     self.prune(now, max_captures=MAX_CAPTURES - 1)
@@ -197,6 +261,8 @@ class CaptureStore:
       "expires_at": now + TTL_SECONDS, "route": route, "center_segment": max(candidates),
       "segment_selection": "latest_logger_segment_at_event_receipt_with_previous_and_next",
       "topics": topics, "event": record, "session": self.session, "files": [], "missing": [],
+      "braking_priority": priority,
+      "braking_observations": [braking_observation(record, now)] if priority else [],
       "interpretation": "candidate_observation_not_diagnosis", "network_upload": False,
     }
     write_manifest(directory, manifest)

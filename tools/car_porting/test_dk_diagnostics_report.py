@@ -200,7 +200,7 @@ def test_configuration_uses_exact_current_observer_keys_and_identity():
   for message in logs:
     analyzer.feed_record(message)
   config = analyzer.report()["configuration"][0]
-  assert config["diagnostics_version"] == "dk-vehicle-diag-v1"
+  assert config["diagnostics_version"] == "dk-vehicle-diag-v2"
   assert config["params_snapshot_scope"] == "initial_numeric_raw_params_only"
   assert config["cp"]["carFingerprint"] == str(cp().carFingerprint)
   assert config["initial_params"]["StopDistanceCarrot"] == 50
@@ -255,3 +255,69 @@ def test_all_new_warning_transitions_survive_real_observer_schema():
   assert changed["current"]["FAULT_DAS"] == 1
   assert changed["current"]["adrv_sound_4"] == 1
   assert changed["current"]["HDA_InfoPUDis1"] == 1
+
+
+def test_v2_braking_hints_keep_event_time_without_claiming_a_collision():
+  analyzer = DiagnosticsReport()
+  analyzer.feed_record(sample())
+  record = sample(1_100_000_000, enabled=False)
+  record["radar"]["status"] = False
+  record["car"]["brake_pressed"] = True
+  record["braking_capture"] = {"priority": 2, "reasons": [
+    {"reason": "driver_brake_intervention", "priority": 1, "mono_ns": 1_040_000_000},
+    {"reason": "hard_deceleration", "priority": 2, "mono_ns": 1_080_000_000},
+  ]}
+  record["transitions"] = [{"field": "brake_pressed", "before": False, "after": True, "mono_ns": 1_040_000_000}]
+  record["braking_observation"] = {"window_min_accel_mps2": -6.0}
+  record["output"]["torque_output_can"] = 270
+  record["controller_after"] = {"limits": {"STEER_MAX": 270}}
+  analyzer.feed_record(record)
+  report = analyzer.report()
+  assert report["capture_hints_not_fault_counts"]["driver_brake_intervention"] == 1
+  assert report["capture_hints_not_fault_counts"]["hard_deceleration"] == 1
+  hints = [item for item in report["timeline"] if item["event"] == "braking_capture_hint"]
+  assert hints[0]["source_seconds"] == pytest.approx(0.04)
+  assert hints[0]["lead_status"] is False
+  assert hints[0]["interpretation"] == "retention_hint_not_collision_or_fault_diagnosis"
+  assert report["captured_transition_counts"]["brake_pressed"] == 1
+  assert report["metrics"]["braking_observation.window_min_accel_mps2"]["min"] == -6.0
+  assert report["metrics"]["output.torque_output_can"]["max"] == 270
+  assert report["assessment"] == "observations_only_no_vehicle_acceptance_verdict"
+
+
+@pytest.mark.parametrize("invalid", [
+  {"reason": "vehicle_collision_confirmed", "priority": 2, "mono_ns": 1},
+  {"reason": ["hard_deceleration"], "priority": 2, "mono_ns": 1},
+  {"reason": "hard_deceleration", "priority": True, "mono_ns": 1},
+  {"reason": "hard_deceleration", "priority": 2, "mono_ns": True},
+  {"reason": "hard_deceleration", "priority": 2, "mono_ns": 2_000_000_000},
+])
+def test_v2_braking_hint_fields_are_allowlisted_and_bounded(invalid):
+  analyzer = DiagnosticsReport()
+  record = sample()
+  record["braking_capture"] = {"priority": 2, "reasons": [invalid]}
+  analyzer.feed_record(record)
+  assert not any(item["event"] == "braking_capture_hint" for item in analyzer.report()["timeline"])
+
+
+def test_v1_records_keep_missing_v2_fields_distinct_from_zero():
+  analyzer = DiagnosticsReport()
+  analyzer.feed_record(sample())
+  report = analyzer.report()
+  assert report["capture_hints_not_fault_counts"] == {"braking_metadata_missing_samples": 1}
+  assert report["metrics"]["output.torque_output_can"]["count"] == 0
+  assert report["metrics"]["output.torque_output_can"]["mean"] is None
+  assert report["counts"]["torque_saturation_active_missing_samples"] == 1
+
+
+def test_v2_torque_conditions_are_separate_observations_with_lateral_only_active():
+  analyzer = DiagnosticsReport()
+  record = sample(enabled=False)
+  record["shadow"].update({"torque_saturation_active": True, "lateral_accel_error_active": True, "torque_opposed_active": False})
+  record["lateral"] = {"accel_error_mps2": 1.2}
+  analyzer.feed_record(record)
+  report = analyzer.report()
+  assert report["counts"]["torque_saturation_active_true_samples"] == 1
+  assert report["counts"]["lateral_accel_error_active_true_samples"] == 1
+  assert report["counts"]["torque_opposed_active_false_samples"] == 1
+  assert report["metrics"]["lateral.accel_error_mps2"]["mean"] == 1.2

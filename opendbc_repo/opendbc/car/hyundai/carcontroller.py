@@ -837,6 +837,15 @@ class CarController(CarControllerBase):
     if alt_buttons and cruise_buttons_msg_values is None:
       return None
 
+    # The switch source runs at 50 Hz, while this controller runs at 100 Hz.
+    # Apply the existing fresh-source rule to planner RES and speed-sync too:
+    # otherwise two ticks can submit the same replacement alive counter. This
+    # prevents duplicate host requests, not proof of stock-SCC acceptance.
+    # CANCEL is handled independently by create_button_messages above.
+    if (self.dk_ka4_runtime_branch and _ka4_stock_scc_standstill_supported(self.CP)
+        and not stock_scc_source_fresh):
+      return None
+
     send_button = self.make_spam_button(CC, CS, stock_scc_source_fresh=stock_scc_source_fresh)
     if send_button > 0:
       if alt_buttons:

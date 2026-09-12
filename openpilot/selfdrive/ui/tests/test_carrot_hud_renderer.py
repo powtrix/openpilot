@@ -621,16 +621,16 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
 
 
 @pytest.mark.parametrize(("show_datetime", "expected"), (
-  (0, [("0909 로그버전", 120, 48)]),
-  (1, [("12:34", 120, 100), ("09-09(수)", 190, 60), ("0909 로그버전", 266, 48)]),
-  (2, [("12:34", 120, 100), ("0909 로그버전", 196, 48)]),
-  (3, [("09-09(수)", 190, 60), ("0909 로그버전", 266, 48)]),
+  (0, [("0912 개선", 120, 48)]),
+  (1, [("12:34", 120, 100), ("09-09(수)", 190, 60), ("0912 개선", 266, 48)]),
+  (2, [("12:34", 120, 100), ("0912 개선", 196, 48)]),
+  (3, [("09-09(수)", 190, 60), ("0912 개선", 266, 48)]),
 ))
-def test_log_version_below_calendar_at_eighty_percent_font(hud_module, monkeypatch, show_datetime, expected):
+def test_improvement_release_below_calendar_at_eighty_percent_font(hud_module, monkeypatch, show_datetime, expected):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)
   renderer._show_date_time = show_datetime
-  renderer._dk_deployment_text = "0909 로그버전"
+  renderer._dk_deployment_text = "0912 개선"
   renderer._date_time_text = "12:34"
   renderer._date_text = "09-09(수)"
   renderer._font_display = object()
@@ -646,8 +646,8 @@ def test_log_version_below_calendar_at_eighty_percent_font(hud_module, monkeypat
 
   assert [(args[0], args[2] - 20, args[3]) for args, _kwargs in calls] == expected
   assert all(kwargs["align"] == "center_bottom" for _args, kwargs in calls)
-  assert all(args[1] == 180 for args, _kwargs in calls if args[0] != "0909 로그버전")
-  label = next(args for args, _kwargs in calls if args[0] == "0909 로그버전")
+  assert all(args[1] == 180 for args, _kwargs in calls if args[0] != "0912 개선")
+  label = next(args for args, _kwargs in calls if args[0] == "0912 개선")
   assert label[3] == 60 * 0.8
   assert label[1] - 347 * 0.5 == 10 + 8
   if show_datetime in (1, 3):
@@ -662,7 +662,7 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
 
   def load_label(branch):
     reads.append(branch)
-    return "0909 로그버전"
+    return "0912 개선"
 
   monkeypatch.setattr(module, "load_dk_deployment_text", load_label)
   renderer = module.HudRenderer()
@@ -670,7 +670,7 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
   renderer._draw_date_time(module.rl.Rectangle(0, 0, 1000, 600))
 
   assert reads == ["dkcarrot-wip"]
-  assert renderer._dk_deployment_text == "0909 로그버전"
+  assert renderer._dk_deployment_text == "0912 개선"
 
 
 def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):

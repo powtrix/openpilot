@@ -270,7 +270,174 @@ def test_session_is_repeated_for_later_log_segments():
   record(observer, *objects, now=61_000_000_000)
   sessions = [msg for msg in logs if msg['kind'] == 'session']
   assert len(sessions) == 2
-  assert all(msg['diagnostics_version'] == 'dk-vehicle-diag-v1' for msg in sessions)
+  assert all(msg['diagnostics_version'] == 'dk-vehicle-diag-v2' for msg in sessions)
+
+
+def test_driver_brake_without_lead_survives_recent_disengagement_and_ordinary_cooldown():
+  CS, CC, CI, sm = fixture_objects()
+  logs = []
+  observer = DkVehicleDiagnostics({}, logs.append)
+  sm['radarState'].leadOne.status = False
+  record(observer, CS, CC, CI, sm)
+  observer.last_topic_ns['braking'] = 1_000_000_000
+  CC.enabled = CS.cruiseState.enabled = False
+  record(observer, CS, CC, CI, sm, now=1_100_000_000)
+  CS.brakePressed = True
+  record(observer, CS, CC, CI, sm, now=1_150_000_000)
+  sample = logs[-1]
+  assert 'braking' in sample['topics']
+  assert sample['braking_capture']['priority'] == 1
+  assert sample['braking_capture']['reasons'][0]['reason'] == 'driver_brake_intervention'
+  assert not sample['request']['enabled'] and not sample['radar']['status']
+
+
+def test_takeover_and_hard_deceleration_promote_same_episode_after_driver_disengages():
+  CS, CC, CI, sm = fixture_objects()
+  CI.CS.scc_control['TakeOverReq'] = 0
+  sm['radarState'].leadOne.status = False
+  logs = []
+  observer = DkVehicleDiagnostics({}, logs.append)
+  record(observer, CS, CC, CI, sm)
+  CI.CS.scc_control['TakeOverReq'] = 1
+  record(observer, CS, CC, CI, sm, now=1_050_000_000)
+  assert logs[-1]['braking_capture']['priority'] == 2
+  assert logs[-1]['braking_capture']['reasons'][0]['reason'] == 'scc_takeover_request'
+  CC.enabled = CS.cruiseState.enabled = False
+  CS.brakePressed = True
+  for i in range(10, 101):
+    CS.aEgo = -6.5 if i == 25 else -3.5
+    record(observer, CS, CC, CI, sm, now=1_000_000_000 + i * 10_000_000)
+  hard = [s for s in logs if s.get('braking_capture', {}).get('priority') == 2
+          and any(r['reason'] == 'hard_deceleration' for r in s['braking_capture']['reasons'])]
+  assert len(hard) == 1
+  assert not hard[0]['request']['enabled']
+  assert min(s['braking_observation']['window_min_accel_mps2'] for s in logs if s['kind'] == 'sample') == -6.5
+  assert any(s['braking_observation']['window_min_accel_mono_ns'] == 1_250_000_000 for s in logs if s['kind'] == 'sample')
+  assert all(not s['braking_observation']['lead_required'] for s in hard)
+
+
+def test_hard_deceleration_requires_dwell_and_recent_motion_not_valid_lead_or_control():
+  CS, CC, CI, sm = fixture_objects()
+  CC.enabled = CS.cruiseState.enabled = False
+  sm['radarState'].leadOne.status = False
+  CS.aEgo = -4.0
+  logs = []
+  observer = DkVehicleDiagnostics({}, logs.append)
+  record(observer, CS, CC, CI, sm)
+  record(observer, CS, CC, CI, sm, now=1_050_000_000)
+  assert not any(s.get('braking_capture', {}).get('priority') == 2 for s in logs)
+  record(observer, CS, CC, CI, sm, now=1_100_000_000)
+  assert logs[-1]['braking_capture']['priority'] == 2
+  CS.vEgo = 0.0
+  record(observer, CS, CC, CI, sm, now=25_000_000_000)
+  assert logs[-1]['braking_capture']['priority'] == 0
+
+
+def test_braking_reason_buffers_and_capture_rate_are_bounded_even_if_signals_toggle():
+  CS, CC, CI, sm = fixture_objects()
+  logs = []
+  observer = DkVehicleDiagnostics({}, logs.append)
+  for i in range(500):
+    CS.brakePressed = bool(i % 2)
+    CI.CS.scc_control['TakeOverReq'] = i % 2
+    record(observer, CS, CC, CI, sm, now=1_000_000_000 + i * 10_000_000)
+  reasons = [r for s in logs if s['kind'] == 'sample' for r in s['braking_capture']['reasons']]
+  assert len(reasons) == 2
+  assert len(observer.last_braking_reason_ns) <= 3
+  assert len(observer.pending_braking_reasons) <= 3
+
+
+def test_torque_semantics_limits_model_hypotheses_and_parser_popup_values_are_explicit():
+  CS, CC, CI, sm = fixture_objects()
+  CS.useLaneLineSpeed = 0
+  CC.actuators.torqueOutputCan = 57
+  CI.CC.params = NS(STEER_MAX=270, STEER_DELTA_UP=2, STEER_DELTA_DOWN=3, STEER_DRIVER_ALLOWANCE=250)
+  CI.CS.lfahda_cluster = {'HDA_InfoPUDis': 0}
+  CI.CS.cp_cam = NS(bus=2, ts_nanos={'LFAHDA_CLUSTER': {'HDA_InfoPUDis': 990_000_000}},
+                    vl={'LFAHDA_CLUSTER': {'HDA_InfoPUDis': 3}})
+  sm['controlsState'].activeLaneLine = False
+  sm['modelV2'].action = NS(desiredCurvature=0.003)
+  sm['modelV2'].leadsV3 = [NS(prob=0.9, probTime=0.0, x=list(range(10)), y=[0.0], v=[-10.0], a=[0.0])] * 4
+  logs = []
+  record(DkVehicleDiagnostics({'cp': {'steerControlType': 'torque'}}, logs.append), CS, CC, CI, sm)
+  sample = logs[-1]
+  assert sample['lateral']['angle_semantics'] == 'not_an_eps_angle_command_when_torque_or_unknown'
+  assert sample['output']['torque_output_can'] == 57
+  assert sample['controller_before']['limits']['STEER_DELTA_DOWN'] == 3
+  assert sample['car']['use_lane_line_speed_kph'] == 0
+  assert sample['lateral']['active_lane_line'] is False
+  assert sample['lateral']['model_desired_curvature'] == 0.003
+  assert len(sample['perception']['model_leads']) == 3
+  assert len(sample['perception']['model_leads'][0]['x']) == 6
+  raw = sample['raw_before']['lfahda_cluster']
+  assert raw['values']['HDA_InfoPUDis'] == 0
+  assert raw['packet_sources'][0]['decoded_values']['HDA_InfoPUDis'] == 3
+  assert len(json.dumps(sample, allow_nan=False)) < 64 * 1024
+
+
+def test_always_lateral_curve_and_unwind_are_observed_without_overall_engagement():
+  CS, CC, CI, sm = fixture_objects()
+  CC.enabled = False
+  CC.latActive = True
+  CC.actuators.curvature = 0.005
+  CC.actuators.steeringAngleDeg = CS.steeringAngleDeg = 20.0
+  logs = []
+  observer = DkVehicleDiagnostics({}, logs.append)
+  for i in range(5):
+    record(observer, CS, CC, CI, sm, now=1_000_000_000 + i * 100_000_000)
+  assert any('curve' in s['topics'] for s in logs)
+  CC.actuators.steeringAngleDeg = 0.0
+  for i in range(5, 10):
+    record(observer, CS, CC, CI, sm, now=1_000_000_000 + i * 100_000_000)
+  assert any('unwind' in s['topics'] for s in logs)
+  assert not CC.enabled and CC.latActive
+  CC.enabled = True
+  CC.latActive = False
+  record(observer, CS, CC, CI, sm, now=2_000_000_000)
+  assert not logs[-1]['shadow']['curve_active']
+  assert not logs[-1]['shadow']['unwind_active']
+
+
+def test_torque_tracking_hints_work_without_angle_fields_and_without_overall_enabled():
+  CS, CC, CI, sm = fixture_objects()
+  CC.enabled = False
+  CC.actuators.steeringAngleDeg = None
+  CC.actuators.torque = 0.5
+  sm['controlsState'].lateralControlState = NS(which=lambda: 'torque', torque=NS(actualLateralAccel=0.0, desiredLateralAccel=1.2))
+  output = NS(torque=-0.96, torqueOutputCan=-260, steeringAngleDeg=None)
+  logs = []
+  observer = DkVehicleDiagnostics({'cp': {'steerControlType': 'torque'}}, logs.append)
+  for i in range(10):
+    now = 1_000_000_000 + i * 100_000_000
+    token = observer.begin(CS, CC, CI, now)
+    observer.finish(token, CS, CC, CI, sm, output, (), now)
+  assert sum('curve' in s['topics'] for s in logs) == 1
+  assert sum('unwind' in s['topics'] for s in logs) == 1
+  sample = logs[-1]
+  assert sample['lateral']['accel_error_mps2'] == 1.2
+  assert sample['shadow']['torque_saturation_active']
+  assert sample['shadow']['lateral_accel_error_active']
+  assert sample['shadow']['torque_opposed_active']
+  assert not sample['shadow']['unwind_active']  # Separate from angle-based hypothesis.
+  assert not CC.enabled and CC.actuators.torque == 0.5 and output.torque == -0.96
+
+
+def test_model_hypothesis_and_lane_iteration_does_not_read_past_bounded_prefix():
+  CS, CC, CI, sm = fixture_objects()
+
+  def bounded_input(count):
+    for _ in range(count):
+      yield NS(prob=0.9, probTime=0.0, x=[1.0], y=[0.0], v=[-1.0], a=[0.0])
+    raise AssertionError('diagnostic observer consumed beyond bounded prefix')
+
+  sm['modelV2'].leadsV3 = bounded_input(3)
+  sm['modelV2'].laneLines = bounded_input(4)
+  logs = []
+  observer = DkVehicleDiagnostics({}, logs.append)
+  record(observer, CS, CC, CI, sm)
+  assert observer.errors == 0
+  assert len(logs[-1]['perception']['model_leads']) == 3
+  assert len(logs[-1]['lateral']['lane_lines']) == 4
 
 
 def test_logger_fault_is_fail_open_and_buffers_stay_bounded():

@@ -12,6 +12,11 @@ def sample(topic="resume"):
           "topics": [topic], "shadow": {"interpretation": "hypothesis_not_vehicle_response"}}
 
 
+def braking_sample(reason="hard_deceleration", mono_ns=123456):
+  return {**sample("braking"), "mono_ns": mono_ns,
+          "braking_capture": {"reasons": [{"reason": reason, "mono_ns": mono_ns}]}}
+
+
 def segment(root, index, data=b"full-rlog", locked=False):
   directory = root / f"route--{index}"
   directory.mkdir(parents=True, exist_ok=True)
@@ -210,3 +215,82 @@ def test_retained_full_rlogs_are_decodable_by_offline_report(store):
   assert report["counts"]["samples"] == 2
   assert report["metadata"]["commit"] == ["abcdef1"]
   assert report["source_service_counts"]["logMessage"] == 4
+
+
+def test_intervention_promotes_earlier_regular_capture_without_losing_pre_event_center(store):
+  segment(store.log_root, 14)
+  segment(store.log_root, 15, locked=True)
+  first = store.accept(sample("braking"), "route", 1000)
+  assert store.accept(braking_sample("driver_brake_intervention"), "route", 1006) == first
+  segment(store.log_root, 16, locked=True)
+  assert store.accept(braking_sample(), "route", 1008) == first
+  manifest = read_manifest(store.root / first)
+  assert manifest["center_segment"] == 15
+  assert manifest["braking_priority"] == 2
+  assert len(manifest["braking_observations"]) == 2
+  assert manifest["network_upload"] is False
+  assert len(store.entries()) == 1
+
+
+def test_two_observed_braking_episodes_118_seconds_apart_bypass_regular_cooldown(store):
+  segment(store.log_root, 15)
+  first = store.accept(braking_sample("driver_brake_intervention"), "route", 1000)
+  assert store.accept(braking_sample(), "route", 1002) == first
+  segment(store.log_root, 17)
+  second = store.accept(braking_sample("scc_takeover_request"), "route", 1118)
+  assert second and second != first
+  assert store.accept(braking_sample("driver_brake_intervention"), "route", 1118.2) == second
+  assert store.accept(braking_sample(), "route", 1120) == second
+  assert [(m["center_segment"], m["braking_priority"]) for _, m in store.entries()] == [(15, 2), (17, 2)]
+
+
+def test_regular_braking_cannot_evict_priority_two_windows_but_new_strong_event_can(store):
+  original = segment(store.log_root, 0)
+  first = store.accept(braking_sample(), "route", 1000)
+  second = store.accept(braking_sample(), "route", 1120)
+  assert store.accept(sample("braking"), "route", 1240) is None
+  assert store.accept(braking_sample("driver_brake_intervention"), "route", 1240) is None
+  third = store.accept(braking_sample(), "route", 1240)
+  assert third is not None
+  assert not (store.root / first).exists()
+  assert (store.root / second).exists()
+  assert len(store.entries()) == 2
+  assert (original / "rlog.zst").read_bytes() == b"full-rlog"
+
+
+def test_priority_survives_recorder_restart_and_same_episode_reasons_are_bounded(store):
+  segment(store.log_root, 0)
+  first = store.accept(braking_sample("driver_brake_intervention"), "route", 1000)
+  restored = CaptureStore(store.log_root, store.root, min_free_bytes=0)
+  for i in range(30):
+    assert restored.accept(braking_sample(), "route", 1001 + i / 10) == first
+  manifest = read_manifest(restored.root / first)
+  assert manifest["braking_priority"] == 2
+  assert len(manifest["braking_observations"]) == 8
+  assert restored.accept(braking_sample(), "other-route", 1005) is None
+
+
+def test_priority_captures_still_obey_hard_byte_ttl_and_count_budgets(store):
+  segment(store.log_root, 0)
+  for i in range(12):
+    store.accept(braking_sample(), "route", 1000 + i * 30)
+  assert len(store.entries()) == 2
+  store.max_bytes = 1
+  store.prune(1500)
+  assert store.entries() == []
+  store.max_bytes = 1024 ** 3
+  store.accept(braking_sample(), "route", 1600)
+  store.prune(1601 + TTL_SECONDS)
+  assert store.entries() == []
+
+
+def test_malformed_priority_cannot_bypass_cooldown_or_expand_manifest(store):
+  segment(store.log_root, 0)
+  first = store.accept(sample("braking"), "route", 1000)
+  for bad in (None, [], {"priority": 2}, {"reasons": [{}]}, {"reasons": [{"reason": []}]},
+              {"reasons": [{"reason": "unrecognized", "priority": 2}]}):
+    assert store.accept({**sample("braking"), "braking_capture": bad}, "route", 1001) is None
+  oversized_reason = {**braking_sample(), "braking_capture": {
+    "reasons": [{"reason": "hard_deceleration", "irrelevant": "x" * 60000}]}}
+  assert store.accept(oversized_reason, "route", 1001) == first
+  assert (store.root / first / "manifest.json").stat().st_size < 4096
