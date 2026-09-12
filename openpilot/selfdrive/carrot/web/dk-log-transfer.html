@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>dk 로그전달 · Log transfer</title>
+  <link rel="stylesheet" href="/dk-logs/assets/dk-log-transfer.css">
+  <script type="module" src="/dk-logs/assets/dk-log-transfer.js"></script>
+</head>
+<body>
+  <main>
+    <header><a href="/" data-text="back">← 웹당근</a><button id="language" type="button">English</button></header>
+    <p class="eyebrow">DK · LOCAL LOG TRANSFER</p>
+    <h1 data-text="title">dk 로그전달</h1>
+    <p class="intro" data-text="intro">차량에서 받아 두고, 집에서 전달하세요. 별도 앱이나 백그라운드 실행 없이 사용합니다.</p>
+    <section class="card">
+      <h2 data-text="step1">1. 차량 → 휴대폰</h2>
+      <p data-text="scope">현재 보관된 문제 전후 원본 rlog와 설정·커밋 정보를 ZIP 하나로 받습니다. 전체 주행 백업이나 영상은 포함하지 않습니다.</p>
+      <p class="notice" data-text="privacy">로그에는 위치·장치 식별정보가 포함될 수 있습니다. 본인의 핫스팟에서 정차 후 사용하고, 파일을 공개하거나 공식 서버에 올리지 마세요.</p>
+      <button id="refresh" type="button" data-text="refresh">목록 새로고침</button>
+      <p id="status" role="status" aria-live="polite"></p>
+      <form id="download-form" action="/api/dk/diagnostics/bundle" method="get" target="_blank" rel="noopener">
+        <fieldset id="captures"><legend data-text="selection">전달할 진단 기록</legend><div id="capture-list"></div></fieldset>
+        <p id="selection-summary"></p>
+        <button id="download" class="primary" type="submit" disabled data-text="download">선택 로그를 휴대폰에 저장</button>
+      </form>
+      <p class="small" data-text="downloadHelp">묶음 준비 후 브라우저가 다운로드합니다. 완료 여부는 브라우저 다운로드 목록에서 확인하세요. 완료 전에는 디바이스 전원과 핫스팟을 유지하세요. 중단되면 다시 다운로드해야 합니다.</p>
+    </section>
+    <section class="card">
+      <h2 data-text="step2">2. 휴대폰 → 집의 맥미니 / NAS</h2>
+      <p data-text="homeHelp">집 Wi-Fi에 연결한 뒤 dk 수신 페이지를 열고, 다운로드 폴더의 .dklog.zip 파일을 선택하세요. 수신 주소는 맥미니에서 dk 수신기를 실행하면 표시됩니다. NAS에서는 별도 실행 환경 설정이 필요합니다.</p>
+      <p data-text="verification">수신기가 파일 검증 후 ‘수신 완료’를 표시해야 전달이 끝난 것입니다. 확인 전에는 휴대폰 파일을 지우지 마세요.</p>
+      <p class="small" data-text="limits">준비 중인 기록은 아직 받을 수 없습니다. ‘일부 구간 누락’ 기록도 확보된 원본은 전달하지만, 누락된 구간이 복구되는 것은 아닙니다. 현재 진단 보관 정책은 최대 10건·1 GiB·7일이며 더 일찍 교체될 수 있습니다.</p>
+    </section>
+    <footer data-text="localOnly">이 페이지는 파일을 휴대폰에 내려줄 뿐, 외부 서버로 전송하거나 차량 제어·설정을 변경하지 않습니다.</footer>
+  </main>
+</body>
+</html>

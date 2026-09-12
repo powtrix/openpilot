@@ -135,6 +135,8 @@ GET /api/dk/diagnostics/<capture_id>/<segment_index>-rlog.zst
 
 실제 artifact 확장자는 manifest를 따른다. API는 GET/HEAD만 제공하며 수집 시작·삭제·업로드 동작이 없다. 사설 IP/localhost Host, 실제 로컬 TCP 상대, 제공된 Origin의 동일 출처를 검사한다. 인터넷의 임의 도메인으로 직접 호출하는 공개 다운로드 API가 아니다. 이 기능만으로 다른 망에 있는 NAS에 자동 전달되지는 않는다.
 
+수동 휴대폰 전달은 웹당근 **Logs → dk 로그전달**(`/dk-logs`)에서 원본 rlog/manifest 묶음을 내려받고, 집에서 별도 dk 수신기로 전달한다. 전체 주행이나 영상 백업은 아니다. 자동 업로드·새 Params 없이 사용자 요청으로만 동작하며, 사용법과 보안·누락·용량 제한은 [DK 수동 휴대폰 로그 전달](dk_phone_log_transfer.md)에 한글/영문으로 설명한다.
+
 ## 로컬 오프라인 분석
 
 도구: `tools/car_porting/dk_diagnostics_report.py`.
