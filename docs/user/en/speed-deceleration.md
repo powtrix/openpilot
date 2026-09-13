@@ -12,6 +12,16 @@ Change them in **Carrot Web → Settings → Driving control → Speed and decel
 > [!CAUTION]
 > These settings can affect desired speed and the deceleration plan. Route, speed-limit, distance, and model inputs can be missing, late, or incorrect. The driver must always monitor the road and intervene immediately.
 
+## DK-only deceleration display — not a setting
+
+The `0913 감속` release of `dkcarrot-wip` automatically shows a red bar and `감속 X.X m/s^2` (deceleration) at the bottom center of the driving screen. No setting is required. It does not change the 22 settings below or any acceleration, braking, or steering control, and it also works on vehicles using stock SCC.
+
+The number is **current vehicle deceleration estimated from wheel speed**. It is not brake pressure, pedal percentage, or an acceleration command from CarrotPilot. It cannot distinguish slowing caused by stock SCC, the driver, engine braking, or a slope. The bar is full at `4.0 m/s²`, while larger values remain visible numerically. A full bar does not represent the vehicle's braking limit.
+
+The indicator is hidden at a stop, with very small deceleration, with stale or invalid input, during warnings, in narrow layouts, or where it could overlap navigation, lead-vehicle, or path-end guidance. Existing guidance and warnings take priority and are not hidden by this feature. No deceleration indicator does not mean no braking. Continue watching the road and the vehicle's response directly rather than relying on this display.
+
+The upper-left release label appears below the calendar date as `0913 감속`, starting with the release date. Its text is 10% larger than before. Existing date-display preferences remain unchanged: with the date hidden, the label appears below the clock or on its own at the upper left. It identifies the installed release, not the current date or the time the device finished updating.
+
 ## Five sections
 
 1. [Speed cameras](#speed-camera)

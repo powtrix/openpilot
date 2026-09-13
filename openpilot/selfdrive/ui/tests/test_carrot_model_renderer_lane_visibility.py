@@ -95,6 +95,9 @@ def model_renderer_module(monkeypatch):
       FontWeight=SimpleNamespace(DISPLAY=0),
     ),
     "openpilot.system.ui.lib.text_draw": SimpleNamespace(draw_text_ui_style=lambda *args, **kwargs: None),
+    "openpilot.system.ui.lib.text_measure": SimpleNamespace(
+      measure_text_cached=lambda font, text, size: Vector2(len(text) * size, size),
+    ),
     "openpilot.system.ui.lib.shader_polygon": SimpleNamespace(
       draw_polygon=lambda *args, **kwargs: None,
       draw_polygon_solid=lambda *args, **kwargs: None,

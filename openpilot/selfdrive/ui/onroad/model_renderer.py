@@ -14,6 +14,7 @@ from openpilot.selfdrive.ui.road_markings import (
 )
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, draw_polygon_solid, Gradient
 from openpilot.system.ui.widgets import Widget
 
@@ -89,6 +90,7 @@ class ModelRenderer(Widget):
     self._car_space_transform = np.zeros((3, 3), dtype=np.float32)
     self._transform_dirty = True
     self._clip_region = None
+    self._deceleration_exclusion_rect = None
 
     self._exp_gradient = Gradient(
       start=(0.0, 1.0),  # Bottom of path
@@ -110,6 +112,9 @@ class ModelRenderer(Widget):
     self._transform_dirty = True
 
   def _render(self, rect: rl.Rectangle):
+    # HUD decorations must not reuse the prior frame's label positions after
+    # an early return or cover current lead-distance/status text.
+    self._deceleration_exclusion_rect = None
     sm = ui_state.sm
 
     # Check if data is up-to-date
@@ -847,6 +852,28 @@ class ModelRenderer(Widget):
       self._carrot_lead_two_status = 0
 
 
+  @property
+  def deceleration_exclusion_rect(self) -> rl.Rectangle | None:
+    rect = self._deceleration_exclusion_rect
+    return None if rect is None else rl.Rectangle(rect.x, rect.y, rect.width, rect.height)
+
+  def _record_deceleration_exclusion_text(self, text: str, x: float, y: float, font_size: float, *, boxed: bool = False) -> None:
+    """Reserve only bounds for labels drawn below; never change their rendering."""
+    size = measure_text_cached(self._font_display, text, font_size)
+    width = max(size.x, max(40, int(len(text) * font_size * 0.8))) if boxed else size.x
+    height = max(size.y, 42) if boxed else size.y
+    # Existing labels are center-aligned, y_offset=0, with up to 8px shadow.
+    left, top = x - width / 2 - 10, y - height / 2 - 10
+    right, bottom = x + width / 2 + 10, y + height / 2 + 10
+    if not all(math.isfinite(value) for value in (left, top, right, bottom)):
+      return
+    previous = self._deceleration_exclusion_rect
+    if previous is not None:
+      left, top = min(left, previous.x), min(top, previous.y)
+      right = max(right, previous.x + previous.width)
+      bottom = max(bottom, previous.y + previous.height)
+    self._deceleration_exclusion_rect = rl.Rectangle(left, top, right - left, bottom - top)
+
   def _draw_path_end_overlay_carrot(self):
     x = self._carrot_path_x
     y = self._carrot_path_y - 135
@@ -854,6 +881,7 @@ class ModelRenderer(Widget):
 
     if self._carrot_soft_hold_active or self._carrot_brake_hold_active or self._carrot_carrot_cruise:
       text = "AUTOHOLD" if self._carrot_brake_hold_active else ("SOFTHOLD" if self._carrot_soft_hold_active else "CARROT")
+      self._record_deceleration_exclusion_text(text, x, disp_y, 50)
       draw_text_ui_style(text, x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
     else:
       draw_dist = False
@@ -861,10 +889,13 @@ class ModelRenderer(Widget):
         if self._carrot_x_state in (3, 5):
           if self._carrot_v_ego < 1.0:
             text = "Signal Error" if self._carrot_traffic_state >= 1000 else "Signal Ready"
+            self._record_deceleration_exclusion_text(text, x, disp_y, 50)
             draw_text_ui_style(text, x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
           else:
+            self._record_deceleration_exclusion_text("Signal slowing", x, disp_y, 50)
             draw_text_ui_style("Signal slowing", x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
         elif self._carrot_x_state == 4:
+          self._record_deceleration_exclusion_text("E2E주행중", x, disp_y, 50)
           draw_text_ui_style("E2E주행중", x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
         elif self._carrot_x_state in (0, 1, 2):
           draw_dist = True
@@ -876,11 +907,13 @@ class ModelRenderer(Widget):
         text_color = rl.Color(255, 255, 255, 255) if self._carrot_x_state == 0 else (rl.Color(191, 191, 191, 255) if self._carrot_x_state == 1 else rl.Color(0, 203, 0, 255))
         if self._carrot_radar_dist > 0.0:
           dist_text = f"{self._carrot_radar_dist:.1f}"
+          self._record_deceleration_exclusion_text(dist_text, x - w, disp_y, 40, boxed=True)
           box_color = rl.Color(255, 0, 0, 255) if self._carrot_radar_track_id < 1 else rl.Color(255, 175, 3, 255)
           self._draw_text_box_carrot(x - w, disp_y, dist_text, 40, box_color)
           draw_text_ui_style(dist_text, x - w, disp_y, 40, text_color, align="center", y_offset=0.0)
         if self._carrot_vision_dist > 0.0:
           dist_text = f"{self._carrot_vision_dist:.1f}"
+          self._record_deceleration_exclusion_text(dist_text, x + w, disp_y, 40, boxed=True)
           self._draw_text_box_carrot(x + w, disp_y, dist_text, 40, rl.Color(0, 0, 255, 255))
           draw_text_ui_style(dist_text, x + w, disp_y, 40, text_color, align="center", y_offset=0.0)
 
@@ -1729,5 +1762,7 @@ class ModelRenderer(Widget):
       if base is not None:
         tx, ty = base
         white = rl.Color(255, 255, 255, 255)
+        self._record_deceleration_exclusion_text(dir_label, tx, ty - 56.0, 72)
+        self._record_deceleration_exclusion_text(dist_str, tx, ty + 18.0, 52)
         draw_text_ui_style(dir_label, tx, ty - 56.0, 72, white, font=self._font_display, align="center", y_offset=0.0)
         draw_text_ui_style(dist_str, tx, ty + 18.0, 52, white, font=self._font_display, align="center", y_offset=0.0)

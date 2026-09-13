@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from openpilot.selfdrive.ui.onroad.deceleration_indicator import DecelerationDisplay
 
 HUD_RENDERER_PATH = Path(__file__).parents[1] / "onroad" / "hud_renderer.py"
 
@@ -602,6 +603,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   monkeypatch.setattr(renderer, "_draw_date_time", lambda rect: calls.append("date"))
   monkeypatch.setattr(renderer, "_draw_tpms", lambda rect: calls.append("tpms"))
   monkeypatch.setattr(renderer, "_draw_egpu_badge", lambda rect: calls.append("egpu"))
+  monkeypatch.setattr(renderer, "_draw_deceleration_indicator", lambda rect: calls.append("deceleration"))
   monkeypatch.setattr(renderer, "_draw_cruise_speed_animation", lambda rect: calls.append("animation"))
   monkeypatch.setattr(module.rl, "draw_rectangle_gradient_v", lambda *args: calls.append("header"))
   monkeypatch.setattr(module.time, "monotonic", lambda: 12.5)
@@ -616,23 +618,24 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
     "date",
     "tpms",
     "egpu",
+    "deceleration",
     "animation",
   ]
 
 
 @pytest.mark.parametrize(("show_datetime", "expected"), (
-  (0, [("0912 개선", 120, 48)]),
-  (1, [("12:34", 120, 100), ("09-09(수)", 190, 60), ("0912 개선", 266, 48)]),
-  (2, [("12:34", 120, 100), ("0912 개선", 196, 48)]),
-  (3, [("09-09(수)", 190, 60), ("0912 개선", 266, 48)]),
+  (0, [("0913 감속", 120, 52.8)]),
+  (1, [("12:34", 120, 100), ("09-13(일)", 190, 60), ("0913 감속", 266, 52.8)]),
+  (2, [("12:34", 120, 100), ("0913 감속", 196, 52.8)]),
+  (3, [("09-13(일)", 190, 60), ("0913 감속", 266, 52.8)]),
 ))
-def test_improvement_release_below_calendar_at_eighty_percent_font(hud_module, monkeypatch, show_datetime, expected):
+def test_release_below_calendar_ten_percent_larger_than_previous_label(hud_module, monkeypatch, show_datetime, expected):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)
   renderer._show_date_time = show_datetime
-  renderer._dk_deployment_text = "0912 개선"
+  renderer._dk_deployment_text = "0913 감속"
   renderer._date_time_text = "12:34"
-  renderer._date_text = "09-09(수)"
+  renderer._date_text = "09-13(일)"
   renderer._font_display = object()
   monkeypatch.setattr(module, "measure_text_cached", lambda *_args: module.rl.Vector2(347, 56))
   monkeypatch.setattr(renderer, "_refresh_date_time_text", lambda now: None)
@@ -646,12 +649,12 @@ def test_improvement_release_below_calendar_at_eighty_percent_font(hud_module, m
 
   assert [(args[0], args[2] - 20, args[3]) for args, _kwargs in calls] == expected
   assert all(kwargs["align"] == "center_bottom" for _args, kwargs in calls)
-  assert all(args[1] == 180 for args, _kwargs in calls if args[0] != "0912 개선")
-  label = next(args for args, _kwargs in calls if args[0] == "0912 개선")
-  assert label[3] == 60 * 0.8
+  assert all(args[1] == 180 for args, _kwargs in calls if args[0] != "0913 감속")
+  label = next(args for args, _kwargs in calls if args[0] == "0913 감속")
+  assert label[3] == pytest.approx(48 * 1.1)
   assert label[1] - 347 * 0.5 == 10 + 8
   if show_datetime in (1, 3):
-    calendar = next(args for args, _kwargs in calls if args[0] == "09-09(수)")
+    calendar = next(args for args, _kwargs in calls if args[0] == "09-13(일)")
     assert label[2] - 56 == calendar[2] + 20
 
 
@@ -662,7 +665,7 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
 
   def load_label(branch):
     reads.append(branch)
-    return "0912 개선"
+    return "0913 감속"
 
   monkeypatch.setattr(module, "load_dk_deployment_text", load_label)
   renderer = module.HudRenderer()
@@ -670,7 +673,98 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
   renderer._draw_date_time(module.rl.Rectangle(0, 0, 1000, 600))
 
   assert reads == ["dkcarrot-wip"]
-  assert renderer._dk_deployment_text == "0912 개선"
+  assert renderer._dk_deployment_text == "0913 감속"
+  assert renderer._dk_deceleration_enabled
+
+
+@pytest.mark.parametrize("branch, enabled", [
+  ("dkcarrot-wip", True), (b"dkcarrot-wip\n", True), ("carrot-wip", False),
+  ("carrot", False), ("origin/dkcarrot-wip", False), (None, False), (b"\xff", False),
+])
+def test_deceleration_branch_gate_does_not_depend_on_release_metadata(hud_module, monkeypatch, branch, enabled):
+  module, fake_ui_state = hud_module
+  fake_ui_state.params = SimpleNamespace(get=lambda key: branch)
+  monkeypatch.setattr(module, "load_dk_deployment_text", lambda *_args: "")
+  renderer = module.HudRenderer()
+  assert renderer._dk_deceleration_enabled is enabled
+
+
+def make_deceleration_renderer(hud_module, monkeypatch, *, fraction=0.375, magnitude=1.5):
+  module, fake_ui_state = hud_module
+  fake_ui_state.started = True
+  renderer = object.__new__(module.HudRenderer)
+  renderer._dk_deceleration_enabled = True
+  renderer._turn_info_hud_visible = False
+  renderer._font_display = object()
+  monkeypatch.setattr(module, "deceleration_display", lambda *_args, **_kwargs: DecelerationDisplay(magnitude, fraction))
+  monkeypatch.setattr(module, "measure_text_cached", lambda *_args: module.rl.Vector2(310, 42))
+  return renderer
+
+
+@pytest.mark.parametrize("fraction, magnitude", [(0.025, 0.1), (0.375, 1.5), (1.0, 4.0), (1.0, 6.0)])
+def test_deceleration_bar_is_red_bottom_center_and_proportional(hud_module, monkeypatch, fraction, magnitude):
+  module, _ = hud_module
+  renderer = make_deceleration_renderer(hud_module, monkeypatch, fraction=fraction, magnitude=magnitude)
+  boxes, texts = [], []
+  monkeypatch.setattr(module.rl, "draw_rectangle_rounded", lambda *args: boxes.append(args))
+  monkeypatch.setattr(module, "draw_text_ui_style", lambda *args, **kwargs: texts.append((args, kwargs)))
+
+  renderer._draw_deceleration_indicator(module.rl.Rectangle(30, 40, 2100, 1020))
+
+  assert len(boxes) == 2
+  track, fill = boxes[0][0], boxes[1][0]
+  assert track == module.rl.Rectangle(900, 1020, 360, 14)
+  assert fill.width == pytest.approx(360 * fraction)
+  assert fill.x + fill.width / 2 == 1080
+  assert fill.y == track.y
+  assert boxes[1][3] == module.COLORS.RED_SOLID
+  assert texts[0][0][:4] == (f"감속 {magnitude:.1f} m/s^2", 1080, 1010, 36)
+  assert texts[0][1]["align"] == "center_bottom"
+
+
+@pytest.mark.parametrize("width, height, navigation, branch", [
+  (1399, 1020, False, True), (2100, 399, False, True), (1999, 1020, True, True),
+  (2100, 1020, False, False),
+])
+def test_deceleration_not_drawn_or_read_in_excluded_layout_or_branch(hud_module, monkeypatch, width, height, navigation, branch):
+  module, _ = hud_module
+  renderer = make_deceleration_renderer(hud_module, monkeypatch)
+  renderer._dk_deceleration_enabled = branch
+  renderer._turn_info_hud_visible = navigation
+  monkeypatch.setattr(module, "deceleration_display", lambda *_args, **_kwargs: pytest.fail("excluded indicator read car state"))
+  renderer._draw_deceleration_indicator(module.rl.Rectangle(0, 0, width, height))
+
+
+@pytest.mark.parametrize("width, navigation", [(1400, False), (2000, True)])
+def test_deceleration_layout_clearance_boundaries(hud_module, monkeypatch, width, navigation):
+  module, _ = hud_module
+  renderer = make_deceleration_renderer(hud_module, monkeypatch)
+  renderer._turn_info_hud_visible = navigation
+  boxes = []
+  monkeypatch.setattr(module.rl, "draw_rectangle_rounded", lambda *args: boxes.append(args))
+  renderer._draw_deceleration_indicator(module.rl.Rectangle(0, 0, width, 1020))
+  assert len(boxes) == 2
+  assert boxes[0][0].x >= 480 + 20  # Left status panel.
+  if navigation:
+    assert boxes[0][0].x + boxes[0][0].width <= width - 800 - 20
+
+
+def test_deceleration_hides_missing_signal_and_overlapping_model_labels(hud_module, monkeypatch):
+  module, _ = hud_module
+  renderer = make_deceleration_renderer(hud_module, monkeypatch)
+  boxes = []
+  monkeypatch.setattr(module.rl, "draw_rectangle_rounded", lambda *args: boxes.append(args))
+  rect = module.rl.Rectangle(30, 40, 2100, 1020)
+  renderer.deceleration_exclusion_rect = module.rl.Rectangle(1000, 960, 200, 70)
+  renderer._draw_deceleration_indicator(rect)
+  assert not boxes
+  renderer.deceleration_exclusion_rect = module.rl.Rectangle(1000, 700, 200, 70)
+  renderer._draw_deceleration_indicator(rect)
+  assert len(boxes) == 2
+  boxes.clear()
+  monkeypatch.setattr(module, "deceleration_display", lambda *_args, **_kwargs: None)
+  renderer._draw_deceleration_indicator(rect)
+  assert not boxes
 
 
 def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):

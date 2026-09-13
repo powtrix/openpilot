@@ -115,10 +115,12 @@ class AugmentedRoadView(CameraView):
       super()._render(rect)
     cam_ms = (time.monotonic() - _t) * 1000.0
 
+    self._hud_renderer.deceleration_exclusion_rect = None
     if not self._suppress_camera_for_cluster:
       # Draw the model overlay only with the camera view
       _t = time.monotonic()
       self.model_renderer.render(self._content_rect)
+      self._hud_renderer.deceleration_exclusion_rect = self.model_renderer.deceleration_exclusion_rect
       model_ms = (time.monotonic() - _t) * 1000.0
     _t = time.monotonic()
     self._hud_renderer.render(self._content_rect)  # plot 활성 시 plot 비용도 hud 구간에 포함

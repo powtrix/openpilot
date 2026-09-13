@@ -9,6 +9,7 @@ from openpilot.common.basedir import BASEDIR
 
 DK_RELEASE_PATH = Path(BASEDIR) / "dk_release.json"
 DK_RELEASE_MAX_BYTES = 4096
+DK_RELEASE_LABEL_MAX_CHARS = 12
 
 
 def load_dk_deployment_text(branch: str | bytes | None, path: Path = DK_RELEASE_PATH) -> str:
@@ -30,6 +31,12 @@ def load_dk_deployment_text(branch: str | bytes | None, path: Path = DK_RELEASE_
       return ""
     if type(metadata.get("diagnostics_version")) is not int or metadata["diagnostics_version"] < 1:
       return ""
+    # Legacy metadata had a fixed suffix. A supplied suffix must fit one HUD line
+    # and contain no controls, invisible formatting, or bidi overrides.
+    label = metadata.get("label", "개선")
+    if (not isinstance(label, str) or not 1 <= len(label) <= DK_RELEASE_LABEL_MAX_CHARS
+        or label != label.strip() or not label.isprintable()):
+      return ""
     deployed_at = metadata.get("deployed_at")
     if not isinstance(deployed_at, str):
       return ""
@@ -41,4 +48,4 @@ def load_dk_deployment_text(branch: str | bytes | None, path: Path = DK_RELEASE_
     return ""
 
   # A deployment date is not the device's installation date or Git commit date.
-  return f"{deployed:%m%d} 개선"
+  return f"{deployed:%m%d} {label}"

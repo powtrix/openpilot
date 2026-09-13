@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from openpilot.selfdrive.ui.dk_deployment import DK_RELEASE_MAX_BYTES, load_dk_deployment_text
+from openpilot.selfdrive.ui.dk_deployment import DK_RELEASE_LABEL_MAX_CHARS, DK_RELEASE_MAX_BYTES, load_dk_deployment_text
 
 
 def write_metadata(tmp_path, metadata):
@@ -21,9 +21,33 @@ def test_installed_deployment_metadata_supplies_date(branch, tmp_path):
   assert load_dk_deployment_text(branch, path) == "0912 개선"
 
 
-def test_label_uses_installed_release_month_day_not_the_live_date(tmp_path):
-  path = write_metadata(tmp_path, release_metadata(deployed_at="2026-01-02 03:04 KST"))
-  assert load_dk_deployment_text("dkcarrot-wip", path) == "0102 개선"
+@pytest.mark.parametrize("deployed_at, expected", [
+  ("2026-01-02 03:04 KST", "0102 개선"),
+  ("2028-11-23 12:34 KST", "1123 개선"),
+])
+def test_label_uses_installed_release_month_day_not_the_live_date(tmp_path, deployed_at, expected):
+  path = write_metadata(tmp_path, release_metadata(deployed_at=deployed_at))
+  assert load_dk_deployment_text("dkcarrot-wip", path) == expected
+
+
+@pytest.mark.parametrize("label", ["감속", "로그 개선", "Brake-v2", "가" * DK_RELEASE_LABEL_MAX_CHARS])
+def test_release_label_is_configurable_and_date_prefix_tracks_metadata(tmp_path, label):
+  path = write_metadata(tmp_path, release_metadata(deployed_at="2027-12-31 23:59 KST", label=label))
+  assert load_dk_deployment_text("dkcarrot-wip", path) == f"1231 {label}"
+
+
+def test_installed_release_displays_0913_deceleration_label():
+  assert load_dk_deployment_text("dkcarrot-wip") == "0913 감속"
+
+
+@pytest.mark.parametrize("label", [
+  None, False, 1, [], {}, "", " ", " 감속", "감속 ", "가" * (DK_RELEASE_LABEL_MAX_CHARS + 1),
+  "감\n속", "감\r속", "감\t속", "감\x00속", "감\x7f속", "감\x85속", "감\u200b속",
+  "감\u200e속", "감\u200f속", "감\u202a속", "감\u202e속", "감\u2066속", "감\u2069속",
+  "감\u2028속", "감\u2029속", "감\ud800속",
+])
+def test_invalid_explicit_label_is_hidden_instead_of_using_legacy_fallback(tmp_path, label):
+  assert load_dk_deployment_text("dkcarrot-wip", write_metadata(tmp_path, release_metadata(label=label))) == ""
 
 
 @pytest.mark.parametrize("branch", [None, "", "carrot-wip", "carrot", "origin/dkcarrot-wip", b"\xff", 1])
