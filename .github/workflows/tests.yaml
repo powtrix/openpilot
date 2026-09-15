@@ -42,7 +42,13 @@ jobs:
           BIG: '1'
           OPENPILOT_PREFIX: dk-ui-import-ci
         # Do not start main(), open a window, or substitute mocked pyray types.
-        run: python -c 'import openpilot.selfdrive.ui.ui; print("DK UI startup imports passed")'
+        run: |
+          python - <<'PY'
+          from openpilot.common.prefix import OpenpilotPrefix
+          with OpenpilotPrefix():
+            import openpilot.selfdrive.ui.ui
+            print("DK UI startup imports passed")
+          PY
       - name: Verify DK startup and display regressions
         if: github.ref == 'refs/heads/dkcarrot-wip' || github.base_ref == 'dkcarrot-wip'
         timeout-minutes: 5

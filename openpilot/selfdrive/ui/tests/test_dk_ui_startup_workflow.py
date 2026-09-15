@@ -21,6 +21,10 @@ def test_dk_pushes_and_pull_requests_run_real_startup_import_after_build():
   assert step["env"]["BIG"] == "1"
   assert step["env"]["OPENPILOT_PREFIX"].startswith("dk-ui-")
   assert "import openpilot.selfdrive.ui.ui" in step["run"]
+  # An environment variable alone does not create the msgq namespace. The
+  # real UI subscribes during import, before any vehicle publisher is started.
+  assert "from openpilot.common.prefix import OpenpilotPrefix" in step["run"]
+  assert "with OpenpilotPrefix():" in step["run"]
   assert "mock" not in step["run"]
   assert "continue-on-error" not in step
   assert 0 < int(step["timeout-minutes"]) <= 2
