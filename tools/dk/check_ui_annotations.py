@@ -96,6 +96,11 @@ def evaluate_annotation(node: ast.AST, names: dict):
 
 
 def check_source(source: str, filename: str, pyray) -> list[str]:
+  # ast.parse alone accepts compiler-invalid code such as duplicate arguments,
+  # top-level return, and misplaced future imports. Validate import-time syntax
+  # before the deferred-annotation shortcut, without executing target code or
+  # writing bytecode files. Do not inherit this checker's own future flags.
+  compile(source, filename, "exec", dont_inherit=True)
   tree = ast.parse(source, filename=filename)
   if any(isinstance(node, ast.ImportFrom) and node.module == "__future__" and
          any(alias.name == "annotations" for alias in node.names) for node in tree.body):

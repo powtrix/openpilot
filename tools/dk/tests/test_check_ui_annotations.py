@@ -51,6 +51,27 @@ def test_annotation_calls_and_other_module_code_are_never_executed(tmp_path):
   assert not marker.exists()
 
 
+@pytest.mark.parametrize("source,reason", [
+  ("import pyray as rl\nreturn None\n", "outside function"),
+  ("import pyray as rl\ndef draw(x, x) -> rl.Rectangle: pass\n", "duplicate argument"),
+  ("value = 1\nfrom __future__ import annotations\nimport pyray as rl\ndef draw() -> rl.Rectangle | None: pass\n",
+   "beginning of the file"),
+  ("from __future__ import annotations\nimport pyray as rl\ndef draw(x, x) -> rl.Rectangle | None: pass\n",
+   "duplicate argument"),
+])
+def test_compiler_invalid_source_is_rejected_before_annotation_shortcuts(source, reason):
+  with pytest.raises(SyntaxError, match=reason):
+    check.check_source(source, "hud.py", pyray)
+
+
+def test_compile_validation_does_not_execute_valid_source(tmp_path):
+  marker = tmp_path / "must-not-exist"
+  source = (f"from __future__ import annotations\nopen({str(marker)!r}, 'w').write('bad')\n"
+            + "import pyray as rl\ndef draw() -> rl.Rectangle | None: pass\n")
+  assert check.check_source(source, "hud.py", pyray) == []
+  assert not marker.exists()
+
+
 def run_git(repo, *args):
   return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
@@ -79,6 +100,26 @@ def test_exact_commit_not_dirty_worktree_is_checked(repository):
   fixed_commit = run_git(repo, "rev-parse", "HEAD")
   path.write_text(bad)
   assert check.check_commit(repo, fixed_commit, pyray)[1] == []
+
+
+@pytest.mark.parametrize("bad", [
+  "import pyray as rl\nreturn None\n",
+  "value = 1\nfrom __future__ import annotations\nimport pyray as rl\ndef draw() -> rl.Rectangle | None: pass\n",
+])
+def test_compiler_invalid_exact_commit_fails_closed_despite_valid_worktree(repository, bad):
+  repo, path = repository
+  path.write_text(bad)
+  run_git(repo, "add", ".")
+  run_git(repo, "commit", "-qm", "compiler-invalid source")
+  bad_commit = run_git(repo, "rev-parse", "HEAD")
+  path.write_text("from __future__ import annotations\nimport pyray as rl\ndef draw() -> rl.Rectangle | None: pass\n")
+  with pytest.raises(SyntaxError):
+    check.check_commit(repo, bad_commit, pyray)
+  result = subprocess.run([sys.executable, str(CHECK_PATH), "--repo", str(repo), "--commit", bad_commit],
+                          capture_output=True, text=True, timeout=30)
+  assert result.returncode == 2
+  assert "push blocked" in result.stderr
+  assert "passed" not in result.stdout
 
 
 SHA = "1" * 40
