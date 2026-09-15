@@ -1,0 +1,16 @@
+#!/bin/sh
+# Annotation gate only. The installed Git hook must preserve its Git LFS hook.
+set -eu
+dk_repo=$(git rev-parse --show-toplevel)
+dk_config_python=$(git config --get dk.uiCheckPython || true)
+dk_config_pythonpath=$(git config --get dk.uiCheckPythonPath || true)
+dk_python=${DK_UI_CHECK_PYTHON:-${dk_config_python:-"$dk_repo/.venv/bin/python"}}
+if [ -n "$dk_config_pythonpath" ]; then
+  PYTHONPATH="$dk_config_pythonpath${PYTHONPATH:+:$PYTHONPATH}"
+  export PYTHONPATH
+fi
+if [ ! -x "$dk_python" ]; then
+  printf '%s\n' 'DK UI annotation check unavailable: configure DK_UI_CHECK_PYTHON with the real pyray runtime. Push blocked.' >&2
+  exit 2
+fi
+exec "$dk_python" "$dk_repo/tools/dk/check_ui_annotations.py" --repo "$dk_repo" --pre-push --remote-name "${1:-}" --remote-url "${2:-}"
