@@ -30,14 +30,14 @@ def test_label_uses_installed_release_month_day_not_the_live_date(tmp_path, depl
   assert load_dk_deployment_text("dkcarrot-wip", path) == expected
 
 
-@pytest.mark.parametrize("label", ["감속", "로그 개선", "Brake-v2", "가" * DK_RELEASE_LABEL_MAX_CHARS])
+@pytest.mark.parametrize("label", ["감속", "로그 개선", "Brake-v2", "브레이크게이지/핸들복원로그", "가" * DK_RELEASE_LABEL_MAX_CHARS])
 def test_release_label_is_configurable_and_date_prefix_tracks_metadata(tmp_path, label):
   path = write_metadata(tmp_path, release_metadata(deployed_at="2027-12-31 23:59 KST", label=label))
   assert load_dk_deployment_text("dkcarrot-wip", path) == f"1231 {label}"
 
 
 def test_installed_release_displays_braking_and_turn_return_log_label():
-  assert load_dk_deployment_text("dkcarrot-wip") == "0917 브레이크 및 복원로그"
+  assert load_dk_deployment_text("dkcarrot-wip") == "0917 브레이크게이지/핸들복원로그"
 
 
 @pytest.mark.parametrize("label", [

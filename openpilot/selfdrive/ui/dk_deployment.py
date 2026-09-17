@@ -9,7 +9,7 @@ from openpilot.common.basedir import BASEDIR
 
 DK_RELEASE_PATH = Path(BASEDIR) / "dk_release.json"
 DK_RELEASE_MAX_BYTES = 4096
-DK_RELEASE_LABEL_MAX_CHARS = 12
+DK_RELEASE_LABEL_MAX_CHARS = 14
 
 
 def load_dk_deployment_text(branch: str | bytes | None, path: Path = DK_RELEASE_PATH) -> str:
