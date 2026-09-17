@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 import numpy as np
 import pyray as rl
@@ -9,6 +11,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
+from openpilot.selfdrive.ui.onroad.stock_scc_braking import braking_bar_geometry, dk_scc_display_enabled, stock_scc_braking_fraction
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app
@@ -46,6 +49,10 @@ class AugmentedRoadView(CameraView):
     self._cached_matrix: np.ndarray | None = None
     self._content_rect = rl.Rectangle()
     self._suppress_camera_for_cluster = False
+    try:
+      self._dk_scc_braking_enabled = dk_scc_display_enabled(ui_state.params.get("GitBranch"))
+    except Exception:
+      self._dk_scc_braking_enabled = False
 
     self.model_renderer = ModelRenderer()
     self._hud_renderer = HudRenderer()
@@ -115,12 +122,10 @@ class AugmentedRoadView(CameraView):
       super()._render(rect)
     cam_ms = (time.monotonic() - _t) * 1000.0
 
-    self._hud_renderer.deceleration_exclusion_rect = None
     if not self._suppress_camera_for_cluster:
       # Draw the model overlay only with the camera view
       _t = time.monotonic()
       self.model_renderer.render(self._content_rect)
-      self._hud_renderer.deceleration_exclusion_rect = self.model_renderer.deceleration_exclusion_rect
       model_ms = (time.monotonic() - _t) * 1000.0
     _t = time.monotonic()
     self._hud_renderer.render(self._content_rect)  # plot 활성 시 plot 비용도 hud 구간에 포함
@@ -389,6 +394,10 @@ class AugmentedRoadView(CameraView):
       bottom_color
     )
 
+    # This overlay is outside the camera scissor and underneath border text.
+    # It observes stock SCC CAN demand; it never participates in car control.
+    self._draw_stock_scc_braking_border(rect)
+
     # ---------- blinkers ----------
     rl.draw_rectangle_rounded(
       left_blink_rect,
@@ -485,6 +494,18 @@ class AugmentedRoadView(CameraView):
                        align="left_top", y_offset=0.0)
     draw_text_ui_style(bottom_right, x + w - text_margin, bottom_text_y, font_size, rl.WHITE,
                        align="right_top", y_offset=0.0)
+
+  def _draw_stock_scc_braking_border(self, rect: rl.Rectangle) -> None:
+    if not getattr(self, "_dk_scc_braking_enabled", False):
+      return
+    fraction = stock_scc_braking_fraction(ui_state.sm, started=ui_state.started,
+                                         started_frame=ui_state.started_frame, now=time.monotonic())
+    if fraction is None:
+      return
+    geometry = braking_bar_geometry(float(rect.x), float(rect.y), float(rect.width), float(rect.height),
+                                    float(UI_BORDER_SIZE), fraction)
+    if geometry is not None:
+      rl.draw_rectangle_rec(rl.Rectangle(*geometry), rl.Color(255, 0, 0, 255))
 
 if __name__ == "__main__":
   gui_app.init_window("OnRoad Camera View")

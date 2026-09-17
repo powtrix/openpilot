@@ -38,4 +38,6 @@ def test_dk_ci_does_not_skip_real_pyray_or_exact_commit_annotation_checks():
   assert "test_dk_model_renderer_runtime_import.py" in step["run"]
   assert "tools/dk/check_ui_annotations.py --commit HEAD" in step["run"]
   assert "test_check_ui_annotations.py" in step["run"]
+  assert "test_stock_scc_braking.py" in step["run"]
+  assert "test_dk_stock_scc_display.py" in step["run"]
   assert "continue-on-error" not in step

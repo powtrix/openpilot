@@ -36,8 +36,8 @@ def test_release_label_is_configurable_and_date_prefix_tracks_metadata(tmp_path,
   assert load_dk_deployment_text("dkcarrot-wip", path) == f"1231 {label}"
 
 
-def test_installed_release_displays_0915_startup_fix_label():
-  assert load_dk_deployment_text("dkcarrot-wip") == "0915 부팅수정"
+def test_installed_release_displays_stock_scc_braking_label():
+  assert load_dk_deployment_text("dkcarrot-wip") == "0917 SCC 제동"
 
 
 @pytest.mark.parametrize("label", [

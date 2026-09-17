@@ -59,10 +59,13 @@ jobs:
         run: |
           python -m pytest -o addopts='' -q \
             openpilot/selfdrive/ui/tests/test_dk_model_renderer_runtime_import.py \
-            openpilot/selfdrive/ui/tests/test_dk_model_hud_exclusions.py \
             openpilot/selfdrive/ui/tests/test_carrot_model_renderer_lane_visibility.py \
             openpilot/selfdrive/ui/tests/test_carrot_hud_renderer.py \
-            openpilot/selfdrive/ui/tests/test_deceleration_indicator.py \
+            openpilot/selfdrive/ui/tests/test_stock_scc_braking.py \
+            opendbc/car/hyundai/tests/test_dk_stock_scc_display.py \
+            opendbc/car/hyundai/tests/test_stock_scc_resume.py \
+            opendbc/car/hyundai/tests/test_stock_scc_can_replay.py \
+            opendbc/car/hyundai/tests/test_jerk.py \
             openpilot/selfdrive/ui/tests/test_dk_deployment.py \
             openpilot/selfdrive/ui/tests/test_cluster_hud_camera_suppression.py \
             openpilot/selfdrive/ui/tests/test_text_draw_offsets.py \

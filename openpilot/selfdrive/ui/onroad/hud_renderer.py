@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.deceleration_source import deceleration_source_presentation
 from openpilot.selfdrive.ui.dk_deployment import load_dk_deployment_text
-from openpilot.selfdrive.ui.onroad.deceleration_indicator import deceleration_display
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.hardware.usbgpu import usbgpu_badge_state
@@ -214,10 +213,7 @@ class HudRenderer(Widget):
     except Exception:
       deployment_branch = None
     self._dk_deployment_text = load_dk_deployment_text(deployment_branch)
-    self._dk_deceleration_enabled = (isinstance(deployment_branch, (str, bytes))
-                                     and deployment_branch.strip() in ("dkcarrot-wip", b"dkcarrot-wip"))
     self._turn_info_hud_visible = False
-    self.deceleration_exclusion_rect: rl.Rectangle | None = None
 
   def _refresh_hud_params(self, now: float) -> None:
     if now < self._hud_params_next_refresh_time:
@@ -314,44 +310,7 @@ class HudRenderer(Widget):
     self._draw_date_time(rect)
     self._draw_tpms(rect)
     self._draw_egpu_badge(rect)
-    self._draw_deceleration_indicator(rect)
     self._draw_cruise_speed_animation(rect)
-
-  def _draw_deceleration_indicator(self, rect: rl.Rectangle) -> None:
-    if not getattr(self, "_dk_deceleration_enabled", False):
-      return
-    # Reserve the existing left status panel and right navigation card. Do not
-    # move this secondary readout up into the road when a sidebar narrows it.
-    if rect.width < 1400 or rect.height < 400 or (self._turn_info_hud_visible and rect.width < 2000):
-      return
-    display = deceleration_display(ui_state.sm, started=ui_state.started,
-                                   started_frame=ui_state.started_frame, now=time.monotonic())
-    if display is None:
-      return
-
-    center_x = rect.x + rect.width * 0.5
-    bar_y = rect.y + rect.height - 40
-    bar_width = 360.0
-    text_size = measure_text_cached(self._font_display, display.text, 36)
-    half_width = max(bar_width, text_size.x) * 0.5 + 4
-    # Include the text outline/shadow and track. The model renderer supplies
-    # bounds for already drawn distance labels; it remains the priority layer.
-    indicator_rect = rl.Rectangle(center_x - half_width, bar_y - text_size.y - 8,
-                                   half_width * 2, text_size.y + 26)
-    exclusion = getattr(self, "deceleration_exclusion_rect", None)
-    if exclusion is not None and (indicator_rect.x < exclusion.x + exclusion.width
-                                  and indicator_rect.x + indicator_rect.width > exclusion.x
-                                  and indicator_rect.y < exclusion.y + exclusion.height
-                                  and indicator_rect.y + indicator_rect.height > exclusion.y):
-      return
-    # A compact track and outlined text, not an opaque card over the road.
-    rl.draw_rectangle_rounded(rl.Rectangle(center_x - bar_width * 0.5, bar_y, bar_width, 14),
-                              1.0, 8, rl.Color(60, 20, 20, 170))
-    fill_width = bar_width * display.fraction
-    rl.draw_rectangle_rounded(rl.Rectangle(center_x - fill_width * 0.5, bar_y, fill_width, 14),
-                              1.0, 8, COLORS.RED_SOLID)
-    draw_text_ui_style(display.text, center_x, bar_y - 10, 36, rl.Color(255, 80, 80, 255),
-                       font=self._font_display, border_width=1.5, shadow_offset=2.0, align="center_bottom")
 
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed

@@ -274,6 +274,16 @@ struct CarState {
   ka4StockSccKeepaliveRequestCount @93 :UInt32; # synthetic RES frames the controller queued in can_sends; does not prove Panda TX or SCC ECU acceptance
   ka4StockSccKeepaliveQualified @94 :Bool; # controller has entered its physical-stop qualification epoch
   ka4StockSccKeepaliveStoppedSec @95 :Float32; # elapsed seconds in that qualification epoch
+  dkStockScc @96 :DkStockScc; # passive stock-SCC command telemetry; never a control input
+
+  struct DkStockScc {
+    accelRequest @0 :Float32; # received SCC_CONTROL.aReqValue, m/s^2; not measured deceleration or brake pressure
+    rawAccelRequest @1 :Float32; # received SCC_CONTROL.aReqRaw, m/s^2; diagnostic target before command ramping
+    valid @2 :Bool; # a fresh accepted stock SCC frame on the existing selected receive bus
+    active @3 :Bool; # valid, ACCMode enabled (not driver override), and no SCC failure/takeover request
+    sourceMonoTime @4 :UInt64; # original accepted CAN frame timestamp, never refreshed from a cached value
+  }
+
   struct Tpms {
     fl @0 :Float32;
     fr @1 :Float32;
