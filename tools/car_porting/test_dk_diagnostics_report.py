@@ -200,12 +200,14 @@ def test_configuration_uses_exact_current_observer_keys_and_identity():
   for message in logs:
     analyzer.feed_record(message)
   config = analyzer.report()["configuration"][0]
-  assert config["diagnostics_version"] == "dk-vehicle-diag-v2"
+  assert config["diagnostics_version"] == "dk-vehicle-diag-v3"
   assert config["params_snapshot_scope"] == "initial_numeric_raw_params_only"
   assert config["cp"]["carFingerprint"] == str(cp().carFingerprint)
   assert config["initial_params"]["StopDistanceCarrot"] == 50
   assert config["initial_params"]["AlphaLongitudinalEnabled"] == 50
   assert config["initial_params"]["CustomSteerDeltaDownLC"] == 50
+  assert config["initial_params"]["LatSmoothSec"] == 50
+  assert config["initial_params"]["LateralTorqueKd"] == 50
 
 
 def test_explicit_unwind_phase_counts_constant_zero_target_and_cooldown_samples():
@@ -298,6 +300,146 @@ def test_v2_braking_hint_fields_are_allowlisted_and_bounded(invalid):
   record["braking_capture"] = {"priority": 2, "reasons": [invalid]}
   analyzer.feed_record(record)
   assert not any(item["event"] == "braking_capture_hint" for item in analyzer.report()["timeline"])
+
+
+def stage(ns=1_000_000_000):
+  return {"event": "dk_lateral_stage", "schema": 1, "kind": "sample", "mono_ns": ns,
+          "target_source": "model", "configured_smoothing_s": 0.4, "effective_smoothing_s": 0.1,
+          "before_smoothing_curvature": -0.02, "smoothed_curvature": 0.012, "clipped_curvature": 0.011,
+          "previous_curvature": 0.015, "curvature_limited": False, "curvature_changed_by_clip": True,
+          "steer_limited_input": True, "steer_limit_flag_refreshed": False,
+          "pid": {"k_p": 1.2}, "sources": {"carOutput": {"mono_ns": ns - 100_000_000, "valid": True, "alive": True}},
+          "request": {"torque": -0.2}, "latest_output": {"torque": 0.3}}
+
+
+def test_real_stage_and_turn_observers_survive_full_cereal_roundtrip(tmp_path):
+  from openpilot.cereal import log
+  from openpilot.selfdrive.carrot.dk_turn_return import TurnReturnObserver
+  from openpilot.selfdrive.controls.lib.dk_lateral_diagnostics import DkLateralDiagnostics
+  from openpilot.selfdrive.controls.tests.test_dk_lateral_diagnostics import capture, context
+
+  records = [session()]
+  turn_observer = TurnReturnObserver()
+  for i, (angle, torque, pressed) in enumerate(((40, 0.6, False), (50, 0.6, False), (50, 0.6, False), (48, 0.1, True))):
+    ns = 1_000_000_000 + i * 100_000_000
+    observation, reasons = turn_observer.update(ns, angle=angle, angle_mono_ns=ns, speed=7.0,
+                                              can_valid=True, active=True, pressed=pressed, driver_torque=-0.5,
+                                              request_fresh=True, torque_mode=True, request_torque=torque,
+                                              output_torque=0.6, request_angle=0.0, desired_curvature=0.01)
+    record = sample(ns, angle=angle, speed=7.0)
+    record["car"]["steering_pressed"] = pressed
+    record["turn_return"] = observation
+    record["unwind_capture"] = {"episode_id": observation["episode_id"], "reasons": reasons}
+    records.append(record)
+    if i == 2:
+      stage_observer = DkLateralDiagnostics(records.append, lambda ns=ns: ns + 10_000_000)
+      capture(stage_observer)
+      stage_observer.emit(*context())
+  events = []
+  initial = log.Event.new_message()
+  initial.logMonoTime = 999_000_000_000  # initData must not define segment-relative time.
+  initial.init("initData")
+  events.append(initial.to_bytes())
+  for message in records:
+    event = log.Event.new_message()
+    event.logMonoTime = message["mono_ns"]
+    event.logMessage = json.dumps({"msg": message})
+    events.append(event.to_bytes())
+  path = tmp_path / "rlog"
+  path.write_bytes(b"".join(events))
+  report = analyze_local([path])
+  assert report["counts"]["lateral_stage_samples"] == 1
+  assert report["counts"]["samples"] == 4
+  turn = report["turn_return"]
+  assert turn["counts"]["phase_return_samples"] == 1
+  assert turn["counts"]["capture_hint_turn_driver_steering_intervention"] == 1
+  hints = [event for event in report["timeline"] if event["event"] == "turn_return_capture_hint"]
+  assert all(event["episode_id"] == "turn-1000000000" for event in hints)
+  assert all(event["source_seconds"] == pytest.approx(0.3) for event in hints)
+  assert all(event["interpretation"] == "retention_hint_not_fault_or_causal_verdict" for event in hints)
+  phase = next(event for event in report["timeline"] if event.get("phase") == "return")
+  assert phase["driver_pressed"] is True
+  assert phase["driver_press_mono_ns"] == 1_300_000_000
+  assert phase["return_start_mono_ns"] == 1_300_000_000
+  stages = report["lateral_stages"]
+  assert stages["configuration"][0]["source_seconds"] == pytest.approx(0.21)
+  assert stages["configuration"][0]["effective_smoothing_s"] == 0.1
+  assert stages["descriptive_metrics"]["pid.k_p"]["mean"] == 1.2
+  assert stages["counts"]["curvature_limited_false_samples"] == 1
+  assert stages["counts"]["curvature_changed_by_clip_true_samples"] == 1
+  assert stages["stage_deltas_not_causal_effects"]["clip_delta_curvature"]["mean"] == pytest.approx(-0.001)
+  assert report["assessment"] == "observations_only_no_vehicle_acceptance_verdict"
+
+
+def test_stage_and_vehicle_clocks_align_per_file_without_cross_source_transitions():
+  analyzer = DiagnosticsReport()
+  analyzer.begin_source("first")
+  analyzer.feed_record(stage(10_000_000_000))
+  analyzer.feed_record(sample(10_100_000_000))
+  analyzer.begin_source("second")
+  analyzer.feed_record(stage())
+  record = sample(1_100_000_000)
+  record["turn_return"] = {"phase": "return", "episode_id": "turn-1000000000"}
+  analyzer.feed_record(record)
+  report = analyzer.report()
+  assert not report["counts"].get("backward_timestamps")
+  assert not report["lateral_stages"]["counts"].get("backward_timestamps")
+  assert report["lateral_stages"]["configuration"][1]["source_seconds"] == 0
+  observation = next(event for event in report["timeline"] if event["event"] == "turn_return_observation")
+  assert observation["source"] == "second"
+  assert observation["source_seconds"] == pytest.approx(0.1)
+
+
+def test_turn_and_stage_fields_are_bounded_and_malformed_values_stay_missing():
+  analyzer = DiagnosticsReport(timeline_limit=3)
+  for i in range(100):
+    data = stage(1_000_000_000 + i * 100_000_000)
+    data["configured_smoothing_s"] = i
+    data["target_source"] = ["untrusted"]
+    data["pid"]["k_p"] = 10**1000
+    data["sources"]["carOutput"]["mono_ns"] = True
+    analyzer.feed_record(data)
+    record = sample(data["mono_ns"] + 1)
+    record["turn_return"] = {"phase": "return", "episode_id": f"turn-{i}", "direction": ["arbitrary"],
+                             "signed_angle_rate_dps": float("nan"), "driver_press_mono_ns": True}
+    record["unwind_capture"] = {"episode_id": f"turn-{i}", "reasons": [
+      {"reason": ["turn_return_candidate"], "priority": 1, "mono_ns": data["mono_ns"]},
+      {"reason": "return_request_output_gap", "priority": True, "mono_ns": data["mono_ns"]},
+      {"reason": "turn_return_candidate", "priority": 1, "mono_ns": record["mono_ns"] + 1},
+    ]}
+    analyzer.feed_record(record)
+  report = analyzer.report()
+  assert len(report["timeline"]) == 3
+  assert report["timeline_dropped"] > 0
+  assert len(report["lateral_stages"]["configuration"]) == 8
+  assert report["lateral_stages"]["counts"]["configuration_snapshots_omitted"] == 92
+  assert report["lateral_stages"]["descriptive_metrics"]["pid.k_p"]["mean"] is None
+  assert report["lateral_stages"]["source_quality"]["carOutput"]["age_unknown"] == 100
+  assert not any("capture_hint_" in key for key in report["turn_return"]["counts"])
+  assert report["turn_return"]["descriptive_metrics"]["signed_angle_rate_dps"]["mean"] is None
+  json.dumps(report, allow_nan=False)
+
+
+def test_stage_schema_invalid_times_and_stage_only_cli(tmp_path, capsys):
+  analyzer = DiagnosticsReport()
+  for timestamp in (True, -1, float("nan"), 2**63):
+    analyzer.feed_record({**stage(), "mono_ns": timestamp})
+  analyzer.feed_record({**stage(), "schema": 2})
+  report = analyzer.report()
+  assert report["counts"]["invalid_lateral_stage_records"] == 4
+  assert report["counts"]["unsupported_schema"] == 1
+  path = tmp_path / "stage.jsonl"
+  path.write_text(json.dumps(stage()))
+  assert main(["--jsonl", str(path)]) == 0
+  report = json.loads(capsys.readouterr().out)
+  assert report["counts"]["lateral_stage_samples"] == 1
+
+
+def test_turn_capture_reason_allowlist_matches_observer():
+  from openpilot.selfdrive.carrot.dk_turn_return import REASON_PRIORITIES
+  from tools.car_porting.dk_diagnostics_report import TURN_CAPTURE_PRIORITIES  # noqa: TID251
+
+  assert TURN_CAPTURE_PRIORITIES == REASON_PRIORITIES
 
 
 def test_v1_records_keep_missing_v2_fields_distinct_from_zero():

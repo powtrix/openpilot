@@ -17,6 +17,17 @@ def braking_sample(reason="hard_deceleration", mono_ns=123456):
           "braking_capture": {"reasons": [{"reason": reason, "mono_ns": mono_ns}]}}
 
 
+def unwind_sample(reason="turn_return_candidate", episode="turn-1000", mono_ns=123456):
+  return {**sample("unwind"), "mono_ns": mono_ns,
+          "unwind_capture": {"episode_id": episode, "reasons": [{"reason": reason, "mono_ns": mono_ns}]}}
+
+
+def test_return_observer_and_retention_reason_contract_match():
+  from openpilot.selfdrive.carrot.dk_diagnosticsd import UNWIND_REASONS
+  from openpilot.selfdrive.carrot.dk_turn_return import REASON_PRIORITIES
+  assert UNWIND_REASONS == REASON_PRIORITIES
+
+
 def segment(root, index, data=b"full-rlog", locked=False):
   directory = root / f"route--{index}"
   directory.mkdir(parents=True, exist_ok=True)
@@ -294,3 +305,94 @@ def test_malformed_priority_cannot_bypass_cooldown_or_expand_manifest(store):
     "reasons": [{"reason": "hard_deceleration", "irrelevant": "x" * 60000}]}}
   assert store.accept(oversized_reason, "route", 1001) == first
   assert (store.root / first / "manifest.json").stat().st_size < 4096
+
+
+def test_city_turn_intervention_promotes_same_episode_without_losing_pre_turn_context(store):
+  segment(store.log_root, 14)
+  segment(store.log_root, 15, locked=True)
+  first = store.accept(unwind_sample(), "route", 1000)
+  segment(store.log_root, 16, locked=True)
+  assert store.accept(unwind_sample("turn_driver_steering_intervention"), "route", 1025) == first
+  manifest = read_manifest(store.root / first)
+  assert manifest["center_segment"] == 15
+  assert manifest["unwind_priority"] == 2
+  assert manifest["unwind_episode_id"] == "turn-1000"
+  assert len(manifest["unwind_observations"]) == 2
+  assert manifest["braking_priority"] == 0
+  assert manifest["network_upload"] is False
+
+
+def test_nearby_distinct_city_turns_bypass_cooldown_without_merging(store):
+  segment(store.log_root, 15)
+  first = store.accept(unwind_sample(episode="turn-1"), "route", 1000)
+  segment(store.log_root, 16)
+  second = store.accept(unwind_sample(episode="turn-2"), "route", 1010)
+  assert first and second and first != second
+  assert [m["center_segment"] for _, m in store.entries()] == [15, 16]
+
+
+def test_four_return_windows_and_driver_interventions_survive_routine_candidates(store):
+  original = segment(store.log_root, 0)
+  captures = [store.accept(unwind_sample("turn_driver_steering_intervention", f"turn-{i}"), "route", 1000 + i * 10)
+              for i in range(4)]
+  assert len(store.entries()) == 4
+  assert store.accept(unwind_sample(episode="turn-weak"), "route", 1040) is None
+  assert store.accept(sample("unwind"), "route", 1240) is None
+  assert all((store.root / capture).exists() for capture in captures)
+  latest = store.accept(unwind_sample("turn_lateral_deactivation", "turn-new"), "route", 1240)
+  assert latest and len(store.entries()) == 4
+  assert not (store.root / captures[0]).exists()
+  assert (original / "rlog.zst").exists()
+
+
+def test_return_priority_restart_and_observation_buffers_are_bounded(store):
+  segment(store.log_root, 0)
+  first = store.accept(unwind_sample(), "route", 1000)
+  restored = CaptureStore(store.log_root, store.root, min_free_bytes=0)
+  for index in range(40):
+    assert restored.accept(unwind_sample("turn_driver_steering_intervention"), "route", 1001 + index / 10) == first
+  manifest = read_manifest(store.root / first)
+  assert manifest["unwind_priority"] == 2
+  assert len(manifest["unwind_observations"]) == 8
+
+
+def test_simultaneous_braking_and_return_hints_preserve_both_topics(store):
+  segment(store.log_root, 0)
+  record = {**unwind_sample(), "topics": ["braking", "unwind", "curve"],
+            "braking_capture": braking_sample()["braking_capture"]}
+  first = store.accept(record, "route", 1000)
+  assert store.accept(record, "route", 1001) == first
+  manifest = read_manifest(store.root / first)
+  assert manifest["topics"] == ["braking", "unwind"]
+  assert manifest["braking_priority"] == 2 and manifest["unwind_priority"] == 1
+  assert len(manifest["braking_observations"]) == len(manifest["unwind_observations"]) == 2
+
+
+@pytest.mark.parametrize("bad", [None, [], {"priority": 2}, {"episode_id": "turn-1", "reasons": [{}]},
+  {"episode_id": "turn-1", "reasons": [{"reason": []}]},
+  {"episode_id": "turn-1", "reasons": [{"reason": "unknown", "priority": 2}]},
+  {"episode_id": "../bad", "reasons": [{"reason": "turn_driver_steering_intervention"}]},
+  {"episode_id": "turn-1", "reasons": [{"reason": "turn_return_candidate"}] * 6}])
+def test_malformed_return_priority_does_not_bypass_cooldown(store, bad):
+  segment(store.log_root, 0)
+  store.accept(sample("unwind"), "route", 1000)
+  assert store.accept({**sample("unwind"), "unwind_capture": bad}, "route", 1001) is None
+
+
+def test_strong_return_windows_still_obey_global_count_bytes_and_expiry(store):
+  original = segment(store.log_root, 0)
+  for topic in ("resume", "engage_warning", "curve", "braking"):
+    store.accept(sample(topic), "route", 1000)
+    store.accept(sample(topic), "route", 1120)
+  for index in range(4):
+    store.accept(unwind_sample("turn_driver_steering_intervention", f"turn-{index}"), "route", 1130 + index)
+  assert len(store.entries()) == 10
+  assert sum("unwind" in manifest["topics"] for _, manifest in store.entries()) == 4
+  store.max_bytes = 1
+  store.prune(1200)
+  assert not store.entries()
+  store.max_bytes = 1024 ** 3
+  store.accept(unwind_sample(), "route", 1300)
+  store.prune(1301 + TTL_SECONDS)
+  assert not store.entries()
+  assert (original / "rlog.zst").exists()

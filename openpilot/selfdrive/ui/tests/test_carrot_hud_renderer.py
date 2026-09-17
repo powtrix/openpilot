@@ -672,6 +672,30 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
   assert renderer._dk_deployment_text == "0913 감속"
 
 
+def test_city_return_release_label_is_below_date_at_unchanged_size(hud_module, monkeypatch):
+  module, _ = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  renderer._show_date_time = 1
+  renderer._dk_deployment_text = "0917 브레이크 및 복원로그"
+  renderer._date_time_text = "19:00"
+  renderer._date_text = "09-17(목)"
+  renderer._font_display = object()
+  monkeypatch.setattr(renderer, "_refresh_date_time_text", lambda now: None)
+  monkeypatch.setattr(module, "measure_text_cached", lambda *_args: module.rl.Vector2(760, 56))
+  calls = []
+  monkeypatch.setattr(module, "draw_text_ui_style", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+  renderer._draw_date_time(module.rl.Rectangle(30, 20, 1500, 1000))
+
+  clock, calendar, label = [args for args, _ in calls]
+  assert label[0] == "0917 브레이크 및 복원로그"
+  assert label[3] == pytest.approx(52.8)
+  assert label[2] - 56 == calendar[2] + 20
+  assert label[1] - 760 / 2 == 30 + 8
+  assert label[1] + 760 / 2 < 30 + 1500
+  assert calendar[2] > clock[2]
+
+
 def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):
   module, _ = hud_module
   sm = {

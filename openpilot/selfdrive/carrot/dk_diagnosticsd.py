@@ -19,14 +19,18 @@ from pathlib import Path
 TOPICS = frozenset(("resume", "engage_warning", "curve", "unwind", "braking"))
 MAX_CAPTURES = 10
 MAX_PER_TOPIC = 2
+MAX_UNWIND_CAPTURES = 4
 MAX_BYTES = 1024 ** 3
 MAX_FILE_BYTES = 256 * 1024 ** 2
 MAX_RECORD_BYTES = 64 * 1024
 TTL_SECONDS = 7 * 86400
 TOPIC_COOLDOWN = 120
 BRAKING_EPISODE_SECONDS = 20
+UNWIND_EPISODE_SECONDS = 40
 MAX_BRAKING_OBSERVATIONS = 8
 BRAKING_REASONS = {"driver_brake_intervention": 1, "scc_takeover_request": 2, "hard_deceleration": 2}
+UNWIND_REASONS = {"turn_return_candidate": 1, "return_slow_angle_response": 1, "return_request_output_gap": 1,
+                 "turn_driver_steering_intervention": 2, "turn_lateral_deactivation": 2}
 FINALIZE_AFTER = 180
 MIN_FREE_BYTES = 5 * 1024 ** 3
 CAPTURE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -101,8 +105,44 @@ def braking_priority(record: dict) -> int:
 
 
 def retention_priority(manifest: dict) -> int:
-  value = manifest.get("braking_priority", 0)
-  return value if isinstance(value, int) and 0 <= value <= 2 and "braking" in manifest["topics"] else 0
+  values = [manifest.get(f"{topic}_priority", 0) for topic in ("braking", "unwind") if topic in manifest["topics"]]
+  return max((value for value in values if type(value) is int and 0 <= value <= 2), default=0)
+
+
+def unwind_priority(record: dict) -> int:
+  capture = record.get("unwind_capture", {})
+  if (not isinstance(capture, dict) or not isinstance(capture.get("reasons"), list)
+      or unwind_episode_id(record) is None):
+    return 0
+  reasons = capture["reasons"]
+  if len(reasons) > len(UNWIND_REASONS):
+    return 0
+  return max((UNWIND_REASONS.get(item.get("reason"), 0) for item in reasons if isinstance(item, dict)
+              and isinstance(item.get("reason"), str)), default=0)
+
+
+def unwind_episode_id(record: dict):
+  capture = record.get("unwind_capture", {})
+  value = capture.get("episode_id") if isinstance(capture, dict) else None
+  # Local observer IDs only. Do not persist arbitrary caller-supplied text.
+  if type(value) is int and 0 <= value < 2 ** 64:
+    return value
+  if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+    return value
+  return None
+
+
+def unwind_observation(record: dict, now: float) -> dict:
+  capture = record.get("unwind_capture", {})
+  reasons = []
+  for item in capture.get("reasons", [])[:len(UNWIND_REASONS)]:
+    if isinstance(item, dict) and isinstance(item.get("reason"), str) and item["reason"] in UNWIND_REASONS:
+      timestamp = item.get("mono_ns")
+      reasons.append({"reason": item["reason"], "priority": UNWIND_REASONS[item["reason"]],
+                      "mono_ns": timestamp if type(timestamp) is int else None})
+  mono_ns = record.get("mono_ns")
+  return {"received_at": now, "mono_ns": mono_ns if type(mono_ns) is int else None,
+          "episode_id": unwind_episode_id(record), "priority": unwind_priority(record), "reasons": reasons}
 
 
 def braking_observation(record: dict, now: float) -> dict:
@@ -197,23 +237,33 @@ class CaptureStore:
       return None
     self.prune(now)
     entries = self.entries()
-    priority = braking_priority(record) if "braking" in topics else 0
+    priorities = {"braking": braking_priority(record) if "braking" in topics else 0,
+                  "unwind": unwind_priority(record) if "unwind" in topics else 0}
+    priority = max(priorities.values())
     if priority:
-      # Independent braking hints bypass regular topic cooldowns. Keep only the
-      # braking tag here so this capture cannot displace unrelated topic quotas.
-      topics = ["braking"]
+      # Preserve interventions independently of routine candidate cooldowns.
+      # Simultaneous braking/steering hints share one window without dropping
+      # either topic. A different turn ID always gets its own center segment.
+      topics = [topic for topic in topics if priorities.get(topic, 0)]
       for directory, manifest in reversed(entries):
-        if (manifest["route"] == route and "braking" in manifest["topics"]
-            and 0 <= now - manifest["created_at"] < BRAKING_EPISODE_SECONDS):
-          # Same short episode: retain the first pre/post center, promote it,
-          # and append bounded trigger times instead of repeatedly copying logs.
-          observations = manifest.get("braking_observations", [])
-          if not isinstance(observations, list):
-            observations = []
-          if len(observations) < MAX_BRAKING_OBSERVATIONS:
-            observations.append(braking_observation(record, now))
-          manifest["braking_observations"] = observations
-          manifest["braking_priority"] = max(priority, retention_priority(manifest))
+        if (manifest["route"] == route and all(topic in manifest["topics"] for topic in topics)
+            and 0 <= now - manifest["created_at"] < (UNWIND_EPISODE_SECONDS if "unwind" in topics else BRAKING_EPISODE_SECONDS)
+            and ("unwind" not in topics or manifest.get("unwind_episode_id") in (None, unwind_episode_id(record)))):
+          # Retain the first pre/post center and append bounded trigger times.
+          for topic in topics:
+            observations = manifest.get(f"{topic}_observations", [])
+            if not isinstance(observations, list):
+              observations = []
+            if len(observations) < MAX_BRAKING_OBSERVATIONS:
+              observe = braking_observation if topic == "braking" else unwind_observation
+              observations.append(observe(record, now))
+            manifest[f"{topic}_observations"] = observations
+            previous_priority = manifest.get(f"{topic}_priority", 0)
+            if type(previous_priority) is not int or not 0 <= previous_priority <= 2:
+              previous_priority = 0
+            manifest[f"{topic}_priority"] = max(priorities[topic], previous_priority)
+          if "unwind" in topics:
+            manifest["unwind_episode_id"] = unwind_episode_id(record)
           write_manifest(directory, manifest)
           return directory.name
     for _, manifest in entries:
@@ -229,15 +279,17 @@ class CaptureStore:
         candidates.append(int(suffix))
     if not candidates:
       return None
-    # Keep at most two candidate windows per topic and ten in total. Eviction
+    # Keep four return windows (baseline and interventions), two for other
+    # topics, and ten in total. Byte/expiry limits remain unchanged. Eviction
     # only removes our copies, never original loggerd data or driver bookmarks.
     accepted_topics = []
     for topic in topics:
       matches = sorted([entry for entry in entries if topic in entry[1]["topics"]],
                        key=lambda item: (retention_priority(item[1]), item[1]["created_at"]))
-      if len(matches) >= MAX_PER_TOPIC and retention_priority(matches[0][1]) > priority:
+      topic_limit = MAX_UNWIND_CAPTURES if topic == "unwind" else MAX_PER_TOPIC
+      if len(matches) >= topic_limit and retention_priority(matches[0][1]) > priority:
         continue
-      while len(matches) >= MAX_PER_TOPIC:
+      while len(matches) >= topic_limit:
         old = matches.pop(0)
         self._remove(old[0])
         entries.remove(old)
@@ -261,8 +313,11 @@ class CaptureStore:
       "expires_at": now + TTL_SECONDS, "route": route, "center_segment": max(candidates),
       "segment_selection": "latest_logger_segment_at_event_receipt_with_previous_and_next",
       "topics": topics, "event": record, "session": self.session, "files": [], "missing": [],
-      "braking_priority": priority,
-      "braking_observations": [braking_observation(record, now)] if priority else [],
+      "braking_priority": priorities["braking"] if "braking" in topics else 0,
+      "braking_observations": [braking_observation(record, now)] if priorities["braking"] and "braking" in topics else [],
+      "unwind_priority": priorities["unwind"] if "unwind" in topics else 0,
+      "unwind_episode_id": unwind_episode_id(record) if "unwind" in topics else None,
+      "unwind_observations": [unwind_observation(record, now)] if priorities["unwind"] and "unwind" in topics else [],
       "interpretation": "candidate_observation_not_diagnosis", "network_upload": False,
     }
     write_manifest(directory, manifest)

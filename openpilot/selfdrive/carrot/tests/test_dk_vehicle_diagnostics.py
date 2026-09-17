@@ -270,7 +270,7 @@ def test_session_is_repeated_for_later_log_segments():
   record(observer, *objects, now=61_000_000_000)
   sessions = [msg for msg in logs if msg['kind'] == 'session']
   assert len(sessions) == 2
-  assert all(msg['diagnostics_version'] == 'dk-vehicle-diag-v2' for msg in sessions)
+  assert all(msg['diagnostics_version'] == 'dk-vehicle-diag-v3' for msg in sessions)
 
 
 def test_driver_brake_without_lead_survives_recent_disengagement_and_ordinary_cooldown():

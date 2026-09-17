@@ -42,10 +42,43 @@ CONFIG_KEYS = ("PathOffset", "AdjustLaneOffset", "UseLaneLineSpeed", "SteerActua
                "CustomSteerDeltaDownLC", "LongActuatorDelay", "VEgoStopping", "StoppingAccel", "StopDistanceCarrot",
                "TrafficLightDetectMode", "ExperimentalMode", "AlphaLongitudinalEnabled", "CanfdHDA2",
                "HyundaiCameraSCC", "EnableRadarTracks", "CruiseButtonTest1", "CruiseButtonTest2", "CruiseButtonTest3",
-               "AutoCruiseControl", "SpeedFromPCM", "Ka4StockSccStandstillRearm")
+               "AutoCruiseControl", "SpeedFromPCM", "Ka4StockSccStandstillRearm", "LatSmoothSec",
+               "LateralTorqueCustom", "LateralTorqueAccelFactor", "LateralTorqueFriction",
+               "LateralTorqueKpV", "LateralTorqueKiV", "LateralTorqueKf", "LateralTorqueKd")
 MAX_JSON_LINE = 1_048_576
 MAX_TIMELINE = 200
 BRAKING_CAPTURE_REASONS = ("driver_brake_intervention", "scc_takeover_request", "hard_deceleration")
+TURN_CAPTURE_PRIORITIES = {"turn_return_candidate": 1, "return_slow_angle_response": 1,
+                          "return_request_output_gap": 1, "turn_driver_steering_intervention": 2,
+                          "turn_lateral_deactivation": 2}
+TURN_PHASES = ("idle", "entry_candidate", "turn", "return", "complete", "reset", "inactive", "unchanged_source")
+TURN_RESET_REASONS = ("missing_or_invalid_timestamp", "stale_or_future_angle", "invalid_car_state",
+                      "stale_or_invalid_request", "nonmonotonic_time_or_sample_gap", "episode_timeout")
+TURN_METRICS = ("angle_source_age_ms", "peak_angle_deg", "elapsed_s", "return_elapsed_s",
+                "signed_angle_rate_dps", "centerward_angle_rate_dps", "remaining_angle_deg",
+                "request_torque_rate_per_s", "output_torque_rate_per_s")
+TURN_FLAGS = ("request_fresh", "recent_lateral_active", "torque_mode", "angle_returning_from_peak",
+              "torque_request_reducing", "angle_goal_reducing", "curvature_goal_reducing",
+              "request_output_same_sign", "request_output_opposed", "same_sign_torque_output_lag",
+              "output_torque_falling_in_turn_direction", "driver_centerward_torque", "driver_pressed_on_entry",
+              "slow_angle_response_observed", "request_output_gap_observed")
+TURN_TIMES = ("start_mono_ns", "peak_mono_ns", "return_start_mono_ns", "driver_press_mono_ns",
+              "driver_release_mono_ns", "lateral_deactivation_mono_ns")
+STAGE_SERVICES = ("carState", "carOutput", "modelV2", "lateralPlan", "liveDelay", "liveParameters",
+                  "liveTorqueParameters", "selfdriveState")
+STAGE_FLAGS = ("lat_active", "selfdrive_active", "lat_plan_fresh", "curvature_limited", "curvature_changed_by_clip",
+               "lane_lag_adjustment_applied", "steer_limited_input", "steer_limited_after_publish",
+               "steer_limit_flag_refreshed", "driver_pressed", "integrator_freeze_condition")
+STAGE_SETTINGS = ("configured_smoothing_s", "effective_smoothing_s", "selected_actuator_delay_s",
+                  "lane_lag_adjustment_delay_s", "torque_mode.custom")
+STAGE_METRICS = ("before_smoothing_curvature", "smoothed_curvature", "clipped_curvature", "previous_curvature",
+                 "lane_lag_adjusted_curvature", *STAGE_SETTINGS,
+                 *("vehicle." + key for key in ("vEgo", "steeringAngleDeg", "steeringRateDeg", "steeringTorque")),
+                 *("request." + key for key in ("torque", "steeringAngleDeg", "curvature")),
+                 *("latest_output." + key for key in ("torque", "torqueOutputCan", "steeringAngleDeg")),
+                 *("pid." + key for key in ("k_p", "k_i", "k_d", "k_f", "speed", "p", "i", "d", "f", "control", "pos_limit", "neg_limit")),
+                 *("torque_params." + key for key in ("latAccelFactor", "latAccelOffset", "friction", "steeringAngleDeadzoneDeg")),
+                 *("vehicle_model." + key for key in ("sR", "cF", "cR")))
 
 
 def get(data: Any, path: str, default=None):
@@ -59,7 +92,18 @@ def get(data: Any, path: str, default=None):
 def number(value):
   if isinstance(value, bool) or not isinstance(value, (int, float)):
     return None
-  return float(value) if math.isfinite(value) else None
+  try:
+    return float(value) if math.isfinite(value) else None
+  except OverflowError:
+    return None
+
+
+def turn_id(value):
+  return value if isinstance(value, str) and value.startswith("turn-") and value[5:].isdigit() and len(value) <= 25 else None
+
+
+def sample_time(value, upper=None):
+  return value if type(value) is int and 0 <= value < 2**63 and (upper is None or value <= upper) else None
 
 
 @dataclass
@@ -105,6 +149,8 @@ class DiagnosticsReport:
     self.first_ns = None
     self.last_ns = None
     self.previous = None
+    self.previous_turn = None
+    self.source_last_sample_ns = None
     self.source_start_ns = None
     self.source = "input"
     self.quality = {name: Counter() for name in SERVICES}
@@ -116,6 +162,16 @@ class DiagnosticsReport:
     self.transitions = Counter()
     self.braking = Counter()
     self.capture_hints = Counter()
+    self.turn_counts = Counter()
+    self.turn_metrics = {name: Stats() for name in TURN_METRICS}
+    self.stage_counts = Counter()
+    self.stage_metrics = {name: Stats() for name in STAGE_METRICS}
+    self.stage_deltas = {name: Stats() for name in ("smoothing_delta_curvature", "clip_delta_curvature",
+                                                  "published_target_delta_curvature", "latest_output_minus_request_torque")}
+    self.stage_quality = {name: Counter() for name in STAGE_SERVICES}
+    self.stage_configuration = []
+    self.current_stage_configuration = None
+    self.stage_last_ns = None
     self.closing_start_ns = None
     self.metrics = {name: Stats() for name in (
       "car.speed_mps", "car.accel_mps2", "car.jerk_mps3", "request.accel_mps2", "output.accel_mps2",
@@ -142,6 +198,10 @@ class DiagnosticsReport:
     self.source_start_ns = None
     # A segment boundary or missing record is not a measured transition.
     self.previous = None
+    self.previous_turn = None
+    self.source_last_sample_ns = None
+    self.stage_last_ns = None
+    self.current_stage_configuration = None
     self.closing_start_ns = None
     self.current_metadata = dict.fromkeys(self.metadata)
     self.current_configuration = None
@@ -181,11 +241,14 @@ class DiagnosticsReport:
     return values
 
   def feed_record(self, record):
-    if not isinstance(record, dict) or record.get("event") != "dk_vehicle_diag":
+    if not isinstance(record, dict) or record.get("event") not in ("dk_vehicle_diag", "dk_lateral_stage"):
       self.counts["non_diagnostic_records"] += 1
       return
     if record.get("schema") != 1:
       self.counts["unsupported_schema"] += 1
+      return
+    if record.get("event") == "dk_lateral_stage":
+      self._stage_observations(record)
       return
     if record.get("kind") == "session":
       self.counts["sessions"] += 1
@@ -210,6 +273,7 @@ class DiagnosticsReport:
           self.counts["configuration_snapshots_omitted"] += 1
         self.current_configuration = config
         self.previous = None
+        self.previous_turn = None
         self.closing_start_ns = None
       return
     ns = record.get("mono_ns")
@@ -222,16 +286,19 @@ class DiagnosticsReport:
       self.first_ns = ns
     if self.source_start_ns is None:
       self.source_start_ns = ns
-    if self.last_ns is not None and ns < self.last_ns:
+    if self.source_last_sample_ns is not None and ns < self.source_last_sample_ns:
       self.counts["backward_timestamps"] += 1
       self.previous = None
+      self.previous_turn = None
       self.closing_start_ns = None
       self.source_start_ns = ns
     self.last_ns = ns
+    self.source_last_sample_ns = ns
     previous = self.previous
     if previous is not None and ns - previous["mono_ns"] > 2e9:
       self.counts["sample_gaps_over_2_seconds"] += 1
       previous = None
+      self.previous_turn = None
       self.closing_start_ns = None
     for service, quality in self.quality.items():
       status = get(record, "freshness." + service)
@@ -282,6 +349,7 @@ class DiagnosticsReport:
       self.state_counts[name][key] += 1
     self._resume_and_engage(record, previous, ns)
     self._capture_observations(record, ns)
+    self._turn_observations(record, ns)
     self._lateral(record)
     self._braking(record, previous, ns)
     self.previous = {"mono_ns": ns, "request": record.get("request", {}), "car": record.get("car", {}),
@@ -309,6 +377,115 @@ class DiagnosticsReport:
       self._event("braking_capture_hint", event_ns, reason=reason, retention_priority=priority,
                   lead_status=get(record, "radar.status"), driver_brake=get(record, "car.brake_pressed"),
                   interpretation="retention_hint_not_collision_or_fault_diagnosis")
+
+  def _turn_observations(self, record, ns):
+    """Describe the passive city-turn observer, without promoting hints to faults."""
+    turn = record.get("turn_return")
+    if not isinstance(turn, dict):
+      self.turn_counts["metadata_missing_samples"] += 1
+      self.previous_turn = None
+      return
+    self.turn_counts["metadata_present_samples"] += 1
+    phase = turn.get("phase")
+    phase = phase if isinstance(phase, str) and phase in TURN_PHASES else "unknown"
+    self.turn_counts["phase_" + phase + "_samples"] += 1
+    for name, stats in self.turn_metrics.items():
+      stats.add(turn.get(name))
+    for name in TURN_FLAGS:
+      value = turn.get(name)
+      self.turn_counts[name + ("_true_samples" if value is True else "_false_samples" if value is False else "_missing_samples")] += 1
+    episode = turn_id(turn.get("episode_id"))
+    direction = turn.get("direction")
+    direction = direction if direction in ("left_positive_angle", "right_negative_angle") else None
+    reset_reason = turn.get("reset_reason")
+    reset_reason = reset_reason if isinstance(reset_reason, str) and reset_reason in TURN_RESET_REASONS else None
+    if reset_reason is not None:
+      self.turn_counts["reset_" + reset_reason + "_samples"] += 1
+    times = {key: sample_time(turn.get(key), ns) for key in TURN_TIMES}
+    state = {"phase": phase, "episode_id": episode, "reset_reason": reset_reason,
+             **{key: times[key] for key in TURN_TIMES[3:]}}
+    if state != self.previous_turn:
+      # These are sampled metadata changes, not a reconstructed physical episode
+      # boundary. Segment starts/gaps deliberately reset previous_turn.
+      self._event("turn_return_observation", ns, **state, direction=direction,
+                  speed_mps=number(get(record, "car.speed_mps")),
+                  remaining_angle_deg=number(turn.get("remaining_angle_deg")),
+                  centerward_angle_rate_dps=number(turn.get("centerward_angle_rate_dps")),
+                  start_mono_ns=times["start_mono_ns"], peak_mono_ns=times["peak_mono_ns"],
+                  return_start_mono_ns=times["return_start_mono_ns"],
+                  driver_pressed=get(record, "car.steering_pressed") if type(get(record, "car.steering_pressed")) is bool else None,
+                  lat_active=get(record, "request.lat_active") if type(get(record, "request.lat_active")) is bool else None,
+                  interpretation="sampled_turn_phase_not_fault_or_causal_verdict")
+    self.previous_turn = state
+    capture = record.get("unwind_capture")
+    if not isinstance(capture, dict):
+      self.turn_counts["capture_metadata_missing_samples"] += 1
+      return
+    capture_episode = turn_id(capture.get("episode_id"))
+    reasons = capture.get("reasons")
+    seen = set()
+    for item in reasons[:len(TURN_CAPTURE_PRIORITIES)] if isinstance(reasons, list) else ():
+      if not isinstance(item, dict):
+        continue
+      reason, priority, timestamp = item.get("reason"), item.get("priority"), sample_time(item.get("mono_ns"), ns)
+      if (capture_episode is None or not isinstance(reason, str) or reason not in TURN_CAPTURE_PRIORITIES
+          or reason in seen or type(priority) is not int or priority != TURN_CAPTURE_PRIORITIES[reason] or timestamp is None):
+        continue
+      seen.add(reason)
+      self.turn_counts["capture_hint_" + reason] += 1
+      self._event("turn_return_capture_hint", timestamp, episode_id=capture_episode, reason=reason,
+                  retention_priority=priority, interpretation="retention_hint_not_fault_or_causal_verdict")
+
+  def _stage_observations(self, record):
+    ns = sample_time(record.get("mono_ns"))
+    if record.get("kind") != "sample" or ns is None:
+      self.counts["invalid_lateral_stage_records"] += 1
+      return
+    self.counts["lateral_stage_samples"] += 1
+    if self.source_start_ns is None:
+      self.source_start_ns = ns
+    if self.stage_last_ns is not None and ns < self.stage_last_ns:
+      self.stage_counts["backward_timestamps"] += 1
+    self.stage_last_ns = ns
+    target = record.get("target_source")
+    target = target if isinstance(target, str) and target in ("inactive", "lane", "lane_empty", "model") else "unknown"
+    self.stage_counts["target_source_" + target + "_samples"] += 1
+    for field in STAGE_FLAGS:
+      value = record.get(field)
+      self.stage_counts[field + ("_true_samples" if value is True else "_false_samples" if value is False else "_missing_samples")] += 1
+    for field, stats in self.stage_metrics.items():
+      stats.add(get(record, field))
+    for name, left, right in (
+      ("smoothing_delta_curvature", "smoothed_curvature", "before_smoothing_curvature"),
+      ("clip_delta_curvature", "clipped_curvature", "smoothed_curvature"),
+      ("published_target_delta_curvature", "clipped_curvature", "previous_curvature"),
+      ("latest_output_minus_request_torque", "latest_output.torque", "request.torque"),
+    ):
+      a, b = number(get(record, left)), number(get(record, right))
+      self.stage_deltas[name].add(None if a is None or b is None else a - b)
+    for service, quality in self.stage_quality.items():
+      status = get(record, "sources." + service)
+      if not isinstance(status, dict):
+        quality["missing"] += 1
+        continue
+      quality["present"] += 1
+      for flag in ("valid", "alive"):
+        value = status.get(flag)
+        quality[flag if value is True else "not_" + flag if value is False else flag + "_unknown"] += 1
+      source_ns = sample_time(status.get("mono_ns"))
+      age_ms = (ns - source_ns) / 1e6 if source_ns is not None and source_ns > 0 else None
+      quality["age_unknown" if age_ms is None else "stale_or_future" if age_ms < 0 or age_ms > self.stale_ms else "within_age_limit"] += 1
+    config = {"branch": self.current_metadata["branch"], "commit": self.current_metadata["commit"],
+              "target_source": target, **{key: number(get(record, key)) for key in STAGE_SETTINGS},
+              **{key: get(record, "torque_mode." + key) if type(get(record, "torque_mode." + key)) is bool else None
+                 for key in ("use_steering_angle", "nnff", "nnff_lite")}}
+    if config != self.current_stage_configuration:
+      if len(self.stage_configuration) < 8:
+        self.stage_configuration.append({"source": self.source, "mono_ns": ns,
+                                         "source_seconds": (ns - self.source_start_ns) / 1e9, **config})
+      else:
+        self.stage_counts["configuration_snapshots_omitted"] += 1
+      self.current_stage_configuration = config
 
   def _resume_and_engage(self, record, previous, ns):
     requested = get(record, "request.resume")
@@ -443,7 +620,10 @@ class DiagnosticsReport:
                             "All onset times are sampled observations, not exact ECU reaction times or causality.",
                             "Statistics include recorded values; consult per-service missing/invalid/stale coverage.",
                             "Raw fields are cached decoded signals, not independently observed physical CAN outcomes.",
-                            "Steering angle error is descriptive, not tracking validation on torque-controlled cars."],
+                            "Steering angle error is descriptive, not tracking validation on torque-controlled cars.",
+                            "Turn phases, slow-return and intervention hints are collection candidates, not confirmed faults or causes.",
+                            "Control-stage carOutput is the latest received output, not a synchronized ECU acknowledgement.",
+                            "The control-stage curvature_limited flag excludes jerk limiting; consult the numerical clip delta too."],
             "criteria": {"closing_lead": "radar status true, 0 < distance <= 80 m and relative speed < -0.5 m/s",
                          "deceleration_onset": "adjacent recorded acceleration crosses from >= -0.1 to < -0.1 m/s^2",
                          "curve_samples": "shadow.curve_active; fallback: enabled, speed > 3 m/s, |request curvature| > 0.002 /m",
@@ -454,11 +634,16 @@ class DiagnosticsReport:
             "metadata_truncated": self.metadata_truncated,
             "configuration": self.configuration,
             "time": {"first_sample_mono_ns": self.first_ns, "last_sample_mono_ns": self.last_ns,
-                     "basis": "first diagnostic sample within each input, never initData"},
+                     "basis": "first vehicle or lateral-stage diagnostic sample within each input, never initData"},
             "source_quality": {k: dict(v) for k, v in self.quality.items()},
             "raw_source_quality": {k: dict(v) for k, v in self.raw_quality.items()},
             "topic_candidate_counts": dict(self.topic_counts),
             "capture_hints_not_fault_counts": dict(self.capture_hints),
+            "turn_return": {"counts": dict(self.turn_counts), "descriptive_metrics": {k: v.report() for k, v in self.turn_metrics.items()}},
+            "lateral_stages": {"counts": dict(self.stage_counts), "configuration": self.stage_configuration,
+                               "source_quality": {k: dict(v) for k, v in self.stage_quality.items()},
+                               "descriptive_metrics": {k: v.report() for k, v in self.stage_metrics.items()},
+                               "stage_deltas_not_causal_effects": {k: v.report() for k, v in self.stage_deltas.items()}},
             "captured_transition_counts": dict(self.transitions),
             "resume": {**dict(self.resume), "scc_states": {k: dict(v) for k, v in self.state_counts.items()},
                        "observed_interlocks_not_causal_verdict": dict(self.interlock_observations)},
@@ -504,7 +689,7 @@ def main(argv=None):
   except (OSError, ValueError) as error:
     parser.error(str(error))
   print(json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2))
-  return 0 if report["counts"].get("samples", 0) else 2
+  return 0 if report["counts"].get("samples", 0) or report["counts"].get("lateral_stage_samples", 0) else 2
 
 
 if __name__ == "__main__":

@@ -127,6 +127,16 @@ class Controls:
       self.LaC = LatControlTorque(self.CP, self.CI)
     self.carrot_controls = CarrotControls(self.CP)
 
+    # Optional local-only observer. Even an import/init failure must not affect
+    # control startup, and comparison branches never instantiate it.
+    self.dk_lateral_diagnostics = None
+    try:
+      if self.dk_ka4_stock_scc_resume_gate and self.CP.lateralTuning.which() == 'torque':
+        from openpilot.selfdrive.controls.lib.dk_lateral_diagnostics import DkLateralDiagnostics
+        self.dk_lateral_diagnostics = DkLateralDiagnostics(cloudlog.debug)
+    except Exception:
+      pass
+
   def update(self):
     self.sm.update(15)
     if self.sm.updated["liveCalibration"]:
@@ -242,6 +252,7 @@ class Controls:
     else:
       new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, self.desired_curvature, 0.1)
 
+    dk_previous_desired_curvature = self.desired_curvature  # observation only
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = float(self.desired_curvature)
@@ -292,6 +303,17 @@ class Controls:
       if not math.isfinite(attr):
         cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
         setattr(actuators, p, 0.0)
+
+    try:
+      if self.dk_lateral_diagnostics is not None:
+        self.dk_lateral_diagnostics.capture(
+          self.sm.frame, dk_previous_desired_curvature,
+          curvature if CC.latActive and self.lanefull_mode_enabled and len(lat_plan.curvatures) > 0 else None,
+          new_desired_curvature, curvature_limited, self.steer_limited_by_safety,
+          lat_plan_fresh, lat_smooth_seconds, steer_actuator_delay,
+        )
+    except Exception:
+      pass
 
     return CC, lac_log
 
@@ -477,6 +499,14 @@ class Controls:
     cc_send.valid = CS.canValid
     cc_send.carControl = CC
     self.pm.send('carControl', cc_send)
+
+    # Runs after both existing publications; diagnostic state is never an input
+    # to the control calculations. The helper bounds logging to at most 10 Hz.
+    try:
+      if self.dk_lateral_diagnostics is not None:
+        self.dk_lateral_diagnostics.emit(self, CC)
+    except Exception:
+      pass
 
   def run(self):
     rk = Ratekeeper(100, print_delay_threshold=None)

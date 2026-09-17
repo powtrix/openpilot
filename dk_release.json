@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "deployed_at": "2026-09-17 17:42 KST",
-  "diagnostics_version": 2,
-  "label": "SCC 제동"
+  "deployed_at": "2026-09-17 19:06 KST",
+  "diagnostics_version": 3,
+  "label": "브레이크 및 복원로그"
 }

@@ -47,7 +47,10 @@ jobs:
           from openpilot.common.prefix import OpenpilotPrefix
           with OpenpilotPrefix():
             import openpilot.selfdrive.ui.ui
-            print("DK UI startup imports passed")
+            import openpilot.selfdrive.controls.controlsd
+            import openpilot.selfdrive.carrot.dk_vehicle_diagnostics
+            import openpilot.selfdrive.carrot.dk_diagnosticsd
+            print("DK UI and passive diagnostics startup imports passed")
           PY
       - name: Build DK CAN replay test library
         if: github.ref == 'refs/heads/dkcarrot-wip' || github.base_ref == 'dkcarrot-wip'
@@ -74,5 +77,12 @@ jobs:
             openpilot/selfdrive/ui/tests/test_cluster_hud_camera_suppression.py \
             openpilot/selfdrive/ui/tests/test_text_draw_offsets.py \
             openpilot/selfdrive/ui/tests/test_dk_ui_startup_workflow.py \
+            openpilot/selfdrive/carrot/tests/test_dk_vehicle_diagnostics.py \
+            openpilot/selfdrive/carrot/tests/test_dk_turn_return.py \
+            openpilot/selfdrive/carrot/tests/test_dk_diagnosticsd.py \
+            openpilot/selfdrive/carrot/tests/test_dk_log_transfer.py \
+            openpilot/selfdrive/controls/tests/test_dk_lateral_diagnostics.py \
+            openpilot/selfdrive/controls/tests/test_ka4_lateral_sign.py \
+            tools/car_porting/test_dk_diagnostics_report.py \
             tools/dk/tests/test_check_ui_annotations.py
           python tools/dk/check_ui_annotations.py --commit HEAD

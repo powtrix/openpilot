@@ -9,8 +9,9 @@ import re
 from itertools import islice
 from numbers import Integral, Real
 
-from opendbc.car.hyundai.values import CAR
+from opendbc.car.hyundai.values import CAR, HyundaiFlags
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.carrot.dk_turn_return import TurnReturnObserver, valid_time
 
 
 SAMPLE_NS = 100_000_000
@@ -19,7 +20,7 @@ TOPIC_COOLDOWN_NS = 30_000_000_000
 BRAKING_REASON_COOLDOWN_NS = 20_000_000_000
 RECENT_CONTROL_NS = 5_000_000_000
 SESSION_NS = 60_000_000_000
-DIAGNOSTICS_VERSION = 'dk-vehicle-diag-v2'
+DIAGNOSTICS_VERSION = 'dk-vehicle-diag-v3'
 MAX_TRANSITIONS = 32
 PARAM_KEYS = (
   'PathOffset', 'AdjustLaneOffset', 'UseLaneLineSpeed', 'SteerActuatorDelay', 'SteerRatioRate',
@@ -28,6 +29,8 @@ PARAM_KEYS = (
   'TrafficLightDetectMode', 'ExperimentalMode', 'AlphaLongitudinalEnabled', 'CanfdHDA2',
   'HyundaiCameraSCC', 'EnableRadarTracks', 'CruiseButtonTest1', 'CruiseButtonTest2', 'CruiseButtonTest3',
   'AutoCruiseControl', 'SpeedFromPCM', 'Ka4StockSccStandstillRearm',
+  'LatSmoothSec', 'LateralTorqueCustom', 'LateralTorqueAccelFactor', 'LateralTorqueFriction',
+  'LateralTorqueKpV', 'LateralTorqueKiV', 'LateralTorqueKf', 'LateralTorqueKd',
 )
 CONTROLLER_FIELDS = (
   'frame', 'apply_angle_last', 'apply_torque_last', 'angle_limit_counter', 'lkas_max_torque',
@@ -148,6 +151,22 @@ def actuators(obj):
           'curvature': field(obj, 'curvature'), 'accel_mps2': field(obj, 'accel')}
 
 
+def service_is_fresh(sm, name, now_ns, max_age_ns=250_000_000):
+  timestamp = getattr(sm, 'logMonoTime', {}).get(name, 0)
+  return bool(valid_time(timestamp) and valid_time(now_ns) and 0 <= now_ns - timestamp <= max_age_ns and
+              getattr(sm, 'valid', {}).get(name, False) and getattr(sm, 'alive', {}).get(name, False))
+
+
+def steering_angle_source(state, cp_metadata):
+  """Match Hyundai CAN-FD CarState's selected angle, never an arbitrary bus."""
+  flags = cp_metadata.get('flags')
+  angle_control = isinstance(flags, Integral) and bool(flags & HyundaiFlags.ANGLE_CONTROL)
+  message, name = ('MDPS', 'STEERING_ANGLE_2') if angle_control else ('STEERING_SENSORS', 'STEERING_ANGLE')
+  timestamp = getattr(getattr(state, 'cp', None), 'ts_nanos', {}).get(message, {}).get(name)
+  return {'parser': 'cp', 'message': message, 'signal': name,
+          'mono_ns': int(timestamp) if valid_time(timestamp) else None}
+
+
 def controller_snapshot(controller):
   return {**fields(controller, CONTROLLER_FIELDS),
           'limits': fields(getattr(controller, 'params', None), CONTROLLER_LIMITS)}
@@ -213,6 +232,9 @@ class DkVehicleDiagnostics:
     self.motion_window_start_ns = None
     self.motion_window_min_accel = None
     self.motion_window_min_accel_ns = None
+    self.turn_return_observer = TurnReturnObserver()
+    self.pending_unwind_reasons = {}
+    self.unwind_episode_id = None
 
   def _candidate(self, topic, now_ns):
     last = self.last_topic_ns.get(topic)
@@ -360,6 +382,7 @@ class DkVehicleDiagnostics:
         self.last_topic_ns[topic] = now_ns
       self.pending_topics.clear()
       self.pending_braking_reasons.clear()
+      self.pending_unwind_reasons.clear()
       self.motion_window_start_ns = None
       self.motion_window_min_accel = self.motion_window_min_accel_ns = None
       self.transitions.clear()
@@ -417,7 +440,7 @@ class DkVehicleDiagnostics:
     if lateral_state is not None:
       union_name = lateral_state.which()
       lateral['controller_type'] = str(union_name)
-      lateral['controller'] = fields(getattr(lateral_state, union_name), ('active', 'saturated', 'output', 'p', 'i', 'f',
+      lateral['controller'] = fields(getattr(lateral_state, union_name), ('active', 'saturated', 'output', 'p', 'i', 'd', 'f',
         'steeringAngleDeg', 'steeringAngleDesiredDeg', 'angleError', 'error', 'actualLateralAccel', 'desiredLateralAccel'))
     base_resume = bool(request['enabled'] and car['cruise_standstill'] and speeds)
     shadow = {'interpretation': 'hypothesis_not_vehicle_response',
@@ -487,6 +510,39 @@ class DkVehicleDiagnostics:
                 0 < distance < 50 and relative < -0.8, now_ns, 300_000_000, 'braking')
     self.previous_motion = (now_ns, car['accel_mps2'], request['angle_deg'], output_values['angle_deg'])
     braking_reasons = list(self.pending_braking_reasons.values())
+    angle_source = steering_angle_source(CI.CS, self.metadata.get('cp', {}))
+    try:
+      turn_return, new_unwind_reasons = self.turn_return_observer.update(
+        now_ns, angle=car['steering_angle_deg'], angle_mono_ns=angle_source['mono_ns'], speed=car['speed_mps'],
+        can_valid=car['can_valid'] is True, active=lateral_active, pressed=car['steering_pressed'] is True,
+        driver_torque=car['driver_torque'], request_fresh=service_is_fresh(sm, 'carControl', now_ns),
+        torque_mode=torque_mode, request_torque=request['torque'], output_torque=output_values['torque'],
+        request_angle=request['angle_deg'],
+        desired_curvature=lateral['desired_curvature'] if service_is_fresh(sm, 'controlsState', now_ns) else None,
+        transitions=self.transitions)
+    except Exception:
+      # Optional retention analysis must not suppress the existing diagnostic
+      # sample, let alone escape finish() into the already-submitted controls.
+      self.errors += 1
+      self.turn_return_observer = TurnReturnObserver()
+      turn_return = {'phase': 'reset', 'episode_id': None, 'signed_angle_rate_dps': None,
+                     'reset_reason': 'turn_observer_error'}
+      new_unwind_reasons = []
+    turn_return['angle_source'] = angle_source
+    car['steering_signed_rate_dps'] = turn_return['signed_angle_rate_dps']
+    car['steering_rate_dps_semantics'] = 'raw_CAN_rate_may_be_unsigned_use_steering_signed_rate_dps'
+    if turn_return['phase'] in ('reset', 'inactive'):
+      self.pending_unwind_reasons.clear()
+      self.unwind_episode_id = None
+    if new_unwind_reasons:
+      if self.unwind_episode_id != turn_return['episode_id']:
+        self.pending_unwind_reasons.clear()
+      self.unwind_episode_id = turn_return['episode_id']
+      for reason in new_unwind_reasons:
+        self.pending_unwind_reasons[reason['reason']] = reason
+      # A baseline turn or old angle-only topic must not mask an intervention.
+      self.pending_topics.add('unwind')
+    unwind_reasons = list(self.pending_unwind_reasons.values())
     perception = {'interpretation': 'model_future_lead_hypotheses_not_independent_objects',
                   'model_leads': [{**fields(hypothesis, ('prob', 'probTime')),
                                    **{name: numbers(getattr(hypothesis, name, None), 6) for name in ('x', 'y', 'v', 'a')}}
@@ -505,6 +561,9 @@ class DkVehicleDiagnostics:
                                     'window_min_accel_mps2': self.motion_window_min_accel,
                                     'window_min_accel_mono_ns': self.motion_window_min_accel_ns},
             'braking_capture': {'priority': max((r['priority'] for r in braking_reasons), default=0), 'reasons': braking_reasons},
+            'turn_return': turn_return,
+            'unwind_capture': {'priority': max((r['priority'] for r in unwind_reasons), default=0),
+                               'episode_id': self.unwind_episode_id if unwind_reasons else None, 'reasons': unwind_reasons},
             'submitted_can': {'interpretation': 'host_submission_not_panda_or_ecu_acceptance',
               'count': sum(self.tx_counts.values()), 'addresses': [
                 {'address': addr, 'bus': bus, 'count': count} for (addr, bus), count in sorted(self.tx_counts.items())],

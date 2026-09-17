@@ -21,6 +21,9 @@ def test_dk_pushes_and_pull_requests_run_real_startup_import_after_build():
   assert step["env"]["BIG"] == "1"
   assert step["env"]["OPENPILOT_PREFIX"].startswith("dk-ui-")
   assert "import openpilot.selfdrive.ui.ui" in step["run"]
+  assert "import openpilot.selfdrive.controls.controlsd" in step["run"]
+  assert "import openpilot.selfdrive.carrot.dk_vehicle_diagnostics" in step["run"]
+  assert "import openpilot.selfdrive.carrot.dk_diagnosticsd" in step["run"]
   # An environment variable alone does not create the msgq namespace. The
   # real UI subscribes during import, before any vehicle publisher is started.
   assert "from openpilot.common.prefix import OpenpilotPrefix" in step["run"]
@@ -40,6 +43,13 @@ def test_dk_ci_does_not_skip_real_pyray_or_exact_commit_annotation_checks():
   assert "test_check_ui_annotations.py" in step["run"]
   assert "test_stock_scc_braking.py" in step["run"]
   assert "test_dk_stock_scc_display.py" in step["run"]
+  assert "test_dk_vehicle_diagnostics.py" in step["run"]
+  assert "test_dk_turn_return.py" in step["run"]
+  assert "test_dk_diagnosticsd.py" in step["run"]
+  assert "test_dk_log_transfer.py" in step["run"]
+  assert "test_dk_lateral_diagnostics.py" in step["run"]
+  assert "test_ka4_lateral_sign.py" in step["run"]
+  assert "test_dk_diagnostics_report.py" in step["run"]
   assert "continue-on-error" not in step
 
 
