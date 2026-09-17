@@ -263,13 +263,16 @@ def test_actual_carstate_does_not_call_display_helper_outside_ka4_stock_scope(mo
   CP.openpilotLongitudinalControl = op_long
   carstate = CarState(CP)
   parsers = carstate.get_can_parsers(CP)
+  unexpected_calls = []
 
   def unexpected_call(*_args):
+    unexpected_calls.append(_args)
     raise AssertionError("display telemetry must not be evaluated on another vehicle or OP longitudinal")
 
   monkeypatch.setattr(carstate_module, "get_stock_scc_display", unexpected_call)
   ret = carstate.update_canfd(parsers)
   assert not ret.dkStockScc.valid and not ret.dkStockScc.active
+  assert not unexpected_calls
 
 
 def test_actual_carstate_all_existing_fields_unchanged_by_telemetry(monkeypatch):
@@ -288,3 +291,31 @@ def test_actual_carstate_all_existing_fields_unchanged_by_telemetry(monkeypatch)
   assert with_telemetry.pop("dkStockScc")["valid"]
   without_telemetry.pop("dkStockScc")
   assert with_telemetry == without_telemetry
+
+
+def test_optional_display_exception_leaves_vehicle_state_unchanged_and_display_invalid(monkeypatch):
+  Params().put("FingerPrints", str(dict(gen_empty_fingerprint())))
+  CP = CarInterface.get_params(CAR.KIA_CARNIVAL_4TH_GEN, gen_empty_fingerprint(), [], False, False, False)
+  CP.openpilotLongitudinalControl = False
+  normal_state = CarState(CP)
+  failure_state = CarState(CP)
+  parsers = normal_state.get_can_parsers(CP)
+  selected = parsers[Bus.cam] if CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else parsers[Bus.pt]
+  _ = selected.vl[SCC_CONTROL_NAME]
+  selected.update([START_NS, [make_frame(bus=selected.bus)]])
+  normal = normal_state.update_canfd(parsers).to_dict()
+  failed_calls = []
+
+  def failing_display(*args):
+    failed_calls.append(args)
+    raise RuntimeError("unexpected optional display failure")
+
+  monkeypatch.setattr(carstate_module, "get_stock_scc_display", failing_display)
+  failed = failure_state.update_canfd(parsers)
+  assert len(failed_calls) == 1
+  assert not failed.dkStockScc.valid and not failed.dkStockScc.active
+  assert failed.dkStockScc.sourceMonoTime == 0
+  failed_dict = failed.to_dict()
+  normal.pop("dkStockScc")
+  failed_dict.pop("dkStockScc", None)
+  assert normal == failed_dict

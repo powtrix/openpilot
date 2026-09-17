@@ -1037,7 +1037,12 @@ class CarState(CarStateBase):
       ret.cruiseState.standstill = cp_cruise_info.vl["SCC_CONTROL"]["InfoDisplay"] >= 4
       ret.cruiseState.speed = cp_cruise_info.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
       if self.CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN:
-        ret.dkStockScc = get_stock_scc_display(self.CP, cp_cruise_info)
+        try:
+          ret.dkStockScc = get_stock_scc_display(self.CP, cp_cruise_info)
+        except Exception:
+          # Optional display telemetry must never interrupt vehicle-state updates.
+          # Leave its default invalid value; do not log at the control-loop rate.
+          pass
 
     speed_limit_cam = False
     corner = False
