@@ -49,6 +49,10 @@ jobs:
             import openpilot.selfdrive.ui.ui
             print("DK UI startup imports passed")
           PY
+      - name: Build DK CAN replay test library
+        if: github.ref == 'refs/heads/dkcarrot-wip' || github.base_ref == 'dkcarrot-wip'
+        timeout-minutes: 2
+        run: scons -C tools/dk -f safety_tests.scons
       - name: Verify DK startup and display regressions
         if: github.ref == 'refs/heads/dkcarrot-wip' || github.base_ref == 'dkcarrot-wip'
         timeout-minutes: 5

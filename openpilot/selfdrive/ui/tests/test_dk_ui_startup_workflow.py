@@ -41,3 +41,17 @@ def test_dk_ci_does_not_skip_real_pyray_or_exact_commit_annotation_checks():
   assert "test_stock_scc_braking.py" in step["run"]
   assert "test_dk_stock_scc_display.py" in step["run"]
   assert "continue-on-error" not in step
+
+
+def test_can_replay_dependency_is_built_before_test_collection():
+  root = Path(__file__).resolve().parents[4]
+  workflow = yaml.load((root / ".github/workflows/tests.yaml").read_text(), Loader=yaml.BaseLoader)
+  steps = workflow["jobs"]["build_release"]["steps"]
+  build = next(i for i, step in enumerate(steps) if step.get("name") == "Build DK CAN replay test library")
+  tests = next(i for i, step in enumerate(steps) if step.get("name") == "Verify DK startup and display regressions")
+  assert build < tests
+  assert steps[build]["run"] == "scons -C tools/dk -f safety_tests.scons"
+  assert "continue-on-error" not in steps[build]
+  assert "test_stock_scc_can_replay.py" in steps[tests]["run"]
+  entry = (root / "tools/dk/safety_tests.scons").read_text()
+  assert "opendbc/safety/tests/libsafety/SConscript" in entry

@@ -1,0 +1,7 @@
+# Standalone entry point for the existing host-only CAN safety test library.
+# The release SConstruct builds the vehicle binaries, not this test dependency.
+for option in ("mutation", "ubsan", "coverage"):
+  AddOption("--" + option, action="store_true", default=False)
+
+SConscript("../../opendbc_repo/opendbc/safety/tests/libsafety/SConscript")
+Default("../../opendbc_repo/opendbc/safety/tests/libsafety/libsafety.so")
