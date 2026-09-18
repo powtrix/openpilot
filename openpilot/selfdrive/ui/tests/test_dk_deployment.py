@@ -37,7 +37,7 @@ def test_release_label_is_configurable_and_date_prefix_tracks_metadata(tmp_path,
 
 
 def test_installed_release_displays_braking_and_turn_return_log_label():
-  assert load_dk_deployment_text("dkcarrot-wip") == "0917 브레이크게이지/핸들복원로그"
+  assert load_dk_deployment_text("dkcarrot-wip") == "0918 브레이크게이지/핸들복원로그"
 
 
 @pytest.mark.parametrize("label", [

@@ -133,21 +133,28 @@ def test_real_cereal_contract_round_trip_and_missing_default():
 
 @pytest.mark.parametrize("fraction", [0.0025, 0.05, 0.5, 1.0])
 @pytest.mark.parametrize("x, y, width, height", [(0, 0, 2160, 1080), (300, 20, 1860, 1060), (90, 50, 700, 500)])
-def test_geometry_center_out_within_bottom_border(fraction, x, y, width, height):
+def test_geometry_center_out_twice_border_height_with_original_side_insets(fraction, x, y, width, height):
   left, top, fill, thick = braking_bar_geometry(x, y, width, height, 30, fraction)
   assert left + fill / 2 == pytest.approx(x + width / 2)
-  assert top == y + height - 30
-  assert thick == 30
+  assert top == y + height - 60
+  assert thick == 60
+  assert top >= y
+  assert top + thick == y + height
   assert fill == pytest.approx((width - 60) * fraction)
   assert left >= x + 30
   assert left + fill <= x + width - 30
 
 
-@pytest.mark.parametrize("index, value", [(0, float("nan")), (2, 60), (3, 29), (4, 0), (5, 0), (5, -1), (5, 1.01)])
+@pytest.mark.parametrize("index, value", [(0, float("nan")), (2, 60), (3, 59), (4, 0), (5, 0), (5, -1), (5, 1.01)])
 def test_invalid_geometry_hidden(index, value):
   args = [0, 0, 2160, 1080, 30, 0.5]
   args[index] = value
   assert braking_bar_geometry(*args) is None
+
+
+def test_geometry_minimum_height_and_nonstandard_border_size():
+  assert braking_bar_geometry(10, 20, 100, 20, 10, 1) == (20, 20, 80, 20)
+  assert braking_bar_geometry(10, 20, 100, 19, 10, 1) is None
 
 
 def _road_method(name):
@@ -186,8 +193,13 @@ def test_actual_border_draw_uses_real_pyray_rectangle_without_window(monkeypatch
   draw(view, rect)
   assert len(calls) == 1
   drawn, color = calls[0]
-  assert (drawn.x, drawn.y, drawn.width, drawn.height) == (780, 1050, 900, 30)
+  assert (drawn.x, drawn.y, drawn.width, drawn.height) == (780, 1020, 900, 60)
   assert (color.r, color.g, color.b, color.a) == (255, 0, 0, 255)
+  for alert_size in (1, 2, 3):
+    sm["selfdriveState"].alertSize = alert_size
+    draw(view, rect)
+    assert len(calls) == 1  # the taller bar must not paint over any warning
+  sm["selfdriveState"].alertSize = 0
   view._dk_scc_braking_enabled = False
   draw(view, rect)
   assert len(calls) == 1

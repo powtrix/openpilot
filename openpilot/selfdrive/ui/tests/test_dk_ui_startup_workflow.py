@@ -42,6 +42,8 @@ def test_dk_ci_does_not_skip_real_pyray_or_exact_commit_annotation_checks():
   assert "tools/dk/check_ui_annotations.py --commit HEAD" in step["run"]
   assert "test_check_ui_annotations.py" in step["run"]
   assert "test_stock_scc_braking.py" in step["run"]
+  assert "openpilot/selfdrive/ui/tests/test_dk_turn_signal_lamps.py" in step["run"]
+  assert "opendbc/car/hyundai/tests/test_dk_turn_signal_lamps.py" in step["run"]
   assert "test_dk_stock_scc_display.py" in step["run"]
   assert "test_dk_vehicle_diagnostics.py" in step["run"]
   assert "test_dk_turn_return.py" in step["run"]

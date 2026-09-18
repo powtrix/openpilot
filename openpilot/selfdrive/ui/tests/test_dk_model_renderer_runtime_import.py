@@ -51,6 +51,10 @@ cs = car.CarState.new_message(canValid=True)
 cs.dkStockScc.valid = cs.dkStockScc.active = True
 cs.dkStockScc.accelRequest = -2
 cs.dkStockScc.sourceMonoTime = 10_000_000_000
+cs.leftBlinker = cs.rightBlinker = True
+cs.dkTurnSignalLamps.supported = cs.dkTurnSignalLamps.valid = True
+cs.dkTurnSignalLamps.right = True
+cs.dkTurnSignalLamps.sourceMonoTime = 10_000_000_000
 sm = SM(carState=cs.as_reader(), selfdriveState=log.SelfdriveState.new_message().as_reader())
 sm.alive = defaultdict(bool, dict.fromkeys(sm, True))
 sm.valid = dict.fromkeys(sm, True)
@@ -66,15 +70,18 @@ road.time.monotonic = lambda: 10.05
 calls = []
 rl.draw_rectangle = lambda *args: calls.append(('base', args))
 rl.draw_rectangle_rec = lambda r, c: calls.append(('fill', (r.x, r.y, r.width, r.height, c.r, c.g, c.b)))
-rl.draw_rectangle_rounded = lambda *args: None
+lamp_colors = []
+rl.draw_rectangle_rounded = lambda r, rounding, segments, color: lamp_colors.append(color)
 rl.draw_rectangle_rounded_lines_ex = lambda *args: None
 road.draw_text_ui_style = lambda *args, **kwargs: calls.append(('text', args))
 view = object.__new__(road.AugmentedRoadView)
 view._dk_scc_braking_enabled = True
+view._dk_turn_signal_lamps_enabled = True
 view._border_params = types.SimpleNamespace(refresh=lambda now: BorderParamSnapshot())
 view._draw_border_carrot(rl.Rectangle(300, 20, 1860, 1060))
 fill = next(i for i, (kind, _) in enumerate(calls) if kind == 'fill')
-assert calls[fill][1] == (780, 1050, 900, 30, 255, 0, 0)
+assert calls[fill][1] == (780, 1020, 900, 60, 255, 0, 0)
+assert lamp_colors == [rl.BLACK, rl.ORANGE]
 assert calls[fill - 1][0] == 'base'
 assert all(kind == 'text' for kind, _ in calls[fill + 1:])
 assert len(calls[fill + 1:]) == 6

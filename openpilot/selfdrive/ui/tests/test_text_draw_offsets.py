@@ -1,10 +1,11 @@
+import ast
 import importlib.util
 import math
 import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -291,3 +292,67 @@ def test_empty_text_skips_both_draw_paths(text_draw_module, monkeypatch):
 
   assert encode_calls == []
   assert wrapper_calls == []
+
+
+@pytest.mark.parametrize("align, expected", [
+  ("center_bottom", (60.0, 166.0)), ("left_bottom", (100.0, 166.0)),
+  ("center_top", (60.0, 206.0)), ("left_top", (100.0, 206.0)),
+  ("right_top", (20.0, 206.0)), ("left_center", (100.0, 186.0)),
+  ("center", (60.0, 186.0)), ("right_center", (20.0, 186.0)),
+  ("unknown", (100.0, 206.0)),
+])
+def test_text_alignment_preserves_anchors(text_draw_module, align, expected):
+  module, _ = text_draw_module
+  x, y, size = module.get_text_draw_pos("font", "AB", 100.0, 200.0, 40, align)
+  assert (x, y) == expected
+  assert (size.x, size.y) == (80, 40)
+
+
+@pytest.mark.parametrize("outer_rect", [(0, 0, 2160, 1080), (300, 20, 1860, 1060)])
+@pytest.mark.parametrize("label_field", ["sdi_descr", "road_name"])
+def test_actual_navigation_bottom_labels_clear_thick_scc_gauge(text_draw_module, monkeypatch, outer_rect, label_field):
+  from openpilot.selfdrive.ui.onroad.stock_scc_braking import braking_bar_geometry
+
+  module, calls = text_draw_module
+  monkeypatch.setattr(module, "measure_text_cached", lambda font, text, size: module.rl.Vector2(len(text) * size, size * 1.242))
+  module.rl.Rectangle = SimpleNamespace
+  module.rl.WHITE = module.rl.Color(255, 255, 255, 255)
+  module.rl.GREEN = module.rl.Color(0, 255, 0, 255)
+  path = Path(__file__).parents[1] / "onroad" / "hud_renderer.py"
+  tree = ast.parse(path.read_text())
+  cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "HudRenderer")
+  names = {"_draw_turn_info_hud", "_draw_text_left_bottom"}
+  methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
+  assert len(methods) == len(names)
+  namespace = dict(rl=module.rl, draw_text_ui_style=module.draw_text_ui_style, measure_text_cached=module.measure_text_cached)
+  exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
+
+  info = dict(n_go_pos_dist=1000, n_go_pos_time=100, tbt_main_text="안내", x_turn_info=0, x_dist_to_turn=0,
+              sdi_descr="", road_name="")
+  info[label_field] = "방지턱" if label_field == "sdi_descr" else "도로명"
+  boxes = []
+  hud = SimpleNamespace(_font_display="font", _font_bold="font", _get_turn_info_hud_data=lambda: info,
+                        _draw_round_box=lambda *args, **kwargs: boxes.append(args),
+                        _format_eta_text=lambda _: "12:30", _format_go_pos_distance_text=lambda _: "1.0km")
+  for name in names:
+    setattr(hud, name, MethodType(namespace[name], hud))
+  x, y, width, height = outer_rect
+  content = SimpleNamespace(x=x + 30, y=y + 30, width=width - 60, height=height - 60)
+  hud._draw_turn_info_hud(content)
+
+  _, gauge_top, _, gauge_height = braking_bar_geometry(*outer_rect, 30, 1.0)
+  assert gauge_height == 60
+  for _, _, position, size, _, _ in calls:
+    # Include every glyph outline/shadow draw, using the same scaled height
+    # as the real UI font measurements. All navigation text remains visible.
+    assert position.y + size * 1.242 < gauge_top
+  label_calls = [call for call in calls if call[1] == info[label_field]]
+  assert len(label_calls) == 10
+  main = label_calls[-1]
+  assert main[2].x == content.x + content.width - 600
+  assert main[2].y + main[3] * 1.242 == pytest.approx(content.y + content.height - 50 + 6)
+  if label_field == "sdi_descr":
+    box_x, box_y, box_width, box_height = boxes[-1][:4]
+    assert box_x < main[2].x < box_x + box_width
+    assert box_y <= main[2].y
+    assert main[2].y + main[3] * 1.242 <= box_y + box_height

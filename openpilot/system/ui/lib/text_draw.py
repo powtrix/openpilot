@@ -31,6 +31,9 @@ def get_text_draw_pos(font, text, x, y, font_size, align="center_bottom", y_offs
   if align == "center_bottom":
     draw_x = x - text_size.x * 0.5
     draw_y = (y + y_offset) - text_size.y
+  elif align == "left_bottom":
+    draw_x = x
+    draw_y = (y + y_offset) - text_size.y
   elif align == "center_top":
     draw_x = x - text_size.x * 0.5
     draw_y = y + y_offset
@@ -101,4 +104,3 @@ def draw_text_ui_style(text: str,
   position.x = float(draw_x)
   position.y = float(draw_y)
   draw_text_ex(font, draw_text, position, draw_size, 0, color)
-

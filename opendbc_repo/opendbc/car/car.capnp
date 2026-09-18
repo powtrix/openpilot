@@ -275,6 +275,15 @@ struct CarState {
   ka4StockSccKeepaliveQualified @94 :Bool; # controller has entered its physical-stop qualification epoch
   ka4StockSccKeepaliveStoppedSec @95 :Float32; # elapsed seconds in that qualification epoch
   dkStockScc @96 :DkStockScc; # passive stock-SCC command telemetry; never a control input
+  dkTurnSignalLamps @97 :DkTurnSignalLamps; # passive raw lamp phase for the UI; never replaces held control blinkers
+
+  struct DkTurnSignalLamps {
+    supported @0 :Bool; # KA4 CAN-FD supports raw lamp display, including while the source is unavailable
+    valid @1 :Bool; # current selected lamp frame is fresh and accepted by the existing parser
+    left @2 :Bool; # original LEFT_LAMP or LEFT_LAMP_ALT, without the control-state hold
+    right @3 :Bool; # original RIGHT_LAMP or RIGHT_LAMP_ALT, without the control-state hold
+    sourceMonoTime @4 :UInt64; # timestamp of the accepted CAN frame, not the publication time
+  }
 
   struct DkStockScc {
     accelRequest @0 :Float32; # received SCC_CONTROL.aReqValue, m/s^2; not measured deceleration or brake pressure

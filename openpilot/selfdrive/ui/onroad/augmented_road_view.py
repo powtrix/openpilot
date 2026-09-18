@@ -11,6 +11,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
+from openpilot.selfdrive.ui.onroad.dk_turn_signal_lamps import border_turn_signal_lamps
 from openpilot.selfdrive.ui.onroad.stock_scc_braking import braking_bar_geometry, dk_scc_display_enabled, stock_scc_braking_fraction
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
@@ -53,6 +54,7 @@ class AugmentedRoadView(CameraView):
       self._dk_scc_braking_enabled = dk_scc_display_enabled(ui_state.params.get("GitBranch"))
     except Exception:
       self._dk_scc_braking_enabled = False
+    self._dk_turn_signal_lamps_enabled = self._dk_scc_braking_enabled
 
     self.model_renderer = ModelRenderer()
     self._hud_renderer = HudRenderer()
@@ -314,6 +316,10 @@ class AugmentedRoadView(CameraView):
 
     left_blink = bool(car_state.leftBlinker)
     right_blink = bool(car_state.rightBlinker)
+    if self._dk_turn_signal_lamps_enabled:
+      left_blink, right_blink = border_turn_signal_lamps(
+        sm, started=ui_state.started, started_frame=ui_state.started_frame, now=time.monotonic(),
+      )
 
     # ---------- geometry ----------
     top_h = max(0.0, mid_y - gap_half - y)

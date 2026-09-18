@@ -69,6 +69,8 @@ jobs:
             openpilot/selfdrive/ui/tests/test_carrot_model_renderer_lane_visibility.py \
             openpilot/selfdrive/ui/tests/test_carrot_hud_renderer.py \
             openpilot/selfdrive/ui/tests/test_stock_scc_braking.py \
+            openpilot/selfdrive/ui/tests/test_dk_turn_signal_lamps.py \
+            opendbc/car/hyundai/tests/test_dk_turn_signal_lamps.py \
             opendbc/car/hyundai/tests/test_dk_stock_scc_display.py \
             opendbc/car/hyundai/tests/test_stock_scc_resume.py \
             opendbc/car/hyundai/tests/test_stock_scc_can_replay.py \

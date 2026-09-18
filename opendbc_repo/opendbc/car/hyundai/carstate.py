@@ -9,6 +9,7 @@ from opendbc.car import Bus, create_button_events, structs, DT_CTRL
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.dk_stock_scc_display import get_stock_scc_display
+from opendbc.car.hyundai.dk_turn_signal_lamps import get_turn_signal_lamps
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
                                        EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
                                        EV_MODE_STATUS_SIGNAL
@@ -981,6 +982,18 @@ class CarState(CarStateBase):
       left_blinker_lamp = blinkers_info["LEFT_LAMP"] or blinkers_info["LEFT_LAMP_ALT"]
       right_blinker_lamp = blinkers_info["RIGHT_LAMP"] or blinkers_info["RIGHT_LAMP_ALT"]
       ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, left_blinker_lamp, right_blinker_lamp)
+
+    if self.CP.carFingerprint == CAR.KIA_CARNIVAL_4TH_GEN and self.CP.flags & HyundaiFlags.CANFD:
+      # Only presentation gets the raw lamp phase. Keep the held control-state
+      # blinkers above unchanged, including through each physical OFF interval.
+      ret.dkTurnSignalLamps.supported = True
+      try:
+        lamp_message = "BLINKERS" if self.blinkers is not None else "BLINKERS_ALT" if self.blinkers_alt is not None else None
+        ret.dkTurnSignalLamps = get_turn_signal_lamps(self.CP, cp, lamp_message)
+      except Exception:
+        # Optional display failures must not interrupt carState/control. The
+        # supported-but-invalid default makes the UI hide stale illumination.
+        pass
 
     if self.CP.enableBsm:
       if self.cp_bsm is None:

@@ -5,6 +5,7 @@ import math
 
 SCC_MAX_AGE = 0.2  # seconds, including source CAN age, not just fresh carState
 SCC_FULL_SCALE = 4.0  # m/s² demand; display saturation only, NOT a control limit
+SCC_BAR_HEIGHT_SCALE = 2.0  # Extend above the ordinary border for visibility.
 
 
 def dk_scc_display_enabled(branch) -> bool:
@@ -51,10 +52,11 @@ def stock_scc_braking_fraction(sm, *, started: bool, started_frame: int, now: fl
 
 def braking_bar_geometry(x: float, y: float, width: float, height: float,
                          thickness: float, fraction: float) -> tuple[float, float, float, float] | None:
-  """Stay inside the bottom border, leaving the two vertical borders intact."""
+  """Grow upward at twice the border height; keep the original side insets."""
   if not all(_finite(value) for value in (x, y, width, height, thickness, fraction)):
     return None
-  if thickness <= 0 or width <= thickness * 2 or height < thickness or not 0 < fraction <= 1:
+  bar_height = thickness * SCC_BAR_HEIGHT_SCALE
+  if thickness <= 0 or width <= thickness * 2 or height < bar_height or not 0 < fraction <= 1:
     return None
   fill_width = (width - 2 * thickness) * fraction
-  return (x + (width - fill_width) / 2, y + height - thickness, fill_width, thickness)
+  return (x + (width - fill_width) / 2, y + height - bar_height, fill_width, bar_height)
