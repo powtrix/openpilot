@@ -99,18 +99,18 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 ## 전체 설정 지도
 
-현재 `carrot-wip`의 `carrot_settings.json`에는 **177개 파라미터**가 있으며, 모든 항목이 아래 메뉴에 연결되어 있습니다.
+현재 `dkcarrot-wip`의 `carrot_settings.json`에는 **178개 파라미터**가 있으며, 모든 항목이 아래 메뉴에 연결되어 있습니다.
 
 | 대분류 | 항목 수 | 중분류 |
 |---|---:|---|
-| 주행 제어 | 111 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
+| 주행 제어 | 112 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
 | 차량·하드웨어 | 14 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
 | 화면 표시 | 37 | 정보 표시, 경로 표시, 밝기·주행화면, 외부 HUD |
 | 시스템 | 15 | 녹화·전원, 카메라, 네트워크·지도, 사운드, 소프트웨어 |
 
 ## 주행 제어
 
-주행 제어는 차량 움직임에 영향을 줄 수 있는 111개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
+주행 제어는 차량 움직임에 영향을 줄 수 있는 112개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
 
 <a id="start-auto"></a>
 ### 시작·오토 — 9개
@@ -141,12 +141,13 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 버튼 설정은 순정 SCC 사용 여부와 차량 버튼 메시지에 따라 체감이 크게 다릅니다. 버튼이 예상과 다르게 작동하면 사용자 모드보다 `CruiseButtonMode=0`의 일반 동작에서 먼저 확인하세요.
 
 <a id="vehicle-steering"></a>
-### 차량 조향 — 36개
+### 차량 조향 — 37개
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
 | 중앙 보정 | `PathOffset`, `CameraYawTrimDeg` | 레인모드 경로의 좌우 위치와 카메라 YAW 미세 보정 |
 | 조향감 | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | 조향 시점, 평활화, 일시중지 각도와 조향비 |
+| 실험용 조향개선 | `DkExperimentalSteering` | 미래 경로를 이용한 코너 진입·자동 복원 목표 보정 시험 |
 | [차로 변경](lane-change.md)·자동 턴 | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | 차로 변경 진입 조건과 ATC 동작 |
 | 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | 레인모드 MPC 가중치와 차선 사용 조건 |
 | 고급 토크·토크 계수 | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | 커스텀 토크 제어 계수 |
@@ -157,6 +158,20 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 `SteerRatioRate`의 기본값 `100%`는 학습된 조향비를 그대로 적용합니다. `CustomSR=0`일 때 사용되며, 저장된 비율이 허용 범위(`30~200%`)를 벗어나면 안전하게 `100%`로 대체됩니다.
 
 `LateralTorqueCustom`과 `CustomSteer*` 계열은 차량의 기본 조향 튜닝과 안전 제한에 영향을 줄 수 있는 고급 항목입니다. 차종별 검증값과 복구 방법이 없으면 변경하지 마세요.
+
+#### 실험용 조향개선
+
+**설정 → 주행 제어 → 차량 조향 → 실험용 조향개선**에서 선택합니다. `DkExperimentalSteering`의 기본값은 **끄기**이며, `dkcarrot-wip`의 KA4 순정 SCC·토크 조향 구성에서만 적용됩니다.
+
+- **켜기:** 미래 경로를 이용해 코너 진입과 출구의 조향 목표를 보정합니다. 운전자가 먼저 핸들을 펴야 작동하는 기능이 아닙니다.
+- **적용 범위:** 모델 모드의 약 **14~60km/h**에서만 보정합니다. 레인모드·차선변경·유효하지 않은 입력에서는 기존 제어로 복귀하며, 남은 보정은 제한 내에서 회수합니다.
+- **끄기:** 기존 조향 계산을 사용합니다. 차량의 조향 안전 제한은 켜기·끄기 모두 유지됩니다.
+- **적용·복구:** 주차된 오프로드 상태에서 값을 저장합니다. 켜기와 끄기 모두 **다음 제어 시작 때 적용**되므로 확실한 적용을 위해 변경 후 **장치를 재시작**하세요. 저장 직후 실행 중인 제어가 전환되지는 않으며, 주행 중 변경 요청은 서버에서도 거부됩니다.
+- **백업:** 실험 기능을 다른 장치나 나중의 복원에서 실수로 켜지 않도록 파일·QR 백업에 포함하지 않고, 복원·프로필로 켜기도 허용하지 않습니다. 켜려면 이 항목에서 직접 선택합니다.
+
+> [!CAUTION]
+> 아직 실차 검증이 완료되지 않은 시험 기능이며 코너 추종이나 자동 복원이 보장되지 않습니다. 다른 차종·브랜치에서는 적용되지 않으며, 언제든 직접 조향할 준비가 필요합니다.
+> 목표 조향값이 보정되어도 출력 제한 때문에 실제 조향 명령은 같을 수 있습니다. 목표값 변화나 로그 재생만으로 실제 복원 효과가 확인된 것은 아닙니다.
 
 ### 속도·감속 — 22개
 
@@ -291,7 +306,7 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
-| 녹화·전원 | `RecordRoadCam`, `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | 도로 카메라 저장, 외부 자동 로그·진단 전체 동의, Carrot 커뮤니티 데이터 공유, KA4 검증 로그 자동 전송과 시동 OFF 후 자동 전원 종료 시간 |
+| 녹화·전원 | `RecordRoadCam`, `CarrotValidationAutoUpload`, `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `MaxTimeOffroadMin` | 도로 카메라 저장, DK 개인 NAS KA4 검증 로그, 그 밖의 로그·진단 외부 전송, Carrot 커뮤니티 데이터 공유와 시동 OFF 후 자동 전원 종료 시간 |
 | YouTube 라이브 | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | 카메라 영상 송출, 품질과 타임스탬프 |
 | 카메라 | `UseWideCamera` | 광각 전방 카메라 고장 시의 입력 대체 |
 | 네트워크·지도 | `HotspotOnBoot`, `MapboxStyle` | 부팅 시 핫스팟과 지도 배경 스타일 |
@@ -299,9 +314,9 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 | 소프트웨어 | `SoftwareMenu` | 소프트웨어 업데이트 메뉴 활성화 |
 
 - `RecordRoadCam`: `0` 녹화 안 함, `1` 일반 카메라, `2` 일반+광각 카메라입니다. 저장 공간 사용량을 확인하세요.
-- `DkThirdPartyDataSharing`: 외부 제3자 서비스의 자동 로그·진단 전송을 허용하는 상위 동의이며 기본값은 꺼짐입니다. 동의 활성화는 테더링을 제공하는 휴대폰에서 직접 연 Carrot Web 또는 장치 로컬 접속에서만 승인되며 같은 핫스팟의 다른 LAN 클라이언트에서는 켤 수 없습니다. 안전하게 주차한 상태에서 확인 창에 동의해 켜면 comma Athena 원격 연결, 완료된 cloudlog·통계, 로그에 담긴 위치·장치·예외 정보, 서버가 요청하는 rlog/qlog/qcamera·카메라 파일, 실시간 메시지·스냅샷·SIM/주변 네트워크 정보, 원격 SSH, Prime/Firehose 상태, Sentry, stock uploader 및 별도 `ShareData`가 켜진 Xiaoge 데이터·영상 서비스를 허용합니다. 파일마다 다시 확인하지 않으며 휴대폰 테더링 데이터를 쓸 수 있습니다. 모든 자동 전송은 현재 켜진 정확한 동의 세대에 묶입니다. 끄면 열린 연결과 대기·진행 중 자동 전송을 중단하고 Athena 큐를 폐기하며, 곧바로 다시 켜도 이전 동의 세대의 작업은 살아나지 않습니다. 현재 동의 세대가 시작되기 전에 존재한 cloudlog·통계·route/카메라 자료(꺼진 동안 생성된 자료 포함)는 Athena와 stock uploader가 나중에 재전송하지 않도록 영구 제외됩니다. 로컬 주행 로그·저장공간 정리, 별도 동의가 필요한 고정 개인 NAS의 KA4 자동 검증, 사용자가 직접 시작한 개인 NAS·Discord·대시캠 전송은 독립적입니다. Git 업데이트, 온라인 길찾기·지도, GPS/시간 보조, 최초 등록, YouTube Live와 직접 시작한 지원 터널도 별도 인터넷 기능입니다. 이 동의는 설정 백업·프로필·QR에 저장되지 않고 이미 보낸 자료를 자동 삭제하지 않으며 차량 제어 설정을 바꾸지 않습니다.
-- `CarrotCommunityDataSharing`: 기본값은 꺼짐이며 `DkThirdPartyDataSharing`과 이 설정이 모두 켜져야 동작합니다. 동의 활성화는 테더링을 제공하는 휴대폰에서 직접 연 Carrot Web 또는 장치 로컬 접속에서만 승인되며 같은 핫스팟의 다른 LAN 클라이언트에서는 켤 수 없습니다. 주차 상태에서 명시적으로 켜면 장치 식별자·차량명·브랜치/커밋·로컬 네트워크 주소와 상태 heartbeat, 전체 설정값과 카탈로그, 자동 onroad·예외 tmux 진단 및 설정 스냅샷을 Carrot 커뮤니티 서버나 내장 Discord로 보낼 수 있고, 인기 설정값 다운로드와 CWP 주소 등록을 허용합니다. 지원 터미널·Vision 진단·수동 대시캠 전송 완료가 내장 Discord 알림을 쓸 때도 필요합니다. 각 자동 요청과 스트리밍 진단은 두 동의의 현재 정확한 세대에 묶입니다. 둘 중 하나를 끄면 새 요청을 즉시 차단하고 진행 중인 스트림은 다음 조각에서 중단하며 자동 tmux 수집·재시도를 버립니다. 곧바로 다시 켜도 이전 동의 세대에서 준비한 payload는 전송하지 않습니다. 사용자가 직접 지정한 NAS·Discord 주소와 명시적으로 시작한 수동 대시캠 전송 자체는 별개이지만 내장 Discord 완료 알림은 차단됩니다. 아래 `CarrotValidationAutoUpload`도 고정된 개인 NAS와 별도 동의를 사용하므로 두 공유 설정을 꺼도 독립적으로 동작합니다. 동의 값은 설정 백업·프로필·QR에 저장되지 않으며 이미 전송된 자료는 자동 삭제되지 않습니다.
-- `CarrotValidationAutoUpload`: 기본값은 꺼짐이며 이 시험 캠페인은 소유자의 허용 목록에 등록된 DK 장치와 HDA2 플래그가 없는 정확한 KA4 CAN FD HDA1 순정 레이더 SCC·비롱컨 구성에서만 준비됩니다. 브랜치에는 장치 식별자의 단방향 해시만 저장합니다. 주차 중 한 번 동의하면 최대 7일 동안 해당 KA4 시험 조건의 로그 선택과 주행 후 Wi-Fi 전송을 로그별 재확인 없이 자동 처리합니다. 인게이지 정차 시작 약 0.5초 뒤를 관찰하지만 RES를 합성하거나 차량 제어 메시지를 바꾸지 않습니다. 신규 캠페인은 이벤트 캡처당 최대 3개, 캠페인당 최대 10개 캡처/서로 다른 full rlog 30개를 선택합니다. 구버전 legacy 복원 호환 상한은 14개/42개이며 이는 전송 횟수나 바이트 상한이 아닙니다. 동시에 대기하는 큐는 최대 5개 캡처/750 MiB이지만 클라이언트 누적 전송량 상한은 없고 실패한 파일이나 캡처 전체가 최대 7일 동안 다시 전송될 수 있습니다. 서버의 장치별 일일 1 GiB 한도에 도달하면 보존한 로그를 다음 날 재시도할 수 있습니다. 목적지는 표준 HTTPS 443 루트의 정확한 `https://adot.synology.me` 하나로 고정되어 다른 포트·경로·도메인과 배포 환경 변수 우회를 거부하며, Carrot Web의 일반 전송 목적지로도 바꿀 수 없습니다. 동의 활성화는 테더링 제공 휴대폰에서 직접 연 Carrot Web 또는 장치 로컬 접속에서만 승인됩니다. 설정 줄에는 정리된 대기 상태가 표시됩니다. 휴대폰 테더링은 모바일 데이터를 쓸 수 있고 설정을 꺼도 이미 서버에 전송된 자료는 자동 삭제되지 않습니다. 전체 범위와 개인정보는 [분석용 대시캠 로그 전송](dashcam-log-sharing.md#automatic-validation-upload)을 먼저 확인하세요.
+- `CarrotValidationAutoUpload`: `DK 개인 NAS KA4 자동 검증 로그 (시험)`이며 기본값은 꺼짐입니다. 이 시험 캠페인은 소유자의 허용 목록에 등록된 DK 장치와 HDA2 플래그가 없는 정확한 KA4 CAN FD HDA1 순정 레이더 SCC·비롱컨 구성에서만 준비됩니다. 브랜치에는 장치 식별자의 단방향 해시만 저장합니다. 주차 중 한 번 동의하면 최대 7일 동안 해당 KA4 시험 조건의 로그 선택과 주행 후 Wi-Fi 전송을 로그별 재확인 없이 자동 처리합니다. 인게이지 정차 시작 약 0.5초 뒤를 관찰합니다. 수집기는 RES나 차량 메시지를 만들지 않으며, 이 로그 설정을 끄거나 켜도 별도로 자동 적용되는 KA4 재출발 유지 동작은 바뀌지 않습니다. 신규 캠페인은 이벤트 캡처당 최대 3개, 캠페인당 최대 10개 캡처/서로 다른 full rlog 30개를 선택합니다. 구버전 legacy 복원 호환 상한은 14개/42개이며 이는 전송 횟수나 바이트 상한이 아닙니다. 동시에 대기하는 큐는 최대 5개 캡처/750 MiB이지만 클라이언트 누적 전송량 상한은 없고 실패한 파일이나 캡처 전체가 최대 7일 동안 다시 전송될 수 있습니다. 서버의 장치별 일일 1 GiB 한도에 도달하면 보존한 로그를 다음 날 재시도할 수 있습니다. 목적지는 표준 HTTPS 443 루트의 정확한 `https://adot.synology.me` 하나로 고정되어 다른 포트·경로·도메인과 배포 환경 변수 우회를 거부하며 Carrot Web의 일반 전송 목적지로도 바꿀 수 없습니다. 아래 두 공유 설정과 무관하게 이 설정 하나의 동의로만 동작합니다. 설정 줄에는 정리된 대기 상태가 표시됩니다. 휴대폰 테더링은 모바일 데이터를 쓸 수 있고 설정을 꺼도 이미 서버에 전송된 자료는 자동 삭제되지 않습니다. 전체 범위와 개인정보는 [분석용 대시캠 로그 전송](dashcam-log-sharing.md#automatic-validation-upload)을 먼저 확인하세요.
+- `DkThirdPartyDataSharing`: `DK 기타 로그·진단 외부 전송`이며, 위 KA4 자동 검증의 고정 DK 개인 NAS 전송을 제외한 **모든 수동·자동 로그 및 진단 외부 전송**을 허용하는 상위 동의입니다. 기본값은 꺼짐입니다. 끄면 comma Athena, cloudlog·통계, 원격 로그 요청·SSH, Prime/Firehose, Sentry, stock uploader, Xiaoge, Carrot 커뮤니티·Discord는 물론 사용자가 직접 시작한 개인 NAS·Discord·대시캠·tmux 전송도 차단합니다. 열린 연결과 대기·진행 중 전송을 중단하고 이전 동의 세대와 Athena 큐도 폐기합니다. 켜려면 테더링 제공 휴대폰에서 직접 연 Carrot Web 또는 장치 로컬 접속에서 주차 상태 확인에 동의해야 합니다. 화면은 두 동의를 조합해 `내 DK NAS 검증 로그만`, `모든 로그 전송 차단`, `기타 로그·진단 외부 전송 허용` 중 하나를 표시합니다. 로컬 주행 로그와 저장공간 정리는 계속되며, Git 업데이트·온라인 길찾기와 지도·GPS/시간 보조·최초 등록·YouTube Live처럼 로그 전송이 아닌 인터넷 기능은 별개입니다. 동의 값은 설정 백업·프로필·QR에 저장되지 않고 이미 보낸 자료를 자동 삭제하지 않으며 차량 제어 설정을 바꾸지 않습니다.
+- `CarrotCommunityDataSharing`: 기본값은 꺼짐이며 `DkThirdPartyDataSharing`과 이 설정이 모두 켜져야 동작합니다. 상위 설정이 꺼져 있으면 Carrot Web에서 토글이 비활성화되고 차단 이유가 표시되며 저장된 커뮤니티 동의도 해제됩니다. 두 설정이 모두 켜지면 장치 식별자·차량명·브랜치/커밋·로컬 네트워크 주소와 heartbeat, 전체 설정값과 카탈로그, 자동 onroad·예외 tmux 진단, 설정 스냅샷, 인기 설정값, CWP 주소와 내장 Discord 알림을 Carrot 커뮤니티 서비스와 주고받을 수 있습니다. 사용자가 직접 지정한 NAS·Discord와 수동 대시캠·tmux 전송도 상위 설정이 꺼져 있으면 차단됩니다. KA4 자동 검증은 이 설정과 무관하게 위의 별도 동의가 켜진 경우에만 고정 DK 개인 NAS로 전송됩니다. 동의 값은 설정 백업·프로필·QR에 저장되지 않으며 이미 전송된 자료는 자동 삭제되지 않습니다.
 - `MaxTimeOffroadMin`: 시동이 꺼진 뒤 장치가 자동으로 꺼질 때까지의 시간입니다.
 - `UseWideCamera`: 광각 전방 카메라가 고장 난 장치에서만 끄고 장치를 재부팅합니다.
 - `CarrotYouTubeLive`: 네트워크 사용량, 발열과 개인정보 노출 가능성을 함께 확인하세요.

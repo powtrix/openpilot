@@ -46,8 +46,10 @@ test("an authoritative live refresh makes an automatic disable the next consent 
   const applyLiveValues = Function(
     "document",
     "syncSettingControlState",
+    "renderedLogSharingValues",
+    "syncLogSharingPolicyUi",
     `return (${functionSource});`,
-  )(document, syncSettingControlState);
+  )(document, syncSettingControlState, {}, () => {});
 
   // The service completes or expires the campaign and changes Params 1 -> 0.
   assert.equal(applyLiveValues({ CarrotValidationAutoUpload: 0 }, { animate: false }), true);

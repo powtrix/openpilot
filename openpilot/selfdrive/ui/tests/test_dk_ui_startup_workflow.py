@@ -51,6 +51,8 @@ def test_dk_ci_does_not_skip_real_pyray_or_exact_commit_annotation_checks():
   assert "test_dk_log_transfer.py" in step["run"]
   assert "test_dk_lateral_diagnostics.py" in step["run"]
   assert "test_ka4_lateral_sign.py" in step["run"]
+  assert "test_dk_experimental_steering.py" in step["run"]
+  assert "test_dk_steering_setting.py" in step["run"]
   assert "test_dk_diagnostics_report.py" in step["run"]
   assert "continue-on-error" not in step
 

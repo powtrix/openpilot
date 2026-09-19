@@ -269,14 +269,14 @@ def test_carrot_community_data_sharing_is_explicit_opt_in(settings, params):
   assert sharing["risk"] == "high"
   for fragment in (
     "장치 식별자", "로컬 네트워크 주소", "전체 설정값", "자동 onroad·예외 tmux",
-    "기본 Discord", "모바일 데이터", "KA4 자동 검증 로그 전송", "백업·프로필·QR",
-    "DK 외부 자동 로그·진단 공유",
+    "기본 Discord", "모바일 데이터", "KA4 자동 검증 로그", "백업·프로필·QR",
+    "DK 기타 로그·진단 외부 전송",
   ):
     assert fragment in sharing["descr"]
   for fragment in (
     "device identifiers", "local network address", "all setting values",
-    "automatic onroad and exception tmux", "bundled Discord", "mobile data",
-    "KA4 automatic validation upload", "backups, profiles, and QR", "master consent",
+    "automatic onroad/exception tmux", "bundled Discord", "mobile data",
+    "KA4 automatic validation", "backups, profiles, and QR", "master",
   ):
     assert fragment in sharing["edescr"]
 
@@ -285,9 +285,9 @@ def test_carrot_community_data_sharing_is_explicit_opt_in(settings, params):
   basic = next(group for group in record["groups"] if group["id"] == "SYS_RECORD_BASIC")
   assert basic["params"] == [
     "RecordRoadCam",
+    "CarrotValidationAutoUpload",
     "DkThirdPartyDataSharing",
     "CarrotCommunityDataSharing",
-    "CarrotValidationAutoUpload",
     "MaxTimeOffroadMin",
   ]
 
@@ -304,14 +304,14 @@ def test_dk_third_party_data_sharing_is_high_risk_master_opt_in(settings, params
 
   disclosure_fragments = {
     "descr": [
-      "전체 상위 동의", "기본값은 꺼짐", "Athena", "cloudlog", "위치", "rlog/qlog/qcamera",
-      "원격 SSH", "Prime/Firehose", "Sentry", "stock uploader", "Carrot 커뮤니티 데이터 공유",
-      "기존 Athena 업로드 큐", "KA4 자동 검증 로그", "백업·프로필·QR", "주행 제어 설정은 바뀌지 않습니다",
+      "모든 로그·진단 외부 전송의 상위 동의", "기본값은 꺼짐", "Athena", "cloudlog", "위치", "rlog/qlog/qcamera",
+      "원격 SSH", "Prime/Firehose", "Sentry", "stock uploader", "Carrot 커뮤니티 공유",
+      "Athena 큐", "KA4 자동 검증 로그", "백업·프로필·QR", "차량 제어 설정을 바꾸지 않습니다",
     ],
     "edescr": [
-      "Master consent", "off by default", "Athena", "cloudlogs", "location", "rlog, qlog, qcamera",
-      "remote SSH", "Prime and Firehose", "Sentry", "stock uploader", "Carrot Community Data Sharing",
-      "old Athena upload queue", "KA4 automatic validation", "backups, profiles, and QR",
+      "Master consent", "off by default", "Athena", "cloudlogs", "location", "rlog/qlog/qcamera",
+      "remote SSH", "Prime/Firehose", "Sentry", "stock uploader", "Carrot Community Data Sharing",
+      "previous consent session and Athena queue", "KA4 automatic validation", "backups, profiles, and QR",
       "No vehicle-control setting is changed",
     ],
   }

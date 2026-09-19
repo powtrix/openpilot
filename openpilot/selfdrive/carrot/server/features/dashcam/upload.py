@@ -1,13 +1,22 @@
 import base64
+import json
 import os
 import subprocess
 from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout
 
-from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
+from openpilot.selfdrive.carrot.community_data import (
+  community_data_sharing_enabled,
+  community_data_sharing_generation,
+  community_data_sharing_generation_matches,
+)
 from openpilot.system.hardware import HARDWARE
-from openpilot.selfdrive.carrot.web_upload import web_upload_settings
+from openpilot.selfdrive.carrot.web_upload import guarded_async_bytes, web_upload_settings
 
 from ...config import DASHCAM_DEFAULT_DISCORD_KEY, DASHCAM_DEFAULT_DISCORD_WEBHOOK
 from ...services.dashcam_upload_report import (
@@ -16,6 +25,9 @@ from ...services.dashcam_upload_report import (
   upload_share_text as upload_share_text,
 )
 from ...services.params import HAS_PARAMS, Params
+
+
+_CONSENT_GENERATION_UNSET = object()
 from ...services.web_settings import read_web_settings
 
 
@@ -117,20 +129,58 @@ def discord_webhook_url(params: Any) -> str:
   return decode_obfuscated(DASHCAM_DEFAULT_DISCORD_WEBHOOK, DASHCAM_DEFAULT_DISCORD_KEY)
 
 
-async def send_discord_webhook(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def send_discord_webhook(
+  url: str,
+  payload: dict[str, Any],
+  *,
+  params: Any | None = None,
+  consent_generation: str | None = None,
+  community_generation: Any = _CONSENT_GENERATION_UNSET,
+) -> dict[str, Any]:
+  if params is None and HAS_PARAMS:
+    params = Params()
+  if consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
+
+  def master_request_allowed() -> bool:
+    return third_party_data_sharing_generation_matches(consent_generation, params)
+
+  if not master_request_allowed():
+    return {
+      "configured": bool(str(url or "").strip()),
+      "ok": False,
+      "skipped": True,
+      "disabled_by_third_party_sharing": True,
+    }
   url = (url or "").strip()
   if not url:
     return {"configured": False, "ok": False, "skipped": True}
   if not url.startswith(("http://", "https://")):
     return {"configured": True, "ok": False, "error": "invalid webhook url"}
   default_url = decode_obfuscated(DASHCAM_DEFAULT_DISCORD_WEBHOOK, DASHCAM_DEFAULT_DISCORD_KEY)
-  if url == default_url and not community_data_sharing_enabled():
-    return {
-      "configured": True,
-      "ok": False,
-      "skipped": True,
-      "disabled_by_community_sharing": True,
-    }
+  requires_community_consent = url == default_url
+  if community_generation is _CONSENT_GENERATION_UNSET:
+    community_generation = community_data_sharing_generation(params)
+
+  def request_allowed() -> bool:
+    return (
+      master_request_allowed()
+      and (
+        not requires_community_consent
+        or community_data_sharing_generation_matches(community_generation, params)
+      )
+    )
+
+  def blocked_result() -> dict[str, Any]:
+    reason = (
+      "disabled_by_community_sharing"
+      if master_request_allowed() and requires_community_consent
+      else "disabled_by_third_party_sharing"
+    )
+    return {"configured": True, "ok": False, "skipped": True, reason: True}
+
+  if not request_allowed():
+    return blocked_result()
   body = {
     "username": "Carrot Dashcam",
     "content": discord_content(payload),
@@ -140,15 +190,21 @@ async def send_discord_webhook(url: str, payload: dict[str, Any]) -> dict[str, A
   try:
     timeout = ClientTimeout(total=12)
     async with ClientSession(timeout=timeout) as session:
-      if url == default_url and not community_data_sharing_enabled():
-        return {
-          "configured": True,
-          "ok": False,
-          "skipped": True,
-          "disabled_by_community_sharing": True,
-        }
-      async with session.post(url, json=body) as resp:
+      if not request_allowed():
+        return blocked_result()
+      encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+      async with session.post(
+        url,
+        data=guarded_async_bytes(encoded, request_allowed),
+        headers={
+          "Content-Type": "application/json",
+          "Content-Length": str(len(encoded)),
+        },
+        allow_redirects=False,
+      ) as resp:
         text = await resp.text()
+        if not request_allowed():
+          return blocked_result()
         if 200 <= resp.status < 300:
           return {"configured": True, "ok": True, "status": resp.status}
         return {"configured": True, "ok": False, "status": resp.status, "error": text[:500]}

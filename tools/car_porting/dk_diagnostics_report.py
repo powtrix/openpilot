@@ -42,7 +42,7 @@ CONFIG_KEYS = ("PathOffset", "AdjustLaneOffset", "UseLaneLineSpeed", "SteerActua
                "CustomSteerDeltaDownLC", "LongActuatorDelay", "VEgoStopping", "StoppingAccel", "StopDistanceCarrot",
                "TrafficLightDetectMode", "ExperimentalMode", "AlphaLongitudinalEnabled", "CanfdHDA2",
                "HyundaiCameraSCC", "EnableRadarTracks", "CruiseButtonTest1", "CruiseButtonTest2", "CruiseButtonTest3",
-               "AutoCruiseControl", "SpeedFromPCM", "Ka4StockSccStandstillRearm", "LatSmoothSec",
+               "AutoCruiseControl", "SpeedFromPCM", "Ka4StockSccStandstillRearm", "LatSmoothSec", "DkExperimentalSteering",
                "LateralTorqueCustom", "LateralTorqueAccelFactor", "LateralTorqueFriction",
                "LateralTorqueKpV", "LateralTorqueKiV", "LateralTorqueKf", "LateralTorqueKd")
 MAX_JSON_LINE = 1_048_576

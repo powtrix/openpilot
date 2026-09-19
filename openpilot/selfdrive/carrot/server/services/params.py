@@ -10,6 +10,12 @@ import threading
 import zlib
 from typing import Any, Dict, List, Optional
 
+from .dk_steering_setting import (
+  DK_EXPERIMENTAL_STEERING_PARAM,
+  require_steering_setting_offroad,
+  steering_setting_value,
+)
+
 try:
   import brotli
 except Exception:
@@ -69,6 +75,7 @@ VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
 COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing"
 THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing"
 BACKUP_EXCLUDED_PARAMS = frozenset({
+  DK_EXPERIMENTAL_STEERING_PARAM,
   VALIDATION_AUTO_UPLOAD_PARAM,
   COMMUNITY_DATA_SHARING_PARAM,
   THIRD_PARTY_DATA_SHARING_PARAM,
@@ -399,6 +406,12 @@ def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *
                     allow_validation_auto_upload_enable: bool = False,
                     allow_community_data_sharing_enable: bool = False,
                     allow_third_party_data_sharing_enable: bool = False) -> None:
+  if name == DK_EXPERIMENTAL_STEERING_PARAM:
+    value = steering_setting_value(value)
+    # Central policy also covers profiles, QR/file restores and tool writes.
+    # Neither ON nor OFF may be queued while driving; controls latches the
+    # choice only when it starts, so saving never hot-switches lateral control.
+    require_steering_setting_offroad(Params() if HAS_PARAMS and Params is not None else None)
   if (
     name == VALIDATION_AUTO_UPLOAD_PARAM
     and not _explicit_consent_is_disabled(value)
@@ -418,8 +431,15 @@ def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *
   ):
     raise PermissionError("automatic third-party data sharing requires explicit consent")
 
+  disable_community_with_master = (
+    name == THIRD_PARTY_DATA_SHARING_PARAM
+    and _explicit_consent_is_disabled(value)
+  )
+
   if not HAS_PARAMS:
     _mem_store[name] = str(value)
+    if disable_community_with_master:
+      _mem_store[COMMUNITY_DATA_SHARING_PARAM] = "0"
     return
   params = Params()
   try:
@@ -428,6 +448,17 @@ def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *
     if p is None or UnknownKeyName is None or not isinstance(exc, UnknownKeyName):
       raise
     _put_unregistered_setting(params, name, value, p)
+
+  # The community switch is subordinate to this master. Persist it OFF when
+  # the Web API disables the master so a later re-enable cannot silently
+  # revive an earlier community consent.
+  if disable_community_with_master:
+    put_typed(
+      params,
+      COMMUNITY_DATA_SHARING_PARAM,
+      0,
+      {"default": 0, "min": 0, "max": 1},
+    )
 
 
 # -----------------------

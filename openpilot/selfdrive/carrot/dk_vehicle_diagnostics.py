@@ -29,7 +29,7 @@ PARAM_KEYS = (
   'TrafficLightDetectMode', 'ExperimentalMode', 'AlphaLongitudinalEnabled', 'CanfdHDA2',
   'HyundaiCameraSCC', 'EnableRadarTracks', 'CruiseButtonTest1', 'CruiseButtonTest2', 'CruiseButtonTest3',
   'AutoCruiseControl', 'SpeedFromPCM', 'Ka4StockSccStandstillRearm',
-  'LatSmoothSec', 'LateralTorqueCustom', 'LateralTorqueAccelFactor', 'LateralTorqueFriction',
+  'LatSmoothSec', 'DkExperimentalSteering', 'LateralTorqueCustom', 'LateralTorqueAccelFactor', 'LateralTorqueFriction',
   'LateralTorqueKpV', 'LateralTorqueKiV', 'LateralTorqueKf', 'LateralTorqueKd',
 )
 CONTROLLER_FIELDS = (
@@ -188,7 +188,9 @@ def make_dk_vehicle_diagnostics(CP, params, logger=None):
         value = value.decode('ascii', errors='replace') if isinstance(value, bytes) else value
         # Only numeric configuration. Never pass through arbitrary stored text.
         initial_params[key] = scalar(float(value)) if value is not None else None
-      except (KeyError, ValueError, TypeError):
+      except Exception:
+        # An optional key absent from an older native Params build must not
+        # disable every existing passive diagnostic during an update.
         initial_params[key] = None
     metadata = {'branch': 'dkcarrot-wip', 'commit': commit if re.fullmatch('[0-9a-fA-F]{7,64}', commit) else None,
                 'diagnostics_version': DIAGNOSTICS_VERSION, 'params_snapshot_scope': 'initial_numeric_raw_params_only',

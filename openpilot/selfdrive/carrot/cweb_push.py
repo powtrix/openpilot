@@ -17,6 +17,7 @@ from openpilot.selfdrive.carrot.community_data import (
   CommunityConsentBoundBytes,
   community_data_sharing_generation,
   community_data_sharing_generation_matches,
+  open_url_no_redirect,
 )
 
 
@@ -161,8 +162,10 @@ def post_json(
   try:
     if not community_data_sharing_generation_matches(consent_generation, params):
       return False, 0, "community data sharing disabled"
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    with open_url_no_redirect(req, timeout_s) as resp:
       body = resp.read().decode("utf-8", errors="replace")
+      if not community_data_sharing_generation_matches(consent_generation, params):
+        return False, 0, "community data sharing disabled"
       return 200 <= resp.status < 300, int(resp.status), body
   except urllib.error.HTTPError as exc:
     try:

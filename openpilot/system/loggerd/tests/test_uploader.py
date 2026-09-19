@@ -2,11 +2,12 @@ import time
 import threading
 import logging
 import json
+from types import SimpleNamespace
 from pathlib import Path
 import pytest
 from openpilot.system.hardware.hw import Paths
 
-from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
+from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM, third_party_data_sharing_generation
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.loggerd import uploader
 from openpilot.system.loggerd.uploader import main, UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE
@@ -198,3 +199,102 @@ class TestUploader(UploaderTestCase):
 
     with pytest.raises(uploader.AutomaticDataSharingDisabled):
       instance.do_upload(f"{self.seg_dir}/qlog.zst", str(candidate))
+
+  def test_signed_put_disables_redirects_and_aborts_aba_mid_body(self, monkeypatch):
+    candidate = self.make_file_with_data(self.seg_dir, "qlog", 0.01)
+    instance = uploader.Uploader("0000000000000000", str(Paths.log_root()))
+    state = {"enabled": True, "generation": "generation-1"}
+    consent_params = SimpleNamespace(_dk_consent_generation=state["generation"])
+    consent_params.get = lambda _key, *args, **kwargs: b"1" if state["enabled"] else b"0"
+    instance.params = consent_params
+    generation = third_party_data_sharing_generation(consent_params)
+    assert generation is not None
+    instance.consent_generation = generation
+    instance.api.get = lambda *args, **kwargs: SimpleNamespace(
+      status_code=200,
+      text='{"url": "https://upload.example/file", "headers": {}}',
+    )
+
+    request_options = {}
+
+    def put(_url, *, data, **kwargs):
+      request_options.update(kwargs)
+      assert data.read(1)
+      state["enabled"] = False
+      consent_params._dk_consent_generation = state["generation"] = "generation-2"
+      state["enabled"] = True
+      data.read(1)
+      raise AssertionError("stale upload body resumed after consent ABA")
+
+    monkeypatch.setattr(uploader, "fake_upload", False)
+    monkeypatch.setattr(uploader.requests, "put", put)
+
+    with pytest.raises(uploader.AutomaticDataSharingDisabled):
+      instance.do_upload(f"{self.seg_dir}/qlog.zst", str(candidate))
+
+    assert request_options["allow_redirects"] is False
+
+  def test_signed_url_response_does_not_start_old_generation_put(self, monkeypatch):
+    candidate = self.make_file_with_data(self.seg_dir, "qlog", 0.01)
+    instance = uploader.Uploader("0000000000000000", str(Paths.log_root()))
+    state = {"enabled": True, "generation": "generation-1"}
+    consent_params = SimpleNamespace(_dk_consent_generation=state["generation"])
+    consent_params.get = lambda _key, *args, **kwargs: b"1" if state["enabled"] else b"0"
+    instance.params = consent_params
+    generation = third_party_data_sharing_generation(consent_params)
+    assert generation is not None
+
+    def get_signed_url(*_args, **_kwargs):
+      state["enabled"] = False
+      consent_params._dk_consent_generation = state["generation"] = "generation-2"
+      state["enabled"] = True
+      return SimpleNamespace(
+        status_code=200,
+        text='{"url": "https://upload.example/file", "headers": {}}',
+      )
+
+    instance.api.get = get_signed_url
+    monkeypatch.setattr(uploader, "fake_upload", False)
+    monkeypatch.setattr(
+      uploader.requests,
+      "put",
+      lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("stale signed upload started")),
+    )
+
+    with pytest.raises(uploader.AutomaticDataSharingDisabled):
+      instance.do_upload(f"{self.seg_dir}/qlog.zst", str(candidate), generation)
+
+  def test_signed_put_rechecks_generation_after_response(self, monkeypatch):
+    candidate = self.make_file_with_data(self.seg_dir, "qlog", 0.01)
+    instance = uploader.Uploader("0000000000000000", str(Paths.log_root()))
+    state = {"enabled": True, "generation": "generation-1"}
+    consent_params = SimpleNamespace(_dk_consent_generation=state["generation"])
+    consent_params.get = lambda _key, *args, **kwargs: b"1" if state["enabled"] else b"0"
+    instance.params = consent_params
+    generation = third_party_data_sharing_generation(consent_params)
+    assert generation is not None
+    instance.consent_generation = generation
+    instance.api.get = lambda *args, **kwargs: SimpleNamespace(
+      status_code=200,
+      text='{"url": "https://upload.example/file", "headers": {}}',
+    )
+
+    response = SimpleNamespace(closed=False)
+    response.close = lambda: setattr(response, "closed", True)
+
+    def put(_url, *, data, **kwargs):
+      assert kwargs["allow_redirects"] is False
+      while data.read(1024):
+        pass
+      state["enabled"] = False
+      consent_params._dk_consent_generation = state["generation"] = "generation-2"
+      state["enabled"] = True
+      return response
+
+    monkeypatch.setattr(uploader, "fake_upload", False)
+    monkeypatch.setattr(uploader.requests, "put", put)
+
+    with pytest.raises(uploader.AutomaticDataSharingDisabled):
+      instance.do_upload(f"{self.seg_dir}/qlog.zst", str(candidate))
+
+    assert response.closed

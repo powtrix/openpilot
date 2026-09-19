@@ -1,6 +1,7 @@
 {
   "schema": 1,
-  "deployed_at": "2026-09-18 19:18 KST",
+  "deployed_at": "2026-09-20 08:19 KST",
+  "label_date": "2026-09-20",
   "diagnostics_version": 3,
-  "label": "브레이크게이지/핸들복원로그"
+  "label": "코너/조향 개선"
 }

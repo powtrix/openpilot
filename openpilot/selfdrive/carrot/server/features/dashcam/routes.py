@@ -7,6 +7,10 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.selfdrive.carrot.web_upload import (
   VALIDATION_DEVICE_AUTH_VERSION,
   check_web_upload_health,
@@ -15,6 +19,7 @@ from openpilot.selfdrive.carrot.web_upload import (
 )
 
 from ...config import DASHCAM_ROOT
+from ...services.params import HAS_PARAMS, Params
 from . import upload, upload_jobs
 from .catalog import (
   build_routes,
@@ -57,6 +62,18 @@ _route_cache_lock = threading.Lock()
 # the first call always builds. "routes" stays None until populated so an empty
 # index (no footage) is still cached instead of rebuilt every request.
 _route_cache: dict = {"time": 0.0, "sig": object(), "routes": None}
+
+
+def _manual_upload_consent() -> tuple[object | None, str | None]:
+  params = Params() if HAS_PARAMS else None
+  return params, third_party_data_sharing_generation(params)
+
+
+def _require_manual_upload_consent() -> tuple[object | None, str]:
+  params, generation = _manual_upload_consent()
+  if generation is None:
+    raise web.HTTPForbidden(text="third-party data sharing is disabled")
+  return params, generation
 
 
 def client_replay_source_description(segment: str) -> dict:
@@ -494,6 +511,7 @@ async def api_dashcam_upload_summary(request: web.Request) -> web.Response:
 
 async def api_dashcam_upload(request: web.Request) -> web.Response:
   try:
+    _params, consent_generation = _require_manual_upload_consent()
     segments = await request_upload_segments(request)
     running = upload_jobs.running_job()
     if running:
@@ -505,7 +523,7 @@ async def api_dashcam_upload(request: web.Request) -> web.Response:
       }, status=409)
     # Preserve the legacy synchronous response while registering it in the
     # same single-job registry used by the modern endpoint and auto collector.
-    job = upload_jobs.create_job(segments)
+    job = upload_jobs.create_job(segments, run_options={"consent_generation": consent_generation})
     await upload_jobs.start_job(job)
     result = job.get("result") if isinstance(job.get("result"), dict) else {"ok": False, "error": "upload failed"}
     return web.json_response(result)
@@ -517,6 +535,7 @@ async def api_dashcam_upload(request: web.Request) -> web.Response:
 
 async def api_dashcam_upload_start(request: web.Request) -> web.Response:
   try:
+    _params, consent_generation = _require_manual_upload_consent()
     segments = await request_upload_segments(request)
     running = upload_jobs.running_job()
     if running:
@@ -526,7 +545,7 @@ async def api_dashcam_upload_start(request: web.Request) -> web.Response:
         "job_id": running.get("id"),
         "job": upload_jobs.snapshot(running),
       }, status=409)
-    job = upload_jobs.create_job(segments)
+    job = upload_jobs.create_job(segments, run_options={"consent_generation": consent_generation})
     upload_jobs.start_job(job)
     return web.json_response({"ok": True, "job_id": job["id"], "status": job["status"]})
   except web.HTTPException as e:
@@ -537,17 +556,29 @@ async def api_dashcam_upload_start(request: web.Request) -> web.Response:
 
 async def api_dashcam_upload_test(request: web.Request) -> web.Response:
   try:
+    params, consent_generation = _require_manual_upload_consent()
+
+    def request_allowed() -> bool:
+      return third_party_data_sharing_generation_matches(consent_generation, params)
+
     base_url, token = upload.upload_target_settings()
-    result = await check_web_upload_health(base_url, token)
+    result = await check_web_upload_health(base_url, token, request_allowed)
     if result.get("ok"):
       if result.get("legacyUploadsEnabled") is False:
         result["mode"] = "validation-only"
         result["session"] = "disabled"
       elif not token:
-        await create_web_upload_session(base_url, upload.current_upload_metadata(), "test")
+        await create_web_upload_session(
+          base_url,
+          upload.current_upload_metadata(),
+          "test",
+          request_allowed,
+        )
         result["session"] = "automatic"
     status = 200 if result.get("ok") else 502
     return web.json_response({"target": "web", "url": base_url, **result}, status=status)
+  except web.HTTPException as e:
+    return web.json_response({"ok": False, "error": e.text or e.reason}, status=e.status)
   except Exception as e:
     return web.json_response({"ok": False, "error": str(e)}, status=500)
 

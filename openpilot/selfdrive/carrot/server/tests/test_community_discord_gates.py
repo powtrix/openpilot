@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import pytest
 
 from openpilot.selfdrive.carrot.server.features.dashcam import upload as dashcam_upload
 from openpilot.selfdrive.carrot.server.services import support_discord, vision_diag
+
+
+@pytest.fixture(autouse=True)
+def enabled_master_consent(monkeypatch):
+  generation = "master-generation"
+  for module in (dashcam_upload, support_discord, vision_diag):
+    monkeypatch.setattr(module, "third_party_data_sharing_generation", lambda _params=None: generation)
+    monkeypatch.setattr(
+      module,
+      "third_party_data_sharing_generation_matches",
+      lambda expected, _params=None: expected == generation,
+    )
 
 
 def _clear_discord_overrides(monkeypatch) -> None:
@@ -31,11 +44,37 @@ def test_custom_support_webhook_remains_independent(monkeypatch):
   assert support_discord.support_discord_webhook_url() == "https://operator.example/support"
 
 
+def test_master_off_blocks_custom_support_notification_before_network(monkeypatch):
+  _clear_discord_overrides(monkeypatch)
+  monkeypatch.setenv("CARROT_SUPPORT_DISCORD_WEBHOOK_URL", "https://operator.example/support")
+  monkeypatch.setattr(support_discord, "third_party_data_sharing_generation", lambda _params=None: None)
+  monkeypatch.setattr(
+    support_discord,
+    "third_party_data_sharing_generation_matches",
+    lambda *_args, **_kwargs: False,
+  )
+  monkeypatch.setattr(
+    support_discord,
+    "ClientSession",
+    lambda *_args, **_kwargs: pytest.fail("network must not be opened while the master is OFF"),
+  )
+
+  result = asyncio.run(support_discord.send_support_webhook(None, {}))
+
+  assert result["skipped"] is True
+  assert result["disabled_by_third_party_sharing"] is True
+
+
 def test_support_send_rechecks_consent_before_bundled_request(monkeypatch):
   monkeypatch.delenv("CARROT_SUPPORT_DISCORD_WEBHOOK_DISABLE", raising=False)
   default_url = support_discord._decode_obfuscated_webhook_url()
   monkeypatch.setattr(support_discord, "support_discord_webhook_url", lambda: default_url)
-  monkeypatch.setattr(support_discord, "community_data_sharing_enabled", lambda: False)
+  monkeypatch.setattr(support_discord, "community_data_sharing_generation", lambda _params=None: "community-1")
+  monkeypatch.setattr(
+    support_discord,
+    "community_data_sharing_generation_matches",
+    lambda expected, _params=None: expected == "community-2",
+  )
 
   result = asyncio.run(support_discord.send_support_webhook(None, {}))
 
@@ -60,6 +99,25 @@ def test_custom_dashcam_completion_webhook_remains_independent(monkeypatch):
   assert dashcam_upload.discord_webhook_url(None) == "https://operator.example/dashcam"
 
 
+def test_master_off_blocks_custom_dashcam_notification_before_network(monkeypatch):
+  monkeypatch.setattr(dashcam_upload, "third_party_data_sharing_generation", lambda _params=None: None)
+  monkeypatch.setattr(
+    dashcam_upload,
+    "third_party_data_sharing_generation_matches",
+    lambda *_args, **_kwargs: False,
+  )
+  monkeypatch.setattr(
+    dashcam_upload,
+    "ClientSession",
+    lambda *_args, **_kwargs: pytest.fail("network must not be opened while the master is OFF"),
+  )
+
+  result = asyncio.run(dashcam_upload.send_discord_webhook("https://operator.example/dashcam", {}))
+
+  assert result["skipped"] is True
+  assert result["disabled_by_third_party_sharing"] is True
+
+
 def test_dashcam_completion_send_rechecks_consent_before_bundled_request(monkeypatch):
   default_url = dashcam_upload.decode_obfuscated(
     dashcam_upload.DASHCAM_DEFAULT_DISCORD_WEBHOOK,
@@ -71,6 +129,32 @@ def test_dashcam_completion_send_rechecks_consent_before_bundled_request(monkeyp
 
   assert result["ok"] is False
   assert result["skipped"] is True
+  assert result["disabled_by_community_sharing"] is True
+
+
+def test_dashcam_bundled_notification_rejects_previous_community_generation(monkeypatch):
+  default_url = dashcam_upload.decode_obfuscated(
+    dashcam_upload.DASHCAM_DEFAULT_DISCORD_WEBHOOK,
+    dashcam_upload.DASHCAM_DEFAULT_DISCORD_KEY,
+  )
+  monkeypatch.setattr(
+    dashcam_upload,
+    "community_data_sharing_generation_matches",
+    lambda expected, _params=None: expected == "community-2",
+  )
+  monkeypatch.setattr(
+    dashcam_upload,
+    "ClientSession",
+    lambda *_args, **_kwargs: pytest.fail("stale bundled notification must not open the network"),
+  )
+
+  result = asyncio.run(dashcam_upload.send_discord_webhook(
+    default_url,
+    {},
+    community_generation="community-1",
+  ))
+
+  assert result["ok"] is False
   assert result["disabled_by_community_sharing"] is True
 
 
@@ -107,6 +191,25 @@ def test_custom_vision_webhook_remains_independent(monkeypatch):
   assert vision_diag.vision_diag_discord_webhook_url(None) == "https://operator.example/vision"
 
 
+def test_master_off_blocks_custom_vision_bundle_before_collection(monkeypatch):
+  monkeypatch.setattr(vision_diag, "third_party_data_sharing_generation", lambda _params=None: None)
+  monkeypatch.setattr(
+    vision_diag,
+    "third_party_data_sharing_generation_matches",
+    lambda *_args, **_kwargs: False,
+  )
+  monkeypatch.setattr(
+    vision_diag,
+    "get_server_diagnostic_snapshot",
+    lambda: pytest.fail("diagnostic data must not be collected while the master is OFF"),
+  )
+
+  result = asyncio.run(vision_diag.upload_diagnostic_bundle_to_discord(bundle_text="diagnostic"))
+
+  assert result["skipped"] is True
+  assert result["disabled_by_third_party_sharing"] is True
+
+
 def test_vision_send_rechecks_consent_before_bundled_request(monkeypatch):
   default_url = vision_diag._decode_obfuscated(
     vision_diag.VISION_DIAG_DEFAULT_DISCORD_WEBHOOK,
@@ -120,6 +223,33 @@ def test_vision_send_rechecks_consent_before_bundled_request(monkeypatch):
 
   assert result["ok"] is False
   assert result["skipped"] is True
+  assert result["disabled_by_community_sharing"] is True
+
+
+def test_vision_bundled_notification_rejects_previous_community_generation(monkeypatch):
+  default_url = vision_diag._decode_obfuscated(
+    vision_diag.VISION_DIAG_DEFAULT_DISCORD_WEBHOOK,
+    vision_diag.VISION_DIAG_DEFAULT_DISCORD_KEY,
+  )
+  monkeypatch.setattr(vision_diag, "HAS_PARAMS", False)
+  monkeypatch.setattr(vision_diag, "vision_diag_discord_webhook_url", lambda _params=None: default_url)
+  monkeypatch.setattr(
+    vision_diag,
+    "community_data_sharing_generation_matches",
+    lambda expected, _params=None: expected == "community-2",
+  )
+  monkeypatch.setattr(
+    vision_diag,
+    "get_server_diagnostic_snapshot",
+    lambda: pytest.fail("stale consent must stop diagnostic collection"),
+  )
+
+  result = asyncio.run(vision_diag.upload_diagnostic_bundle_to_discord(
+    bundle_text="diagnostic",
+    community_generation="community-1",
+  ))
+
+  assert result["ok"] is False
   assert result["disabled_by_community_sharing"] is True
 
 
@@ -148,9 +278,24 @@ def test_vision_revocation_during_bundle_preparation_blocks_post(monkeypatch):
 def test_support_revocation_during_message_preparation_blocks_post(monkeypatch):
   monkeypatch.delenv("CARROT_SUPPORT_DISCORD_WEBHOOK_DISABLE", raising=False)
   default_url = support_discord._decode_obfuscated_webhook_url()
-  decisions = iter((True, False))
   monkeypatch.setattr(support_discord, "support_discord_webhook_url", lambda: default_url)
-  monkeypatch.setattr(support_discord, "community_data_sharing_enabled", lambda: next(decisions))
+  state = {"generation": "community-1"}
+  monkeypatch.setattr(
+    support_discord,
+    "community_data_sharing_generation",
+    lambda _params=None: state["generation"],
+  )
+
+  def exact_community_match(expected, _params=None):
+    matched = expected == state["generation"]
+    state["generation"] = "community-2"
+    return matched
+
+  monkeypatch.setattr(
+    support_discord,
+    "community_data_sharing_generation_matches",
+    exact_community_match,
+  )
 
   result = asyncio.run(support_discord.send_support_webhook(None, {}))
 

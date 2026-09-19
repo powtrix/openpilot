@@ -18,9 +18,55 @@ from openpilot.selfdrive.carrot.server.services import dashcam_upload_report
 from openpilot.selfdrive.carrot.server.services import web_settings
 
 
+@pytest.fixture(autouse=True)
+def enabled_third_party_upload_consent(monkeypatch):
+  """Most legacy upload tests exercise transport details with consent ON."""
+  generation = "test-master-generation"
+  monkeypatch.setattr(upload_jobs, "third_party_data_sharing_generation", lambda _params=None: generation)
+  monkeypatch.setattr(
+    upload_jobs,
+    "third_party_data_sharing_generation_matches",
+    lambda expected, _params=None: expected == generation,
+  )
+  monkeypatch.setattr(dashcam_routes, "third_party_data_sharing_generation", lambda _params=None: generation)
+  monkeypatch.setattr(
+    dashcam_routes,
+    "third_party_data_sharing_generation_matches",
+    lambda expected, _params=None: expected == generation,
+  )
+
+
 def clear_upload_env(monkeypatch):
   for key in ("CARROT_WEB_UPLOAD_URL", "CARROT_WEB_UPLOAD_TOKEN", "CARROT_TMUX_WEB_UPLOAD_URL"):
     monkeypatch.delenv(key, raising=False)
+
+
+def test_manual_upload_api_binds_job_to_request_consent_generation(monkeypatch):
+  class Request:
+    async def json(self):
+      return {"segments": ["route--0"]}
+
+  captured = {}
+
+  async def selected_segments(_request):
+    return ["route--0"]
+
+  def create_job(segments, *, run_options):
+    captured.update({"segments": segments, "run_options": run_options})
+    return {"id": "job", "status": "running", "segments": segments}
+
+  monkeypatch.setattr(dashcam_routes, "request_upload_segments", selected_segments)
+  monkeypatch.setattr(upload_jobs, "running_job", lambda: None)
+  monkeypatch.setattr(upload_jobs, "create_job", create_job)
+  monkeypatch.setattr(upload_jobs, "start_job", lambda _job: None)
+
+  response = asyncio.run(dashcam_routes.api_dashcam_upload_start(Request()))
+
+  assert response.status == 200
+  assert captured == {
+    "segments": ["route--0"],
+    "run_options": {"consent_generation": "test-master-generation"},
+  }
 
 
 @pytest.mark.parametrize("base_url", [
@@ -260,7 +306,7 @@ def test_carrot_man_sends_diagnostics_to_dsm_and_carrot_logs():
   assert "def send_tmux_carrot_logs(" in carrot_man
   assert 'self.send_tmux_carrot_logs( "onroad", send_settings=True, consent_generation=onroad_tmux_generation' in normalized
   assert "self.send_tmux_carrot_logs( pending_tmux_reason, send_settings=False, consent_generation=pending_tmux_generation" in normalized
-  assert 'self.send_tmux_carrot_logs("tmux_send")' in carrot_man
+  assert 'self.send_tmux_carrot_logs( "tmux_send", master_generation=master_generation' in normalized
   assert "using tmux web fallback" not in carrot_man
 
 
@@ -364,11 +410,13 @@ def test_dashcam_upload_completion_notifies_web_server_and_discord(monkeypatch):
       on_progress("rlog.zst", 34, 34, 34)
     return True
 
-  async def fake_web_complete(base_url, token, payload):
+  async def fake_web_complete(base_url, token, payload, request_allowed=None):
+    assert request_allowed is not None and request_allowed()
     notifications.append(("web", base_url, token, payload["results"][0]["segment"]))
     return {"ok": True, "status": 200}
 
-  async def fake_discord(webhook_url, payload):
+  async def fake_discord(webhook_url, payload, **kwargs):
+    assert kwargs["consent_generation"] == "test-master-generation"
     notifications.append(("discord", webhook_url, payload["shareText"]))
     return {"configured": True, "ok": True, "status": 204}
 
@@ -428,6 +476,62 @@ def test_dashcam_upload_completion_notifies_web_server_and_discord(monkeypatch):
     item["phase"] == "preparing" and 0 < item["progress"] <= upload_jobs.UPLOAD_PREPARING_END_PERCENT
     for item in progress_snapshots
   )
+
+
+def test_manual_upload_revocation_and_off_on_aba_cancel_before_completion(monkeypatch):
+  segment = "00000cfb--69588de3d7--10"
+  state = {"generation": "generation-1"}
+
+  monkeypatch.setattr(
+    upload_jobs,
+    "third_party_data_sharing_generation",
+    lambda _params=None: state["generation"],
+  )
+  monkeypatch.setattr(
+    upload_jobs,
+    "third_party_data_sharing_generation_matches",
+    lambda expected, _params=None: expected is not None and state["generation"] == expected,
+  )
+  monkeypatch.setattr(upload_jobs, "HAS_PARAMS", False)
+  monkeypatch.setattr(upload, "upload_target_settings", lambda: ("https://upload.example", "session-token"))
+  monkeypatch.setattr(upload, "upload_metadata", lambda _params: {
+    "carName": "TEST_CAR",
+    "dongleId": "0123456789abcdef",
+  })
+  monkeypatch.setattr(upload_jobs, "segment_dir", lambda _value: "/tmp/segment")
+  monkeypatch.setattr(upload_jobs, "segment_file_summary", lambda _value: [
+    {"kind": "rlog", "name": "rlog.zst", "size": 128},
+  ])
+
+  async def revoke_during_upload(*_args, **kwargs):
+    should_cancel = kwargs["should_cancel"] if "should_cancel" in kwargs else _args[5]
+    assert should_cancel() is False
+    state["generation"] = None
+    state["generation"] = "generation-2"
+    assert should_cancel() is True
+    raise RuntimeError("upload canceled")
+
+  async def forbidden_completion(*_args, **_kwargs):
+    pytest.fail("completion request must not run after consent ABA")
+
+  async def forbidden_discord(*_args, **_kwargs):
+    pytest.fail("Discord request must not run after consent ABA")
+
+  monkeypatch.setattr(upload_jobs, "upload_folder_to_web", revoke_during_upload)
+  monkeypatch.setattr(upload_jobs, "send_web_upload_complete", forbidden_completion)
+  monkeypatch.setattr(upload, "send_discord_webhook", forbidden_discord)
+
+  upload_jobs.jobs().clear()
+  job = upload_jobs.create_job(
+    [segment],
+    run_options={"consent_generation": "generation-1"},
+  )
+  asyncio.run(upload_jobs.run_job(job))
+
+  assert job["status"] == "canceled"
+  assert job["result"]["canceled"] is True
+  assert "consent changed" in job["result"]["error"]
+  upload_jobs.jobs().clear()
   upload_jobs.jobs().clear()
 
 
@@ -511,6 +615,52 @@ def test_validation_upload_serializes_segments_even_with_parallel_override(monke
   assert result["discord"]["skipped"] is True
   assert upload_tokens == issued_sessions[:-1]
   assert len(issued_sessions) == len(segments) + 1
+
+
+def test_validation_upload_remains_independent_of_third_party_master(monkeypatch):
+  segment = "00000cfb--69588de3d7--0"
+  manifest = [{"segment": segment, "name": "rlog.zst", "size": 8, "sha256": "a" * 64}]
+
+  monkeypatch.setattr(
+    upload_jobs,
+    "third_party_data_sharing_generation_matches",
+    lambda *_args, **_kwargs: pytest.fail("validation must not consult the third-party master"),
+  )
+  monkeypatch.setattr(upload_jobs, "HAS_PARAMS", False)
+  monkeypatch.setattr(upload, "upload_target_settings", lambda: (web_upload.DK_VALIDATION_UPLOAD_ORIGIN, ""))
+  monkeypatch.setattr(upload, "upload_metadata", lambda _params: {"carName": "KA4", "dongleId": "device"})
+  monkeypatch.setattr(upload, "upload_share_text", lambda _payload: "unused")
+  monkeypatch.setattr(upload_jobs, "segment_dir", lambda _segment: "/tmp/segment")
+  monkeypatch.setattr(
+    upload_jobs,
+    "segment_file_summary",
+    lambda _path, **_kwargs: [{"kind": "rlog", "name": "rlog.zst", "size": 8}],
+  )
+
+  async def fake_session(*_args, **_kwargs):
+    return "validation-token"
+
+  async def fake_upload(*_args, **_kwargs):
+    return True
+
+  async def fake_complete(_base_url, _token, payload, **_kwargs):
+    return {"status": 200, **durable_validation_receipt(payload)}
+
+  monkeypatch.setattr(upload_jobs, "create_validation_upload_session", fake_session)
+  monkeypatch.setattr(upload_jobs, "upload_validation_folder_to_web", fake_upload)
+  monkeypatch.setattr(upload_jobs, "send_validation_upload_complete", fake_complete)
+
+  result = asyncio.run(upload_jobs.run_upload_segments(
+    [segment],
+    artifact_kinds={"rlog"},
+    notify_discord=False,
+    safety_check=lambda: True,
+    validation_capture_id="capture",
+    validation_files=manifest,
+  ))
+
+  assert result["ok"] is True
+  assert result["webComplete"]["ok"] is True
 
 
 def test_validation_upload_refreshes_rejected_file_and_completion_sessions(monkeypatch):
@@ -679,8 +829,8 @@ def test_sync_session_is_issued_automatically_from_device_metadata():
     def json():
       return {"ok": True, "token": "short-lived-session"}
 
-  def fake_post(url, *, json, timeout):
-    captured.update({"url": url, "json": json, "timeout": timeout})
+  def fake_post(url, *, json, timeout, allow_redirects):
+    captured.update({"url": url, "json": json, "timeout": timeout, "allow_redirects": allow_redirects})
     return Response()
 
   token = web_upload.create_web_upload_session_sync(
@@ -698,6 +848,7 @@ def test_sync_session_is_issued_automatically_from_device_metadata():
       "purpose": "tmux",
     },
     "timeout": 12,
+    "allow_redirects": False,
   }
 
 
@@ -740,7 +891,8 @@ def test_async_session_is_issued_automatically(monkeypatch):
     async def __aexit__(self, exc_type, exc, tb):
       return False
 
-    def post(self, url, *, json):
+    def post(self, url, *, json, allow_redirects):
+      assert allow_redirects is False
       captured.update({"url": url, "json": json})
       return Context()
 
@@ -760,8 +912,15 @@ def test_tmux_web_post_sends_multipart_and_closes_files(tmp_path: Path):
   settings_path.write_bytes(b'{"enabled": true}')
   captured = {}
 
-  def fake_post(url, *, headers, data, files, timeout):
-    captured.update({"url": url, "headers": headers, "data": data, "files": files, "timeout": timeout})
+  def fake_post(url, *, headers, data, files, timeout, allow_redirects):
+    captured.update({
+      "url": url,
+      "headers": headers,
+      "data": data,
+      "files": files,
+      "timeout": timeout,
+      "allow_redirects": allow_redirects,
+    })
     captured["contents"] = [item[1][1].read() for item in files]
     return "response"
 
@@ -780,6 +939,7 @@ def test_tmux_web_post_sends_multipart_and_closes_files(tmp_path: Path):
   assert [item[0] for item in captured["files"]] == ["files[0]", "files[1]"]
   assert captured["contents"] == [b"tmux-data", b'{"enabled": true}']
   assert captured["timeout"] == 30
+  assert captured["allow_redirects"] is False
   assert all(item[1][1].closed for item in captured["files"])
 
 
@@ -807,8 +967,9 @@ def test_tmux_web_guard_stops_stream_after_mid_file_revocation(tmp_path: Path):
   state = {"allowed": True}
   opened_files = []
 
-  def fake_post(url, *, headers, data, timeout):
+  def fake_post(url, *, headers, data, timeout, allow_redirects):
     del url, headers, timeout
+    assert allow_redirects is False
     opened_files.extend(segment for segment in data._segments if hasattr(segment, "read"))
     sent_file_chunks = 0
     for chunk in data:
@@ -828,6 +989,45 @@ def test_tmux_web_guard_stops_stream_after_mid_file_revocation(tmp_path: Path):
     )
 
   assert opened_files and all(fileobj.closed for fileobj in opened_files)
+
+
+def test_tmux_web_guard_rechecks_generation_after_response(tmp_path: Path):
+  tmux_path = tmp_path / "tmux.log"
+  tmux_path.write_bytes(b"tmux-data")
+  state = {"generation": "generation-1"}
+
+  def fake_post(_url, *, data, allow_redirects, **_kwargs):
+    assert allow_redirects is False
+    list(data)
+    state["generation"] = "generation-2"
+    return object()
+
+  with pytest.raises(PermissionError, match="no longer allowed"):
+    web_upload.post_tmux_web(
+      "https://upload.example/api/v1/tmux/upload",
+      {},
+      {"tmux_why": "exception"},
+      str(tmux_path),
+      post=fake_post,
+      request_allowed=lambda: state["generation"] == "generation-1",
+    )
+
+
+def test_guarded_bytes_body_rejects_off_on_aba_between_chunks():
+  state = {"generation": "generation-1"}
+  body = web_upload.GuardedBytesBody(
+    b"x" * (web_upload.GUARDED_MULTIPART_CHUNK_SIZE + 1),
+    lambda: state["generation"] == "generation-1",
+  )
+
+  assert body.read(web_upload.GUARDED_MULTIPART_CHUNK_SIZE) == (
+    b"x" * web_upload.GUARDED_MULTIPART_CHUNK_SIZE
+  )
+  state["generation"] = None
+  state["generation"] = "generation-2"
+
+  with pytest.raises(PermissionError, match="no longer allowed"):
+    body.read(web_upload.GUARDED_MULTIPART_CHUNK_SIZE)
 
 
 def test_web_settings_migrate_previous_upload_keys():
@@ -893,8 +1093,8 @@ class FakeHealthSession:
   async def __aexit__(self, exc_type, exc, tb):
     return False
 
-  def get(self, url, *, headers):
-    type(self).requests.append((url, headers))
+  def get(self, url, *, headers, allow_redirects):
+    type(self).requests.append((url, headers, allow_redirects))
     return FakeCompleteRequestContext(type(self).response)
 
 
@@ -916,11 +1116,12 @@ def test_web_upload_health_preserves_safe_receiver_capabilities(monkeypatch):
   assert result["deviceAllowlistConfigured"] is True
   assert result["legacyUploadsEnabled"] is False
   assert "privateDetail" not in result
-  assert FakeHealthSession.requests == [("https://upload.example/api/v1/health", {})]
+  assert FakeHealthSession.requests == [("https://upload.example/api/v1/health", {}, False)]
 
 
 def test_dashcam_upload_test_accepts_healthy_validation_only_receiver(monkeypatch):
-  async def fake_health(_base_url, _token):
+  async def fake_health(_base_url, _token, request_allowed):
+    assert request_allowed()
     return {
       "ok": True,
       "status": 200,
@@ -978,8 +1179,8 @@ class FakeCompleteSession:
   async def __aexit__(self, exc_type, exc, tb):
     return False
 
-  def post(self, url, *, json, headers):
-    type(self).requests.append((url, json, headers))
+  def post(self, url, *, json, headers, allow_redirects):
+    type(self).requests.append((url, json, headers, allow_redirects))
     return FakeCompleteRequestContext(type(self).response)
 
 
@@ -1025,6 +1226,7 @@ def test_web_upload_complete_preserves_success_receipt_fields(monkeypatch):
     "https://upload.example/api/v1/complete",
     {"results": [{"segment": "route--0"}]},
     {"Authorization": "Bearer token"},
+    False,
   )]
 
 
@@ -1080,7 +1282,8 @@ class FakeSession:
   async def __aexit__(self, exc_type, exc, tb):
     return False
 
-  def put(self, url, data, headers=None):
+  def put(self, url, data, headers=None, allow_redirects=True):
+    assert allow_redirects is False
     return FakeRequestContext(self, url, data, headers or {})
 
 

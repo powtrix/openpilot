@@ -15,6 +15,7 @@ from ...community_data import (
   community_data_sharing_generation,
   community_data_sharing_generation_matches,
 )
+from ...web_upload import guarded_async_bytes
 from .params import HAS_PARAMS, Params, get_param_values, infer_type_from_setting
 from .settings import get_settings_cached
 
@@ -365,15 +366,21 @@ async def _post_snapshot(
     return False, 0, "community data sharing disabled"
   encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
-  async def guarded_body():
-    if not community_data_sharing_generation_matches(consent_generation, params):
-      raise PermissionError("community data sharing consent changed")
-    yield encoded_payload
+  def request_allowed() -> bool:
+    return community_data_sharing_generation_matches(consent_generation, params)
 
   try:
     request_headers = {**headers, "Content-Type": "application/json", "Content-Length": str(len(encoded_payload))}
-    async with session.post(url, data=guarded_body(), timeout=timeout_s, headers=request_headers) as resp:
+    async with session.post(
+      url,
+      data=guarded_async_bytes(encoded_payload, request_allowed),
+      timeout=timeout_s,
+      headers=request_headers,
+      allow_redirects=False,
+    ) as resp:
       text = await resp.text()
+      if not request_allowed():
+        return False, 0, "community data sharing consent changed"
       return 200 <= resp.status < 300, int(resp.status), text
   except Exception as exc:
     return False, 0, str(exc)
@@ -401,8 +408,11 @@ async def download_popular_values_once(session: ClientSession) -> dict[str, Any]
       params={"car_key_type": "CarSelected3", "car_key": car_key, "settings_hash": settings_hash},
       timeout=timeout_s,
       headers=_request_headers(params),
+      allow_redirects=False,
     ) as resp:
       data = await resp.json(content_type=None)
+      if not community_data_sharing_generation_matches(consent_generation, params):
+        return None
       if resp.status < 200 or resp.status >= 300 or not isinstance(data, dict):
         print(f"[carrot_param_value] popular download failed status={resp.status}", flush=True)
         return None

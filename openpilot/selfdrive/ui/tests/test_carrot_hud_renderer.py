@@ -672,11 +672,12 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
   assert renderer._dk_deployment_text == "0913 감속"
 
 
-def test_city_return_release_label_is_below_date_at_unchanged_size(hud_module, monkeypatch):
+@pytest.mark.parametrize("release_label", ["0917 브레이크게이지/핸들복원로그", "0920 코너/조향 개선"])
+def test_city_return_release_label_is_below_date_at_unchanged_size(hud_module, monkeypatch, release_label):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)
   renderer._show_date_time = 1
-  renderer._dk_deployment_text = "0917 브레이크게이지/핸들복원로그"
+  renderer._dk_deployment_text = release_label
   renderer._date_time_text = "19:00"
   renderer._date_text = "09-17(목)"
   renderer._font_display = object()
@@ -689,7 +690,7 @@ def test_city_return_release_label_is_below_date_at_unchanged_size(hud_module, m
   renderer._draw_date_time(module.rl.Rectangle(30, 20, 1500, 1000))
 
   clock, calendar, label = [args for args, _ in calls]
-  assert label[0] == "0917 브레이크게이지/핸들복원로그"
+  assert label[0] == release_label
   assert label[3] == pytest.approx(52.8)
   assert label[2] - 56 == calendar[2] + 20
   assert label[1] - 1000 / 2 == 30 + 8

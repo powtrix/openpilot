@@ -7,6 +7,7 @@ from openpilot.common.logging_extra import SwagLogFileFormatter
 from openpilot.system.hardware.hw import Paths
 from openpilot.common.swaglog import get_file_handler
 from openpilot.common.params import Params
+from openpilot.selfdrive.carrot.community_data import automatic_diagnostic_request
 
 
 def main() -> NoReturn:
@@ -33,7 +34,11 @@ def main() -> NoReturn:
       except Exception as e:
         print(f"decode error: {e}, skipping log")
         print(f"Raw bytes (hex): {raw_bytes.hex()[:200]}...")  # ?욌?遺꾨쭔 異쒕젰
-        Params().put("CarrotException", "log")
+        params = Params()
+        params.put(
+          "CarrotException",
+          automatic_diagnostic_request("log", params) or "log",
+        )
         continue
 
       if level >= log_level:

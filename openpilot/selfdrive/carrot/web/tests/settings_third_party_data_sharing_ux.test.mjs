@@ -41,7 +41,7 @@ test("the third-party master toggle requires its own 0-to-1 confirmation and con
   assert.match(source, /paramCommitOptions\.webConsent = true/);
   assert.match(
     source,
-    /third_party_data_sharing_enable_confirm[\s\S]{0,600}personal-NAS\/manual dashcam uploads, Git updates, and navigation\/maps remain independent/,
+    /third_party_data_sharing_enable_confirm[\s\S]{0,700}manually started personal-NAS, Discord, dashcam, or tmux transfers/,
   );
 });
 
@@ -63,25 +63,25 @@ test("cancelling the third-party consent restores the committed value without wr
   assert.deepEqual(events, ["confirm-third-party", ["restore", 0]]);
 });
 
-test("all supported languages disclose the third-party transfer scope and independent paths", async () => {
+test("all supported languages disclose the complete non-validation transfer scope", async () => {
   const requiredFragments = {
     en: [
       "Athena", "cloudlogs", "location", "rlog/qlog/qcamera", "remote SSH", "Prime/Firehose",
-      "Sentry", "stock uploader", "Carrot community sharing", "old Athena upload queue",
-      "KA4 validation", "private NAS", "personal-NAS", "dashcam uploads", "Git updates",
-      "online routing/maps", "remain independent", "mobile data", "not deleted automatically",
+      "Sentry", "stock uploader", "Carrot community", "Athena queue", "KA4 automatic validation",
+      "fixed DK private NAS", "personal-NAS", "dashcam", "tmux", "Git updates",
+      "online routing/maps", "non-log internet features", "mobile data", "not deleted automatically",
     ],
     ko: [
       "Athena", "cloudlog", "위치", "rlog/qlog/qcamera", "원격 SSH", "Prime/Firehose",
-      "Sentry", "stock uploader", "Carrot 커뮤니티 공유", "기존 Athena 업로드 큐",
-      "KA4 자동 검증", "고정 개인 NAS", "개인 NAS", "대시캠 전송", "Git 업데이트",
-      "온라인 길찾기·지도", "독립적으로", "테더링 데이터", "자동 삭제되지 않습니다",
+      "Sentry", "stock uploader", "Carrot 커뮤니티", "Athena 큐", "KA4 자동 검증",
+      "고정 DK 개인 NAS", "개인 NAS", "대시캠", "tmux", "Git 업데이트",
+      "온라인 길찾기·지도", "비로그 인터넷 기능", "테더링 데이터", "자동 삭제되지 않습니다",
     ],
     zh: [
       "Athena", "cloudlog", "位置", "rlog/qlog/qcamera", "远程 SSH", "Prime/Firehose",
-      "Sentry", "原生 uploader", "Carrot 社区共享", "旧 Athena 上传队列",
-      "KA4 自动验证", "固定私人 NAS", "个人 NAS", "行车日志上传", "Git 更新",
-      "在线路线/地图", "独立", "移动数据", "不会自动删除",
+      "Sentry", "原生 uploader", "Carrot 社区", "Athena 队列", "KA4 自动验证",
+      "固定 DK 私人 NAS", "个人 NAS", "行车日志", "tmux", "Git 更新",
+      "在线路线/地图", "非日志联网功能", "移动数据", "不会自动删除",
     ],
   };
 

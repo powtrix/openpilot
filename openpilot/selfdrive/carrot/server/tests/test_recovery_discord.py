@@ -1,6 +1,17 @@
 import json
+import pytest
 
 from openpilot.selfdrive.carrot.recovery import server as recovery
+
+
+@pytest.fixture(autouse=True)
+def enabled_master_consent(monkeypatch):
+  monkeypatch.setattr(recovery, "_third_party_data_sharing_generation", lambda: "master-generation")
+  monkeypatch.setattr(
+    recovery,
+    "_third_party_data_sharing_generation_matches",
+    lambda expected: expected == "master-generation",
+  )
 
 
 class _Response:
@@ -30,11 +41,19 @@ def test_recovery_tmux_discord_upload_attaches_log(monkeypatch, tmp_path):
   }.get(key, default))
 
   def fake_urlopen(request, timeout):
+    data = request.data
+    if hasattr(data, "read"):
+      chunks = []
+      while chunk := data.read(64 * 1024):
+        chunks.append(chunk)
+      request_capture["data"] = b"".join(chunks)
+    else:
+      request_capture["data"] = data
     request_capture["request"] = request
     request_capture["timeout"] = timeout
     return _Response()
 
-  monkeypatch.setattr(recovery.urllib.request, "urlopen", fake_urlopen)
+  monkeypatch.setattr(recovery, "_open_no_redirect", fake_urlopen)
 
   result = recovery._send_tmux_discord("tmux_send")
 
@@ -43,12 +62,13 @@ def test_recovery_tmux_discord_upload_attaches_log(monkeypatch, tmp_path):
   request = request_capture["request"]
   assert request.full_url == "https://discord.example/webhook"
   assert request.get_header("User-agent") == "CarrotRecovery/2.0"
-  assert b'name="files[0]"' in request.data
-  assert b"recovery tmux output" in request.data
-  assert b"tmux_send-" in request.data
-  payload_start = request.data.index(b'{"username"')
-  payload_end = request.data.index(b"\r\n", payload_start)
-  payload = json.loads(request.data[payload_start:payload_end])
+  sent_data = request_capture["data"]
+  assert b'name="files[0]"' in sent_data
+  assert b"recovery tmux output" in sent_data
+  assert b"tmux_send-" in sent_data
+  payload_start = sent_data.index(b'{"username"')
+  payload_end = sent_data.index(b"\r\n", payload_start)
+  payload = json.loads(sent_data[payload_start:payload_end])
   assert payload["username"] == "Carrot Exception"
   assert payload["flags"] == 4
 
@@ -56,7 +76,8 @@ def test_recovery_tmux_discord_upload_attaches_log(monkeypatch, tmp_path):
 def test_server_tmux_log_reports_actual_discord_result(monkeypatch):
   calls = []
   monkeypatch.setattr(recovery, "_capture_tmux_log", lambda: (0, ""))
-  monkeypatch.setattr(recovery, "_send_tmux_destinations", lambda reason: calls.append(reason) or {
+  monkeypatch.setattr(recovery, "_community_data_sharing_generation", lambda: "community-generation")
+  monkeypatch.setattr(recovery, "_send_tmux_destinations", lambda reason, **_kwargs: calls.append(reason) or {
     "ok": False,
     "partial": False,
     "destinations": {},
@@ -75,6 +96,34 @@ def test_server_tmux_log_reports_actual_discord_result(monkeypatch):
   }
 
 
+def test_recovery_server_tmux_request_cannot_resume_after_master_off_on_aba(monkeypatch):
+  state = {"generation": "master-generation"}
+  monkeypatch.setattr(recovery, "_third_party_data_sharing_generation", lambda: state["generation"])
+  monkeypatch.setattr(
+    recovery,
+    "_third_party_data_sharing_generation_matches",
+    lambda expected: expected == state["generation"],
+  )
+  monkeypatch.setattr(recovery, "_community_data_sharing_generation", lambda: "community-generation")
+
+  def capture_then_reenable():
+    state["generation"] = None
+    state["generation"] = "new-master-generation"
+    return 0, ""
+
+  monkeypatch.setattr(recovery, "_capture_tmux_log", capture_then_reenable)
+  monkeypatch.setattr(
+    recovery.Path,
+    "read_bytes",
+    lambda *_args, **_kwargs: pytest.fail("revoked request must not read the captured log"),
+  )
+
+  result = recovery._tool_action("server_tmux_log", {})
+
+  assert result["ok"] is False
+  assert result["disabled_by_third_party_sharing"] is True
+
+
 def test_recovery_tmux_sends_to_all_main_server_destinations(monkeypatch, tmp_path):
   tmux_log = tmp_path / "tmux.log"
   tmux_log.write_bytes(b"tmux-data")
@@ -83,13 +132,21 @@ def test_recovery_tmux_sends_to_all_main_server_destinations(monkeypatch, tmp_pa
 
   monkeypatch.setattr(recovery, "TMUX_LOG_PATH", str(tmux_log))
   monkeypatch.setattr(recovery, "_tmux_upload_payload", lambda reason: payload)
-  monkeypatch.setattr(recovery, "_send_tmux_dsm", lambda sent_payload, raw: calls.append(("dsm", sent_payload, raw)) or {"ok": True, "status": 200})
+  monkeypatch.setattr(
+    recovery,
+    "_send_tmux_dsm",
+    lambda sent_payload, raw, _master: calls.append(("dsm", sent_payload, raw)) or {"ok": True, "status": 200},
+  )
   monkeypatch.setattr(
     recovery,
     "_send_tmux_carrot_logs",
-    lambda sent_payload, raw: calls.append(("carrot_logs", sent_payload, raw)) or {"ok": True, "status": 200},
+    lambda sent_payload, raw, _master, _community: calls.append(("carrot_logs", sent_payload, raw)) or {"ok": True, "status": 200},
   )
-  monkeypatch.setattr(recovery, "_send_tmux_discord", lambda reason, raw, web: calls.append(("discord", reason, raw, web)) or {"ok": True, "status": 204})
+  monkeypatch.setattr(
+    recovery,
+    "_send_tmux_discord",
+    lambda reason, raw, web, _master, _community: calls.append(("discord", reason, raw, web)) or {"ok": True, "status": 204},
+  )
 
   result = recovery._send_tmux_destinations("tmux_send")
 
@@ -109,12 +166,12 @@ def test_recovery_dsm_upload_uses_automatic_session(monkeypatch):
 
   monkeypatch.delenv("CARROT_WEB_UPLOAD_TOKEN", raising=False)
   monkeypatch.setattr(recovery, "_web_upload_base_url", lambda: "https://upload.example")
-  monkeypatch.setattr(recovery, "_post_json", lambda url, body: calls.append(("session", url, body)) or {
+  monkeypatch.setattr(recovery, "_post_json", lambda url, body, **_kwargs: calls.append(("session", url, body)) or {
     "ok": True,
     "status": 200,
     "body": {"ok": True, "token": "session-token"},
   })
-  monkeypatch.setattr(recovery, "_post_tmux_upload", lambda url, headers, body, raw: calls.append(("upload", url, headers, body, raw)) or {
+  monkeypatch.setattr(recovery, "_post_tmux_upload", lambda url, headers, body, raw, _allowed: calls.append(("upload", url, headers, body, raw)) or {
     "ok": True,
     "status": 200,
   })
@@ -167,6 +224,122 @@ def test_recovery_custom_discord_destinations_remain_independent(monkeypatch):
 
   assert recovery._exception_webhook_url() == "https://operator.example/exception"
   assert recovery._support_webhook_url() == "https://operator.example/support"
+
+
+def test_recovery_bundled_support_notification_requires_exact_community_generation(monkeypatch):
+  default_url = recovery._default_support_webhook_url()
+  monkeypatch.setattr(recovery, "_support_webhook_url", lambda: default_url)
+  monkeypatch.setattr(recovery, "_community_data_sharing_generation", lambda: "community-1")
+  monkeypatch.setattr(
+    recovery,
+    "_community_data_sharing_generation_matches",
+    lambda expected: expected == "community-2",
+  )
+  monkeypatch.setattr(
+    recovery,
+    "_open_no_redirect",
+    lambda *_args, **_kwargs: pytest.fail("bundled notification must be blocked before network"),
+  )
+
+  result = recovery._send_support_webhook({})
+
+  assert result["ok"] is False
+  assert result["skipped"] is True
+  assert result["disabled_by_community_sharing"] is True
+
+
+def test_recovery_master_off_blocks_manual_tmux_before_log_read(monkeypatch):
+  monkeypatch.setattr(recovery, "_third_party_data_sharing_generation", lambda: None)
+  monkeypatch.setattr(
+    recovery,
+    "_third_party_data_sharing_generation_matches",
+    lambda *_args: False,
+  )
+  monkeypatch.setattr(
+    recovery.Path,
+    "read_bytes",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tmux log must not be read")),
+  )
+
+  result = recovery._send_tmux_destinations("tmux_send")
+
+  assert result["ok"] is False
+  assert result["disabled_by_third_party_sharing"] is True
+
+
+def test_recovery_guarded_body_rejects_master_off_on_aba(monkeypatch):
+  state = {"generation": "generation-1"}
+  monkeypatch.setattr(recovery, "_third_party_data_sharing_generation", lambda: state["generation"])
+  body = recovery._ConsentBoundBytes(
+    b"x" * (128 * 1024),
+    lambda: recovery._third_party_data_sharing_generation() == "generation-1",
+  )
+
+  assert body.read(64 * 1024) == b"x" * (64 * 1024)
+  state["generation"] = None
+  state["generation"] = "generation-2"
+
+  with pytest.raises(PermissionError, match="consent changed"):
+    body.read(64 * 1024)
+
+
+def test_recovery_guarded_bodies_cap_unbounded_reads_and_recheck_after_read(monkeypatch):
+  master_state = {"generation": "master-generation"}
+  community_state = {"generation": "community-generation"}
+  monkeypatch.setattr(recovery, "_third_party_data_sharing_generation", lambda: master_state["generation"])
+  monkeypatch.setattr(
+    recovery,
+    "_third_party_data_sharing_generation_matches",
+    lambda expected: expected == master_state["generation"],
+  )
+  monkeypatch.setattr(recovery, "_community_data_sharing_generation", lambda: community_state["generation"])
+  monkeypatch.setattr(
+    recovery,
+    "_community_data_sharing_generation_matches",
+    lambda expected: expected == community_state["generation"],
+  )
+
+  master_body = recovery._ConsentBoundBytes(
+    b"m" * (128 * 1024),
+    lambda: recovery._third_party_data_sharing_generation_matches("master-generation"),
+  )
+  community_body = recovery._CommunityConsentBoundBytes(
+    b"c" * (128 * 1024),
+    "community-generation",
+  )
+
+  assert master_body.read() == b"m" * (64 * 1024)
+  assert community_body.read() == b"c" * (64 * 1024)
+
+  master_state["generation"] = "new-master-generation"
+  community_state["generation"] = "new-community-generation"
+  with pytest.raises(PermissionError, match="consent changed"):
+    master_body.read()
+  with pytest.raises(PermissionError, match="consent changed"):
+    community_body.read()
+
+
+def test_recovery_sensitive_requests_install_no_redirect_handler(monkeypatch):
+  captured = {}
+
+  class Opener:
+    def open(self, request, timeout):
+      captured.update({"request": request, "timeout": timeout})
+      return _Response()
+
+  def build_opener(handler):
+    captured["handler"] = handler
+    return Opener()
+
+  monkeypatch.setattr(recovery.urllib.request, "build_opener", build_opener)
+  request = recovery.urllib.request.Request("https://upload.example/sensitive")
+
+  with recovery._open_no_redirect(request, 12):
+    pass
+
+  assert isinstance(captured["handler"], recovery._NoRedirectHandler)
+  assert captured["request"] is request
+  assert captured["timeout"] == 12
 
 
 def test_recovery_carrot_logs_revocation_blocks_final_network_call(monkeypatch):

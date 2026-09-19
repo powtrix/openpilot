@@ -24,6 +24,7 @@ from openpilot.common.realtime import Ratekeeper
 TESLA_DAS_ROAD_ADDRESS = 605
 TESLA_AUTOPILOT_PARTY_BUS = 2
 TESLA_DAS_ROAD_TIMEOUT_S = 1.0
+CONSENT_STREAM_CHUNK_SIZE = 64 * 1024
 
 
 class XiaogeDataBroadcaster:
@@ -80,7 +81,13 @@ class XiaogeDataBroadcaster:
       conn.sendall(struct.pack("!I", len(packet)))
       if not third_party_data_sharing_generation_matches(consent_generation, self.params):
         return False
-      conn.sendall(packet)
+      view = memoryview(packet)
+      for offset in range(0, len(view), CONSENT_STREAM_CHUNK_SIZE):
+        if not third_party_data_sharing_generation_matches(consent_generation, self.params):
+          return False
+        conn.sendall(view[offset:offset + CONSENT_STREAM_CHUNK_SIZE])
+        if not third_party_data_sharing_generation_matches(consent_generation, self.params):
+          return False
       return True
     except OSError:
       return False
@@ -101,6 +108,8 @@ class XiaogeDataBroadcaster:
           if not third_party_data_sharing_generation_matches(self.consent_generation, self.params):
             break
           conn.sendall(struct.pack("!I", 0))
+          if not third_party_data_sharing_generation_matches(self.consent_generation, self.params):
+            break
     except OSError:
       pass
     finally:

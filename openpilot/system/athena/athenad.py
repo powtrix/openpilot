@@ -382,6 +382,10 @@ def _do_upload(
   callback: Callable | None = None,
   consent_generation: str | None = None,
 ) -> requests.Response:
+  if consent_generation is None:
+    consent_generation = active_consent_generation or third_party_data_sharing_generation()
+  if consent_generation is None:
+    raise AbortTransferException("automatic third-party data sharing is disabled")
   _require_third_party_data_sharing(consent_generation=consent_generation)
   path = upload_item.path
   compress = False
@@ -397,13 +401,22 @@ def _do_upload(
   try:
     stream, content_length = get_upload_stream(path, compress)
     _require_third_party_data_sharing(consent_generation=consent_generation)
-    guarded_callback = callback or (
-      lambda _size, _current: _require_third_party_data_sharing(consent_generation=consent_generation)
-    )
+    def guarded_callback(*args) -> None:
+      _require_third_party_data_sharing(consent_generation=consent_generation)
+      if callback is not None:
+        callback(*args)
+
+    _require_third_party_data_sharing(consent_generation=consent_generation)
     response = UPLOAD_SESS.put(upload_item.url,
                                data=CallbackReader(stream, guarded_callback, content_length),
                                headers={**upload_item.headers, 'Content-Length': str(content_length)},
-                               timeout=30)
+                               timeout=30,
+                               allow_redirects=False)
+    try:
+      _require_third_party_data_sharing(consent_generation=consent_generation)
+    except Exception:
+      response.close()
+      raise
     return response
   finally:
     if stream:
@@ -581,7 +594,8 @@ def startLocalProxy(
     _require_third_party_data_sharing(consent_generation=consent_generation)
     ws = create_connection(remote_ws_uri,
                            cookie="jwt=" + identity_token,
-                           enable_multithread=True)
+                           enable_multithread=True,
+                           redirect_limit=0)
     try:
       _require_third_party_data_sharing(consent_generation=consent_generation)
     except Exception:
@@ -994,7 +1008,8 @@ def main(exit_event: threading.Event | None = None):
       ws = create_connection(ws_uri,
                              cookie="jwt=" + api.get_token(),
                              enable_multithread=True,
-                             timeout=30.0)
+                             timeout=30.0,
+                             redirect_limit=0)
       try:
         _require_third_party_data_sharing(params, consent_generation)
       except Exception:

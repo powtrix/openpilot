@@ -76,6 +76,33 @@ def vision_payload(**overrides) -> bytes:
   return json.dumps(data).encode()
 
 
+def test_http_response_stops_between_bounded_chunks_after_consent_revoke():
+  handler = object.__new__(v_asm_server.Handler)
+  sharing_allowed = True
+  writes = []
+
+  class FakeService:
+    @staticmethod
+    def data_sharing_allowed():
+      return sharing_allowed
+
+  class FakeWriter:
+    @staticmethod
+    def write(data):
+      nonlocal sharing_allowed
+      writes.append(bytes(data))
+      sharing_allowed = False
+
+  handler.service = FakeService()
+  handler.wfile = FakeWriter()
+  handler.close_connection = False
+  body = b"x" * (v_asm_server.CONSENT_STREAM_CHUNK_SIZE * 2 + 1)
+  assert not handler._write_guarded(body)
+  assert len(writes) == 1
+  assert len(writes[0]) == v_asm_server.CONSENT_STREAM_CHUNK_SIZE
+  assert handler.close_connection
+
+
 def test_vision_payload_validation():
   result = parse_xiaoge_vision_payload(vision_payload())
   assert result.left_lane == 0

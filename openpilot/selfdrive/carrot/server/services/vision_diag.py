@@ -13,9 +13,18 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from aiohttp import ClientSession, ClientTimeout, FormData
+from aiohttp import ClientSession, ClientTimeout
 
-from openpilot.selfdrive.carrot.community_data import community_data_sharing_enabled
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
+from openpilot.selfdrive.carrot.community_data import (
+  community_data_sharing_enabled,
+  community_data_sharing_generation,
+  community_data_sharing_generation_matches,
+)
+from openpilot.selfdrive.carrot.web_upload import GuardedMultipartBody
 
 from ..config import VISION_DIAG_DEFAULT_DISCORD_KEY, VISION_DIAG_DEFAULT_DISCORD_WEBHOOK
 from .params import HAS_PARAMS, Params
@@ -34,6 +43,7 @@ JOURNAL_LINE_LIMIT = 240
 PROC_NET_LINE_LIMIT = 320
 VISION_TEST_LOG_LINE_LIMIT = 240
 DISCORD_FILE_MAX_BYTES = 8 * 1024 * 1024
+_CONSENT_GENERATION_UNSET = object()
 
 _STREAM_PROXY_HISTORY: deque[dict[str, Any]] = deque(maxlen=STREAM_PROXY_HISTORY_LIMIT)
 _STREAM_PROXY_HISTORY_LOCK = threading.Lock()
@@ -411,8 +421,23 @@ async def upload_diagnostic_bundle_to_discord(
   console_text: str = "",
   console_filename: str | None = None,
   source: str = "web",
+  consent_generation: Any = _CONSENT_GENERATION_UNSET,
+  community_generation: Any = _CONSENT_GENERATION_UNSET,
 ) -> dict[str, Any]:
   params = Params() if HAS_PARAMS else None
+  if consent_generation is _CONSENT_GENERATION_UNSET:
+    consent_generation = third_party_data_sharing_generation(params)
+
+  def master_request_allowed() -> bool:
+    return third_party_data_sharing_generation_matches(consent_generation, params)
+
+  if not master_request_allowed():
+    return {
+      "configured": False,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_third_party_sharing": True,
+    }
   url = vision_diag_discord_webhook_url(params)
   if not url:
     return {"configured": False, "ok": False, "skipped": True}
@@ -420,13 +445,29 @@ async def upload_diagnostic_bundle_to_discord(
     return {"configured": True, "ok": False, "error": "invalid webhook url"}
 
   default_url = _decode_obfuscated(VISION_DIAG_DEFAULT_DISCORD_WEBHOOK, VISION_DIAG_DEFAULT_DISCORD_KEY)
-  if url == default_url and not community_data_sharing_enabled(params):
-    return {
-      "configured": True,
-      "ok": False,
-      "skipped": True,
-      "disabled_by_community_sharing": True,
-    }
+  requires_community_consent = url == default_url
+  if community_generation is _CONSENT_GENERATION_UNSET:
+    community_generation = community_data_sharing_generation(params)
+
+  def request_allowed() -> bool:
+    return (
+      master_request_allowed()
+      and (
+        not requires_community_consent
+        or community_data_sharing_generation_matches(community_generation, params)
+      )
+    )
+
+  def blocked_result() -> dict[str, Any]:
+    reason = (
+      "disabled_by_community_sharing"
+      if master_request_allowed() and requires_community_consent
+      else "disabled_by_third_party_sharing"
+    )
+    return {"configured": True, "ok": False, "skipped": True, reason: True}
+
+  if not request_allowed():
+    return blocked_result()
 
   snapshot = await asyncio.to_thread(get_server_diagnostic_snapshot)
   meta = _diagnostic_metadata(params)
@@ -460,24 +501,32 @@ async def upload_diagnostic_bundle_to_discord(
     "flags": 4,
   }
 
-  form = FormData()
-  form.add_field("payload_json", json.dumps(payload, ensure_ascii=False), content_type="application/json")
-  form.add_field("files[0]", upload_bytes, filename=upload_name, content_type="text/plain; charset=utf-8")
+  files = [("files[0]", (upload_name, upload_bytes, "text/plain; charset=utf-8"))]
   if console_upload_bytes:
-    form.add_field("files[1]", console_upload_bytes, filename=console_upload_name, content_type="text/plain; charset=utf-8")
+    files.append(("files[1]", (console_upload_name, console_upload_bytes, "text/plain; charset=utf-8")))
+  form = GuardedMultipartBody(
+    {"payload_json": json.dumps(payload, ensure_ascii=False)},
+    files,
+    request_allowed,
+  )
 
   try:
     timeout = ClientTimeout(total=20)
     async with ClientSession(timeout=timeout) as session:
-      if url == default_url and not community_data_sharing_enabled(params):
-        return {
-          "configured": True,
-          "ok": False,
-          "skipped": True,
-          "disabled_by_community_sharing": True,
-        }
-      async with session.post(url, data=form) as resp:
+      if not request_allowed():
+        return blocked_result()
+      async with session.post(
+        url,
+        data=form,
+        headers={
+          "Content-Type": form.content_type,
+          "Content-Length": str(form.content_length),
+        },
+        allow_redirects=False,
+      ) as resp:
         text = await resp.text()
+        if not request_allowed():
+          return blocked_result()
         if 200 <= resp.status < 300:
           return {
             "configured": True,

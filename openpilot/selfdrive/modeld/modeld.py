@@ -12,6 +12,11 @@ from msgq.visionipc import VisionIpcClient, VisionStreamType, VisionBuf
 from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
+from openpilot.selfdrive.carrot.community_data import (
+  automatic_diagnostic_request,
+  community_data_sharing_generation_matches,
+  parse_automatic_diagnostic_request,
+)
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
@@ -50,10 +55,17 @@ def queue_usbgpu_error_tmux(params: Params, context: str) -> bool:
     if isinstance(pending_reason, bytes):
       pending_reason = pending_reason.decode("utf-8", errors="ignore")
     if pending_reason in (None, ""):
-      params.put("CarrotException", USBGPU_TMUX_ERROR_REASON)
+      params.put(
+        "CarrotException",
+        automatic_diagnostic_request(USBGPU_TMUX_ERROR_REASON, params) or USBGPU_TMUX_ERROR_REASON,
+      )
       cloudlog.warning(f"queued {USBGPU_TMUX_ERROR_REASON} tmux capture: {context}")
       return True
-    if pending_reason == USBGPU_TMUX_ERROR_REASON:
+    queued_reason, queued_generation = parse_automatic_diagnostic_request(pending_reason)
+    if (
+      queued_reason == USBGPU_TMUX_ERROR_REASON
+      and community_data_sharing_generation_matches(queued_generation, params)
+    ):
       return True
     cloudlog.warning(
       f"did not replace pending CarrotException={pending_reason!r} with "

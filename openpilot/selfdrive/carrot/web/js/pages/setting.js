@@ -15,6 +15,7 @@ if (
   !carrotSettingsRuntime?.docs ||
   !carrotSettingsRuntime?.context ||
   !carrotSettingsRuntime?.entry ||
+  !carrotSettingsRuntime?.logSharing ||
   !carrotSettingsRuntime?.toggle ||
   !carrotSettingsRuntime?.validationUpload ||
   !carrotSettingsRuntime?.view ||
@@ -33,6 +34,7 @@ const settingDerivedRuntime = carrotSettingsRuntime.derived;
 const settingDocumentationRuntime = carrotSettingsRuntime.docs;
 const settingContextRuntime = carrotSettingsRuntime.context;
 const settingEntryRuntime = carrotSettingsRuntime.entry;
+const settingLogSharingRuntime = carrotSettingsRuntime.logSharing;
 const settingToggleRuntime = carrotSettingsRuntime.toggle;
 const settingValidationUploadRuntime = carrotSettingsRuntime.validationUpload;
 const settingViewRuntime = carrotSettingsRuntime.view;
@@ -50,6 +52,45 @@ const THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing";
 const COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing";
 const VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload";
 let validationUploadStatusRequestSequence = 0;
+let renderedLogSharingValues = {};
+
+function renderedSettingValue(name) {
+  const row = document.querySelector(`#items .setting[data-setting-name="${name}"]`);
+  const value = row?.querySelector(".val");
+  return value?.dataset.committedValue ?? value?.dataset.rawValue ?? renderedLogSharingValues[name];
+}
+
+function syncLogSharingPolicyUi() {
+  const state = settingLogSharingRuntime.normalizeScope({
+    thirdPartyEnabled: renderedSettingValue(THIRD_PARTY_DATA_SHARING_PARAM),
+    validationEnabled: renderedSettingValue(VALIDATION_AUTO_UPLOAD_PARAM),
+  });
+
+  const masterRow = document.querySelector(
+    `#items .setting[data-setting-name="${THIRD_PARTY_DATA_SHARING_PARAM}"]`,
+  );
+  const scopeStatus = masterRow?.querySelector(".log-sharing-scope-status");
+  if (scopeStatus) {
+    scopeStatus.textContent = getUIText(state.scopeLabelKey, "Log transfer scope unavailable");
+  }
+
+  const communityRow = document.querySelector(
+    `#items .setting[data-setting-name="${COMMUNITY_DATA_SHARING_PARAM}"]`,
+  );
+  const communityStatus = communityRow?.querySelector(".community-sharing-policy-status");
+  const communityToggle = communityRow?.querySelector(".c-switch__input");
+  if (communityStatus) {
+    communityStatus.hidden = !state.communityBlocked;
+    communityStatus.textContent = state.communityBlocked
+      ? getUIText(state.communityBlockedLabelKey, "Blocked while other log transfers are off")
+      : "";
+  }
+  if (communityToggle) communityToggle.disabled = state.communityBlocked;
+  if (communityRow) {
+    communityRow.classList.toggle("is-policy-blocked", state.communityBlocked);
+    communityRow.setAttribute("aria-disabled", state.communityBlocked ? "true" : "false");
+  }
+}
 
 function formatValidationUploadTimestamp(epochSeconds) {
   const value = Number(epochSeconds);
@@ -132,7 +173,7 @@ function confirmCommunityDataSharingEnable() {
   return appConfirm(
     getUIText(
       "community_data_sharing_enable_confirm",
-      "Enable Carrot community data sharing? Device identifiers, network status, settings, automatic tmux diagnostics, and support metadata may be exchanged with Carrot community services without per-file confirmation. KA4 automatic validation upload remains controlled by its separate consent below.",
+      "Enable Carrot community data sharing? DK Other Logs & Diagnostics Transfer must be on. Device identifiers, network status, settings, automatic tmux diagnostics, and support metadata may be exchanged without per-file confirmation. Turning the DK master off blocks and clears this setting. KA4 automatic validation remains controlled separately.",
     ),
     {
       title: getUIText("community_data_sharing_enable_title", "Carrot community data-sharing consent"),
@@ -146,10 +187,10 @@ function confirmThirdPartyDataSharingEnable() {
   return appConfirm(
     getUIText(
       "third_party_data_sharing_enable_confirm",
-      "Enable automatic third-party diagnostics and data sharing? This reconnects comma remote services and permits automatic diagnostic logs, statistics, remote log requests, Prime/Firehose status checks, and separately enabled Carrot community sharing. Local recording, private-NAS KA4 validation, explicitly started personal-NAS/manual dashcam uploads, Git updates, and navigation/maps remain independent.",
+      "Enable DK other logs and diagnostics transfer? This permits comma remote services, automatic diagnostics and statistics, remote log requests, Prime/Firehose, community services, and manually started personal-NAS, Discord, dashcam, or tmux transfers. Turning it off blocks every non-validation log path. Separately consented KA4 validation can still go only to the fixed DK private NAS; non-log internet features remain separate.",
     ),
     {
-      title: getUIText("third_party_data_sharing_enable_title", "Automatic external data-sharing consent"),
+      title: getUIText("third_party_data_sharing_enable_title", "DK other logs and diagnostics transfer consent"),
       confirmLabel: getUIText("third_party_data_sharing_enable", "Agree & enable"),
       cancelLabel: getUIText("cancel", "Cancel"),
     },
@@ -344,6 +385,7 @@ function cacheSettingValue(name, value, group = null) {
 
 function applyRestoredSettingValuesToRenderedItems(values, options = {}) {
   if (!values || typeof values !== "object") return false;
+  renderedLogSharingValues = { ...renderedLogSharingValues, ...values };
   const animate = options.animate !== false;
   let updated = false;
   document.querySelectorAll(".setting[data-setting-name]").forEach((row) => {
@@ -362,6 +404,7 @@ function applyRestoredSettingValuesToRenderedItems(values, options = {}) {
     }
     updated = true;
   });
+  syncLogSharingPolicyUi();
   return updated;
 }
 
@@ -2448,6 +2491,7 @@ async function renderItems(group, options = {}) {
   } catch (e) {
     values = {};
   }
+  renderedLogSharingValues = { ...values };
 
   if (
     renderToken !== settingRenderToken ||
@@ -2596,9 +2640,27 @@ async function renderItems(group, options = {}) {
       validationUploadStatus.setAttribute("aria-live", "polite");
     }
 
+    let logSharingScopeStatus = null;
+    if (!profile && !isSettingFavoritesGroup(group) && name === THIRD_PARTY_DATA_SHARING_PARAM) {
+      logSharingScopeStatus = document.createElement("div");
+      logSharingScopeStatus.className = "muted mt-sm log-sharing-scope-status";
+      logSharingScopeStatus.setAttribute("role", "status");
+      logSharingScopeStatus.setAttribute("aria-live", "polite");
+    }
+
+    let communitySharingPolicyStatus = null;
+    if (!profile && !isSettingFavoritesGroup(group) && name === COMMUNITY_DATA_SHARING_PARAM) {
+      communitySharingPolicyStatus = document.createElement("div");
+      communitySharingPolicyStatus.className = "muted mt-sm community-sharing-policy-status";
+      communitySharingPolicyStatus.setAttribute("role", "status");
+      communitySharingPolicyStatus.setAttribute("aria-live", "polite");
+    }
+
     el.appendChild(top);
     el.appendChild(d);
     if (validationUploadStatus) el.appendChild(validationUploadStatus);
+    if (logSharingScopeStatus) el.appendChild(logSharingScopeStatus);
+    if (communitySharingPolicyStatus) el.appendChild(communitySharingPolicyStatus);
 
     const popularTopValues = Array.isArray(popularEntry?.top_values) ? popularEntry.top_values : [];
     let contextPanel = null;
@@ -2802,6 +2864,16 @@ async function renderItems(group, options = {}) {
 
     async function commitSettingValue(next, commitOptions = {}) {
       const previous = val.dataset.committedValue ?? val.dataset.rawValue ?? String(p.default);
+      if (!profile && name === "DkExperimentalSteering" && String(next) !== String(previous)) {
+        const confirmed = await appConfirm(
+          getUIText("setting_dk_steering_confirm", "Save this experimental steering selection? ON and OFF apply when controls next starts. Restart the device after changing it to ensure application. The running controller will not change now; on-road validation is incomplete."),
+          { title: title || name, confirmLabel: getUIText("ok", "OK"), cancelLabel: getUIText("cancel", "Cancel") },
+        );
+        if (!confirmed) {
+          syncSettingControlState(el, previous);
+          return false;
+        }
+      }
       let validationConsentConfirmed = commitOptions.validationConsentConfirmed === true;
       let communityConsentConfirmed = commitOptions.communityConsentConfirmed === true;
       let thirdPartyConsentConfirmed = commitOptions.thirdPartyConsentConfirmed === true;
@@ -2875,15 +2947,35 @@ async function renderItems(group, options = {}) {
           if (result && Object.prototype.hasOwnProperty.call(result, "value")) {
             committed = result.value;
           }
+          if (result?.restart_recommended === true && result?.applies_at === "controls_start") {
+            showAppToast(getUIText("setting_dk_steering_restart", "Saved for the next controls start. Restart the device to ensure application; the current controller has not changed."));
+          }
         }
         syncSettingControlState(el, committed);
         val.dataset.committedValue = String(committed);
+        renderedLogSharingValues[name] = committed;
+        if (
+          !profile
+          && name === THIRD_PARTY_DATA_SHARING_PARAM
+          && Number(committed) !== 1
+        ) {
+          // The device atomically clears the subordinate consent with the
+          // master. Mirror that authoritative side effect immediately so the
+          // disabled community row never remains visually checked or cached.
+          applyRestoredSettingValuesToRenderedItems(
+            { [COMMUNITY_DATA_SHARING_PARAM]: 0 },
+            { animate: false },
+          );
+          cacheSettingValue(COMMUNITY_DATA_SHARING_PARAM, 0, group);
+          if (originGroup !== group) cacheSettingValue(COMMUNITY_DATA_SHARING_PARAM, 0, originGroup);
+        }
         if (!profile) {
           cacheSettingValue(name, committed, group);
           if (originGroup !== group) cacheSettingValue(name, committed, originGroup);
           refreshSettingHistory();
         }
         if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
+        syncLogSharingPolicyUi();
         return true;
       } catch (e) {
         // Controls update optimistically on input/change. Put every rejected
@@ -2891,6 +2983,7 @@ async function renderItems(group, options = {}) {
         // claims consent or a setting value that the device did not store.
         syncSettingControlState(el, previous);
         if (validationUploadStatus) refreshValidationUploadStatus(validationUploadStatus);
+        syncLogSharingPolicyUi();
         showAppToast((UI_STRINGS[LANG].set_failed || "set failed: ") + e.message, { tone: "error" });
         return false;
       }
@@ -3037,6 +3130,7 @@ async function renderItems(group, options = {}) {
           }
         } finally {
           toggleInput.disabled = false;
+          syncLogSharingPolicyUi();
         }
       };
     }
@@ -3111,6 +3205,7 @@ async function renderItems(group, options = {}) {
 
   itemsBox.dataset.renderedGroup = group;
   if (detailMode) itemsBox.dataset.renderedDetail = detailName;
+  syncLogSharingPolicyUi();
   scheduleSettingOverflowSync(itemsBox);
   window.CarrotMapboxTokenSettings?.sync?.();
   window.CarrotYouTubeLiveSettings?.sync?.();

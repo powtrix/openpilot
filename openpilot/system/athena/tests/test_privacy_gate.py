@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+import inspect
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,6 +67,74 @@ def test_athenad_direct_upload_boundaries_fail_closed(monkeypatch):
     athenad._do_upload(item)
   with pytest.raises(athenad.AbortTransferException):
     athenad.uploadFilesToUrls([])
+
+
+def test_athenad_signed_put_disables_redirects_and_aborts_aba_mid_body(monkeypatch):
+  state = {"generation": "generation-1"}
+  callback_calls = []
+  request_options = {}
+
+  monkeypatch.setattr(athenad, "active_consent_generation", None)
+  monkeypatch.setattr(athenad, "third_party_data_sharing_generation", lambda *_args: state["generation"])
+  monkeypatch.setattr(
+    athenad,
+    "third_party_data_sharing_generation_matches",
+    lambda expected, *_args: expected == state["generation"],
+  )
+  monkeypatch.setattr(athenad, "artifact_is_blocked", lambda _path: False)
+  monkeypatch.setattr(athenad, "get_upload_stream", lambda *_args: (io.BytesIO(b"payload"), 7))
+
+  def put(_url, *, data, **kwargs):
+    request_options.update(kwargs)
+    assert data.read(1) == b"p"
+    state["generation"] = "generation-2"
+    data.read(1)
+    raise AssertionError("stale Athena body resumed after consent ABA")
+
+  monkeypatch.setattr(athenad.UPLOAD_SESS, "put", put)
+  item = athenad.UploadItem(path="/not-opened", url="https://upload.example/file", headers={}, created_at=0, id="id")
+
+  with pytest.raises(athenad.AbortTransferException):
+    athenad._do_upload(item, lambda *_args: callback_calls.append(True), "generation-1")
+
+  assert callback_calls == [True]
+  assert request_options["allow_redirects"] is False
+
+
+def test_athenad_signed_put_rechecks_generation_after_response(monkeypatch):
+  state = {"generation": "generation-1"}
+  response = SimpleNamespace(closed=False)
+  response.close = lambda: setattr(response, "closed", True)
+
+  monkeypatch.setattr(
+    athenad,
+    "third_party_data_sharing_generation_matches",
+    lambda expected, *_args: expected == state["generation"],
+  )
+  monkeypatch.setattr(athenad, "artifact_is_blocked", lambda _path: False)
+  monkeypatch.setattr(athenad, "get_upload_stream", lambda *_args: (io.BytesIO(b"payload"), 7))
+
+  def put(_url, *, data, **kwargs):
+    assert kwargs["allow_redirects"] is False
+    while data.read(1024):
+      pass
+    state["generation"] = "generation-2"
+    return response
+
+  monkeypatch.setattr(athenad.UPLOAD_SESS, "put", put)
+  item = athenad.UploadItem(path="/not-opened", url="https://upload.example/file", headers={}, created_at=0, id="id")
+
+  with pytest.raises(athenad.AbortTransferException):
+    athenad._do_upload(item, consent_generation="generation-1")
+
+  assert response.closed
+
+
+def test_athena_websockets_do_not_follow_redirects():
+  main_source = inspect.getsource(athenad.main)
+  proxy_source = inspect.getsource(athenad.startLocalProxy)
+  assert "redirect_limit=0" in main_source
+  assert "redirect_limit=0" in proxy_source
 
 
 def test_manage_athenad_off_discards_legacy_queue_without_starting(monkeypatch):

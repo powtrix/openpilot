@@ -20,20 +20,20 @@ test("the community data toggle requires its own explicit confirmation", async (
   assert.match(source, /paramCommitOptions\.webConsent = true/);
 });
 
-test("all supported languages disclose the community transfer scope and KA4 independence", async () => {
+test("all supported languages disclose the master block and private-NAS exception", async () => {
   const requiredFragments = {
     en: [
-      "device identifiers", "local network address", "all setting values", "automatic onroad and exception tmux",
-      "bundled Discord", "mobile data", "user-configured NAS", "KA4 automatic validation upload",
-      "private WPA2/WPA3",
+      "device identifiers", "local network address", "all setting values", "automatic onroad/exception tmux",
+      "bundled Discord", "mobile data", "User-configured NAS", "manually started dashcam or tmux",
+      "fixed DK private NAS", "blocks and clears", "private WPA2/WPA3",
     ],
     ko: [
       "장치 식별자", "로컬 네트워크 주소", "전체 설정값", "자동 onroad·예외 tmux", "기본 Discord",
-      "모바일 데이터", "직접 지정한 NAS", "KA4 자동 검증 로그 전송", "WPA2/WPA3",
+      "모바일 데이터", "직접 지정한 NAS", "수동 대시캠·tmux", "고정 DK 개인 NAS", "차단·해제", "WPA2/WPA3",
     ],
     zh: [
       "设备标识", "局域网地址", "全部设置值", "自动行驶中/异常 tmux", "内置 Discord", "移动数据",
-      "自行配置的 NAS", "KA4 自动验证日志", "WPA2/WPA3",
+      "用户自定义 NAS", "手动行车日志或 tmux", "固定 DK 私人 NAS", "阻止并清除", "WPA2/WPA3",
     ],
   };
 

@@ -61,6 +61,7 @@ SNAPSHOT_TIMEOUT_SECONDS = 5.0
 # VisionIPC recv holds the GIL while waiting. Poll without blocking, then sleep
 # in Python so an idle camera cannot stall inference or HTTP on other threads.
 CAMERA_POLL_INTERVAL_SECONDS = 0.005
+CONSENT_STREAM_CHUNK_SIZE = 64 * 1024
 
 
 DEFAULT_POLYGONS = {
@@ -571,6 +572,18 @@ class Handler(BaseHTTPRequestHandler):
       return
     super().send_error(code, message, explain)
 
+  def _write_guarded(self, body: bytes) -> bool:
+    view = memoryview(body)
+    for offset in range(0, len(view), CONSENT_STREAM_CHUNK_SIZE):
+      if not self.service.data_sharing_allowed():
+        self.close_connection = True
+        return False
+      self.wfile.write(view[offset:offset + CONSENT_STREAM_CHUNK_SIZE])
+      if not self.service.data_sharing_allowed():
+        self.close_connection = True
+        return False
+    return True
+
   def _json(self, status: HTTPStatus, payload: object) -> None:
     if not self.service.data_sharing_allowed():
       self.close_connection = True
@@ -584,7 +597,7 @@ class Handler(BaseHTTPRequestHandler):
     if not self.service.data_sharing_allowed():
       self.close_connection = True
       return
-    self.wfile.write(body)
+    self._write_guarded(body)
 
   def do_GET(self) -> None:
     if not self.service.data_sharing_allowed():
@@ -600,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
       if not self.service.data_sharing_allowed():
         self.close_connection = True
         return
-      self.wfile.write(body)
+      self._write_guarded(body)
     elif path == "/api/status":
       self._json(HTTPStatus.OK, self.service.status())
     elif path == "/api/config":
@@ -622,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
       if not self.service.data_sharing_allowed():
         self.close_connection = True
         return
-      self.wfile.write(jpeg)
+      self._write_guarded(jpeg)
     else:
       self.send_error(HTTPStatus.NOT_FOUND)
 

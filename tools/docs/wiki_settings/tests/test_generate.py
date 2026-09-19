@@ -85,16 +85,18 @@ class WikiSettingsGeneratorTest(unittest.TestCase):
       catalog_commit=COMMIT,
       generated_at=STAMP,
     )
-    self.assertEqual(len(result.generated_settings), 177)
-    self.assertEqual(result.index["review"], {"current": 0, "needs_review": 177})
+    self.assertEqual(len(result.generated_settings), 178)
+    self.assertEqual(result.index["review"], {"current": 0, "needs_review": 178})
     self.assertEqual(result.index["locales"], ["ko", "en", "zh"])
-    self.assertEqual(len(result.pages), (177 * 3) + 2)
+    self.assertEqual(len(result.pages), (178 * 3) + 2)
     setting_pages = {
       name: text
       for name, text in result.pages.items()
       if GENERATOR.GENERATED_PAGE_RE.fullmatch(name)
     }
-    self.assertEqual(len(setting_pages), 177 * 3)
+    self.assertEqual(len(setting_pages), 178 * 3)
+    self.assertIn("재시작", result.pages["KO-실험용-조향개선.md"])
+    self.assertIn("OFF uses the existing steering calculation", result.pages["EN-Experimental-Steering-Improvement.md"])
     self.assertTrue(all(text.count("<!-- CARROT:SETTING:BEGIN ") == 1 for text in setting_pages.values()))
     for name, text in result.pages.items():
       if name.endswith(".md"):

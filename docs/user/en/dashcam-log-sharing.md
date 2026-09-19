@@ -7,16 +7,16 @@ When you ask a Carrot support specialist to analyze abnormal behavior, use `Logs
 > [!WARNING]
 > Operate Carrot Web only after parking safely. While driving, do not search for or select logs; remember the occurrence time and symptom instead.
 
-## Automatic community sharing versus manual log upload
+## Choose the log-transfer scope
 
-`System > Record & Power > DK Automatic External Logs & Diagnostics` is the master consent for comma Athena and other automatic transfers to outside third parties; `Carrot Community Data Sharing` is the subordinate consent for Carrot community services. Both are off by default, and both must be enabled before Carrot community servers or bundled Discord webhooks can receive device/network status, setting values, automatic onroad/exception tmux diagnostics, and support metadata without per-file confirmation. Popular-setting downloads and CWP address registration also require both. Turning either one off blocks new community requests, stops all automatic tmux capture/retries, and discards pending automatic exception transfers.
+`System > Record & Power > DK Other Logs & Diagnostics Transfer` is the master consent for every manual or automatic external log and diagnostic transfer except the KA4 automatic validation path below. It is off by default. Off blocks comma Athena and external diagnostic services as well as user-started personal-NAS, Discord, dashcam, and tmux transfers. `Carrot Community Data Sharing` is subordinate and can be enabled only while the master is on. Turning the master off clears community consent and stops new community requests, automatic tmux capture/retries, and pending automatic exception transfers.
 
-Turning both sharing settings off does not change a manual upload itself after it is explicitly started from selected segments in `Logs > Dashcam`, a user-configured NAS or Discord URL, or the separate KA4 automatic-validation consent below. However, the default `adot.synology.me` DK receiver is restricted to automatic KA4 validation and rejects manual dashcam/tmux uploads with HTTP 403; manual upload requires a separately authenticated private receiver. The post-upload report to the bundled default Discord is also blocked, so copy the completion result and send it manually. In particular, if `CarrotValidationAutoUpload` is enabled, its full-rlog upload to the fixed private-NAS receiver can continue while both sharing settings are off. None of the three consent values is included in backups, profiles, or QR transfer, so a new installation or another device cannot inherit it automatically.
+Carrot Web combines the master and validation consents into one of three labels: `Only my DK NAS validation logs`, `All log transfers blocked`, or `Other logs and diagnostics allowed`. Before manually sending dashcam logs or using a configured NAS or Discord destination, turn on `DK Other Logs & Diagnostics Transfer`. The default `adot.synology.me` DK receiver remains restricted to automatic KA4 validation and rejects manual dashcam/tmux uploads with HTTP 403, so manual upload requires a separately authenticated receiver. Conversely, enabling only `CarrotValidationAutoUpload` keeps every other log path blocked while full rlogs go automatically to the fixed DK private NAS. None of the three consent values is included in backups, profiles, or QR transfer, so a new installation or another device cannot inherit it automatically.
 
 <a id="automatic-validation-upload"></a>
-## Automatic KA4 validation upload (experimental)
+## DK private-NAS KA4 automatic validation logs (experimental)
 
-`System > Record & Power > KA4 Automatic Validation Log Upload (Experimental)` is a bounded collector that removes the need to find or send each log manually. It is off by default. Enabling it once while safely parked is explicit consent for a campaign of up to seven days, including every automatic post-drive upload during that campaign; there is no per-log confirmation. It never changes vehicle-control behavior or `PathOffset`; the legacy `Ka4StockSccStandstillRearm` metadata is forced to `0` because periodic stopped-lead RES injection is disabled.
+`System > Record & Power > DK Private-NAS KA4 Automatic Validation Logs (Experimental)` is a bounded collector that removes the need to find or send each log manually. It is off by default. Enabling it once while safely parked is explicit consent for a campaign of up to seven days, including every automatic post-drive upload during that campaign; there is no per-log confirmation. The collector setting itself never changes vehicle control or `PathOffset`. `Ka4StockSccStandstillRearm` is not a screen setting; it is internal metadata recording whether automatic resume retention is active on the exact KA4 stock-radar-SCC, non-longitudinal topology. Turning log collection off does not turn that vehicle behavior off.
 
 The collector arms only when all of this vehicle topology is confirmed:
 
@@ -50,6 +50,8 @@ Note as much of the following as possible:
 “At about 14:32, the vehicle unexpectedly decelerated from about 80 km/h as a car merged from the right, and I disengaged with the brake” is much more useful than “It behaved strangely.”
 
 ## Fastest method: send a symptom that just occurred
+
+Before a manual upload, park safely and enable `System > Record & Power > DK Other Logs & Diagnostics Transfer`. With it off, the upload cannot start even when the destination is a personal NAS or user-configured Discord. You can turn it off again after the transfer if no other log sharing is needed.
 
 1. Park safely and wait for the drive to finish.
 2. Open `http://device-IP:7000` in a browser.
@@ -88,7 +90,7 @@ If the completion screen shows the same `uploaded/total` number, all selected fi
 
 The result generated by `Copy` can include device, branch, commit, and per-segment upload information. Each successful segment is shown as a public Synology viewer link. Opening it provides web playback, public files, and ready-to-copy Cabana, PlotJuggler, and JotPluggler commands. Consecutively numbered segments from the same route also receive one combined link that opens the full range.
 
-When the upload job finishes, the device sends the same result report directly to the configured Discord webhook. If the user has not supplied a custom webhook and the bundled default Discord is used, both `DkThirdPartyDataSharing=1` and `CarrotCommunityDataSharing=1` are required. Disabled consent or a Discord notification failure does not undo an already completed log upload; post the completion screen's `Copy` result to the channel manually.
+When the upload job finishes, the device sends the same result report directly to the configured Discord webhook. Every result transfer, including a user-configured Discord, requires `DkThirdPartyDataSharing=1`; the bundled default Discord also requires `CarrotCommunityDataSharing=1`. Turning the master off during a job can stop the transfer in progress. If only the Discord notification fails, post the completion screen's `Copy` result to the channel manually.
 
 Public viewer links do not require a login. Anyone who receives a link can open or forward it. Confirm the selected segments and the Discord channel where the report will be posted, then add the following details when requesting analysis:
 

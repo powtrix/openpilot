@@ -9,6 +9,10 @@ from collections import deque
 from datetime import datetime
 from typing import Any
 
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.selfdrive.carrot.web_upload import (
   create_validation_upload_session,
   create_web_upload_session,
@@ -364,10 +368,23 @@ async def run_upload_segments(
   completion_metadata: Mapping[str, Any] | None = None,
   base_url_override: str | None = None,
   safety_check: Any | None = None,
+  consent_generation: str | None = None,
   validation_capture_id: str | None = None,
   validation_files: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+  params = Params() if HAS_PARAMS else None
+  validation_mode = bool(validation_capture_id and validation_files is not None)
+  if not validation_mode and consent_generation is None:
+    consent_generation = third_party_data_sharing_generation(params)
+
+  def master_consent_matches() -> bool:
+    return validation_mode or third_party_data_sharing_generation_matches(consent_generation, params)
+
   def ensure_runtime_safe() -> None:
+    if not master_consent_matches():
+      if job:
+        job["cancel_requested"] = True
+      raise UploadCanceled("third-party data sharing consent changed")
     if safety_check is None:
       return
     try:
@@ -380,8 +397,6 @@ async def run_upload_segments(
       raise UploadCanceled("automatic upload safety policy changed")
 
   ensure_runtime_safe()
-  params = Params() if HAS_PARAMS else None
-  validation_mode = bool(validation_capture_id and validation_files is not None)
   configured_base_url, token = upload.upload_target_settings()
   base_url = str(base_url_override or configured_base_url).rstrip("/")
   if base_url_override is not None and configured_base_url != base_url and not validation_mode:
@@ -398,7 +413,7 @@ async def run_upload_segments(
     # cannot strand the final receipt behind an expired bearer token.
     token = ""
   elif not token:
-    token = await create_web_upload_session(base_url, meta, "dashcam")
+    token = await create_web_upload_session(base_url, meta, "dashcam", master_consent_matches)
   remote_base_path = (
     f"{base_url}/validation/{device_id}/{validation_capture_id}/"
     if validation_mode else f"{base_url}/routes/{storage_directory}/"
@@ -591,7 +606,7 @@ async def run_upload_segments(
             unsafe = True
           if unsafe and job:
             job["cancel_requested"] = True
-          return unsafe or is_cancel_requested(job)
+          return unsafe or not master_consent_matches() or is_cancel_requested(job)
 
         if validation_mode:
           validation_token = await create_validation_upload_session(
@@ -638,7 +653,7 @@ async def run_upload_segments(
             segment,
             base_url,
             token,
-            should_cancel if job else None,
+            should_cancel,
             filenames=[str(item["name"]) for item in files],
             on_progress=on_file_progress if job else None,
           )
@@ -748,7 +763,12 @@ async def run_upload_segments(
         should_continue=safety_check,
       )
   else:
-    response_payload["webComplete"] = await send_web_upload_complete(base_url, token, response_payload)
+    response_payload["webComplete"] = await send_web_upload_complete(
+      base_url,
+      token,
+      response_payload,
+      master_consent_matches,
+    )
   ensure_not_canceled(job)
   ensure_runtime_safe()
   if validation_mode:
@@ -804,13 +824,17 @@ async def run_upload_segments(
       phase_total=2,
     )
   if notify_discord:
+    ensure_runtime_safe()
     response_payload["discord"] = await upload.send_discord_webhook(
       upload.discord_webhook_url(params),
       response_payload,
+      params=params,
+      consent_generation=consent_generation,
     )
   else:
     response_payload["discord"] = {"configured": False, "ok": False, "skipped": True}
   ensure_not_canceled(job)
+  ensure_runtime_safe()
   if job:
     progress(
       job,

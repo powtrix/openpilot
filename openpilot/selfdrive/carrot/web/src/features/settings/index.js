@@ -62,6 +62,10 @@ import {
   normalizeValidationUploadStatus,
   VALIDATION_UPLOAD_STATUS_LABEL_KEYS,
 } from "./validation_upload_status.js";
+import {
+  LOG_SHARING_SCOPE_LABEL_KEYS,
+  normalizeLogSharingScope,
+} from "./log_sharing_scope.js";
 import { commitSettingToggle } from "./toggle_commit.js";
 
 const installedTargets = new WeakMap();
@@ -131,6 +135,10 @@ export function installSettingsRuntimeFacade(target = globalThis, options = {}) 
     validationUpload: Object.freeze({
       normalizeStatus: normalizeValidationUploadStatus,
       statusLabelKeys: VALIDATION_UPLOAD_STATUS_LABEL_KEYS,
+    }),
+    logSharing: Object.freeze({
+      normalizeScope: normalizeLogSharingScope,
+      labelKeys: LOG_SHARING_SCOPE_LABEL_KEYS,
     }),
     toggle: Object.freeze({ commit: commitSettingToggle }),
     popular: Object.freeze({

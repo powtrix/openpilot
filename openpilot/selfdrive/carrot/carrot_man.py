@@ -28,16 +28,21 @@ import ipaddress
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper, set_core_affinity
 from openpilot.common.params import Params, ParamKeyType
+from openpilot.common.external_data import (
+  third_party_data_sharing_generation,
+  third_party_data_sharing_generation_matches,
+)
 from openpilot.common.filter_simple import MyMovingAverage
 from openpilot.system.hardware import PC, TICI
 from openpilot.selfdrive.navd.helpers import Coordinate
 from openpilot.common.constants import CV
 
 from openpilot.selfdrive.carrot.community_data import (
-  CommunityConsentBoundBytes,
+  automatic_diagnostic_request,
   community_data_sharing_enabled,
   community_data_sharing_generation,
   community_data_sharing_generation_matches,
+  parse_automatic_diagnostic_request,
 )
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
@@ -86,6 +91,45 @@ EXCEPTION_DISCORD_WEBHOOK_OBFUSCATED = (
   "CxUGAhxOAkocChYTGxsLQE4ZXEwAAhtAA0gHEAwKGwdGXlsfQgdTUEVKXkEcUkpaVEdEWkAkRwMCFzEL"
   "MF8zS1YzWh8YJlkpVk4EUwQ0ED02IkgXKjMkQzIYIRt/HgUWUTUQWCcaAS1XKhpFUT4cGDBnLiACOx1DXQ=="
 )
+_CONSENT_GENERATION_UNSET = object()
+TMUX_SEND_REQUEST_PREFIX = "tmux_send:"
+
+
+def parse_carrot_exception_request(value: Any) -> tuple[str | None, str | None]:
+  automatic_reason, automatic_generation = parse_automatic_diagnostic_request(value)
+  if automatic_reason is not None:
+    return automatic_reason, automatic_generation
+  if isinstance(value, bytes):
+    value = value.decode("utf-8", errors="replace")
+  text = str(value or "").strip()
+  if text.startswith(TMUX_SEND_REQUEST_PREFIX):
+    generation = text[len(TMUX_SEND_REQUEST_PREFIX):].strip()
+    return ("tmux_send", generation or None)
+  return (text or None, None)
+
+
+def carrot_exception_request_allowed(
+  reason: str | None,
+  generation: str | None,
+  params: Any,
+) -> bool:
+  if reason == "tmux_send":
+    return third_party_data_sharing_generation_matches(generation, params)
+  if reason in AUTOMATIC_EXCEPTION_TMUX_REASONS:
+    return community_data_sharing_generation_matches(generation, params)
+  return False
+
+
+def diagnostic_consent_generation_changed(
+  previous_master: Any,
+  previous_community: Any,
+  current_master: str | None,
+  current_community: str | None,
+) -> bool:
+  return (
+    previous_master is not _CONSENT_GENERATION_UNSET
+    and (previous_master != current_master or previous_community != current_community)
+  )
 
 
 def limit_route_points(points, max_points=NAVI_ROUTE_MAX_POINTS):
@@ -136,19 +180,24 @@ def queue_carrot_exception_tmux_send(context: str = "", reason: str = "exception
   with _carrot_exception_tmux_send_lock:
     try:
       params = Params()
-      if not community_data_sharing_enabled(params):
+      request = automatic_diagnostic_request(reason, params)
+      if request is None:
         return False
       current = params.get("CarrotException")
       if current in (None, "", b""):
         put_nonblocking = getattr(params, "put_nonblocking", None)
         if callable(put_nonblocking):
-          put_nonblocking("CarrotException", reason)
+          put_nonblocking("CarrotException", request)
         else:
-          params.put("CarrotException", reason)
+          params.put("CarrotException", request)
         _carrot_exception_tmux_send_queued = True
         print(f"[carrot_man] CarrotException {reason} queued: {context or 'exception'}")
         return True
-      elif current == reason:
+      current_reason, current_generation = parse_carrot_exception_request(current)
+      if (
+        current_reason == reason
+        and community_data_sharing_generation_matches(current_generation, params)
+      ):
         _carrot_exception_tmux_send_queued = True
         return True
       return False
@@ -911,15 +960,34 @@ class CarrotMan:
     print(f"[carrot_man] {label}: status={response.status_code} {response.text}")
     return response
 
-  def send_tmux_web(self, tmux_why, send_settings=False, consent_generation=None):
+  def send_tmux_web(
+    self,
+    tmux_why,
+    send_settings=False,
+    consent_generation=None,
+    master_generation=_CONSENT_GENERATION_UNSET,
+  ):
     try:
-      request_allowed = None
+      if master_generation is _CONSENT_GENERATION_UNSET:
+        master_generation = third_party_data_sharing_generation(self.params)
+
+      def master_request_allowed():
+        return third_party_data_sharing_generation_matches(master_generation, self.params)
+
+      if not master_request_allowed():
+        print("[carrot_man] DSM tmux upload skipped: third-party data sharing is disabled")
+        return None
+
+      request_allowed = master_request_allowed
       if tmux_why != "tmux_send":
         if consent_generation is None:
           consent_generation = community_data_sharing_generation(self.params)
 
         def automatic_request_allowed():
-          return community_data_sharing_generation_matches(consent_generation, self.params)
+          return (
+            master_request_allowed()
+            and community_data_sharing_generation_matches(consent_generation, self.params)
+          )
 
         request_allowed = automatic_request_allowed
         if not request_allowed():
@@ -943,11 +1011,26 @@ class CarrotMan:
       traceback.print_exc()
       return None
 
-  def send_tmux_carrot_logs(self, tmux_why, send_settings=False, consent_generation=None):
+  def send_tmux_carrot_logs(
+    self,
+    tmux_why,
+    send_settings=False,
+    consent_generation=None,
+    master_generation=_CONSENT_GENERATION_UNSET,
+  ):
     """Send the independent copy consumed by the Discord carrot_logs forum."""
+    if master_generation is _CONSENT_GENERATION_UNSET:
+      master_generation = third_party_data_sharing_generation(self.params)
     if consent_generation is None:
       consent_generation = community_data_sharing_generation(self.params)
-    if not community_data_sharing_generation_matches(consent_generation, self.params):
+
+    def request_allowed():
+      return (
+        third_party_data_sharing_generation_matches(master_generation, self.params)
+        and community_data_sharing_generation_matches(consent_generation, self.params)
+      )
+
+    if not request_allowed():
       print("[carrot_man] carrot_logs upload skipped: community data sharing is disabled")
       return None
     try:
@@ -955,7 +1038,7 @@ class CarrotMan:
       url, headers = carrot_logs_web_target()
       return self._post_tmux_target(
         "carrot_logs upload", url, headers, payload, send_settings,
-        lambda: community_data_sharing_generation_matches(consent_generation, self.params),
+        request_allowed,
       )
     except Exception as e:
       print(f"carrot_logs tmux sending error...: {e}")
@@ -1054,7 +1137,18 @@ class CarrotMan:
     web_response=None,
     send_settings=False,
     consent_generation=None,
+    master_generation=_CONSENT_GENERATION_UNSET,
   ):
+    if master_generation is _CONSENT_GENERATION_UNSET:
+      master_generation = third_party_data_sharing_generation(self.params)
+
+    def master_request_allowed():
+      return third_party_data_sharing_generation_matches(master_generation, self.params)
+
+    if not master_request_allowed():
+      print("[carrot_man] discord tmux skipped: third-party data sharing is disabled")
+      return False
+
     url = self._tmux_discord_webhook_url()
     if not url:
       return False
@@ -1075,9 +1169,15 @@ class CarrotMan:
       consent_generation = community_data_sharing_generation(self.params)
 
     def request_allowed():
-      return community_data_sharing_generation_matches(consent_generation, self.params)
+      return (
+        master_request_allowed()
+        and (
+          not requires_community_consent
+          or community_data_sharing_generation_matches(consent_generation, self.params)
+        )
+      )
 
-    if requires_community_consent and not request_allowed():
+    if not request_allowed():
       print("[carrot_man] discord tmux skipped: community data sharing is disabled")
       return False
 
@@ -1107,43 +1207,29 @@ class CarrotMan:
         opened_files.append(toggle_file)
         files.append(("files[1]", (f"toggles-{stamp}.json", toggle_file, "application/json")))
 
-      if requires_community_consent and not request_allowed():
+      if not request_allowed():
         print("[carrot_man] discord tmux skipped: community data sharing is disabled")
         return False
 
-      if files:
-        if requires_community_consent:
-          body = GuardedMultipartBody(
-            {"payload_json": json.dumps(payload, ensure_ascii=False)},
-            files,
-            request_allowed,
-          )
-          response = requests.post(
-            url,
-            data=body,
-            headers={
-              "Content-Type": body.content_type,
-              "Content-Length": str(body.content_length),
-            },
-            timeout=12,
-          )
-        else:
-          response = requests.post(
-            url,
-            data={"payload_json": json.dumps(payload, ensure_ascii=False)},
-            files=files,
-            timeout=12,
-          )
-      elif requires_community_consent:
-        encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        response = requests.post(
-          url,
-          data=CommunityConsentBoundBytes(encoded_payload, self.params, consent_generation),
-          headers={"Content-Type": "application/json", "Content-Length": str(len(encoded_payload))},
-          timeout=12,
-        )
-      else:
-        response = requests.post(url, json=payload, timeout=12)
+      body = GuardedMultipartBody(
+        {"payload_json": json.dumps(payload, ensure_ascii=False)},
+        files,
+        request_allowed,
+      )
+      response = requests.post(
+        url,
+        data=body,
+        headers={
+          "Content-Type": body.content_type,
+          "Content-Length": str(body.content_length),
+        },
+        timeout=12,
+        allow_redirects=False,
+      )
+
+      if not request_allowed():
+        print("[carrot_man] discord tmux revoked before response completion")
+        return False
 
       ok = 200 <= response.status_code < 300
       print(f"[carrot_man] discord tmux {'sent' if ok else 'failed'}: status={response.status_code} reason={tmux_why}")
@@ -1232,10 +1318,14 @@ class CarrotMan:
     onroad_start_at = None
     onroad_tmux_captured = False
     onroad_tmux_generation = None
+    onroad_tmux_master_generation = None
     onroad_tmux_next_attempt_at = 0.0
     pending_tmux_reason = None
     pending_tmux_generation = None
+    pending_tmux_master_generation = None
     pending_tmux_next_attempt_at = 0.0
+    observed_master_generation = _CONSENT_GENERATION_UNSET
+    observed_community_generation = _CONSENT_GENERATION_UNSET
     can_error_detected_at = None
     can_error_tmux_requested = False
     current_onroad_car_state_seen = False
@@ -1264,6 +1354,7 @@ class CarrotMan:
               is_tmux_sent = False
               onroad_tmux_captured = False
               onroad_tmux_generation = None
+              onroad_tmux_master_generation = None
               onroad_tmux_next_attempt_at = 0.0
               can_error_detected_at = None
               can_error_tmux_requested = False
@@ -1279,6 +1370,7 @@ class CarrotMan:
             is_tmux_sent = False
             onroad_tmux_captured = False
             onroad_tmux_generation = None
+            onroad_tmux_master_generation = None
             onroad_tmux_next_attempt_at = 0.0
             can_error_detected_at = None
             can_error_tmux_requested = False
@@ -1289,15 +1381,76 @@ class CarrotMan:
           networkConnected = False if network_type == NetworkType.none else True
           community_generation = community_data_sharing_generation(self.params)
           community_data_sharing = community_generation is not None
+          master_generation = third_party_data_sharing_generation(self.params)
+
+          consent_generation_changed = diagnostic_consent_generation_changed(
+            observed_master_generation,
+            observed_community_generation,
+            master_generation,
+            community_generation,
+          )
+          observed_master_generation = master_generation
+          observed_community_generation = community_generation
+          if consent_generation_changed:
+            current_exception, _current_request_generation = parse_carrot_exception_request(
+              self.params.get("CarrotException"),
+            )
+            if current_exception in CARROT_EXCEPTION_TMUX_REASONS:
+              self.params.put("CarrotException", "")
+            pending_tmux_reason = None
+            pending_tmux_generation = None
+            pending_tmux_master_generation = None
+            pending_tmux_next_attempt_at = 0.0
+            is_tmux_sent = False
+            onroad_tmux_captured = False
+            onroad_tmux_generation = None
+            onroad_tmux_master_generation = None
+            onroad_tmux_next_attempt_at = 0.0
+            onroad_start_at = now if is_onroad and community_generation is not None else None
+            can_error_detected_at = None
+            can_error_tmux_requested = False
+            reset_carrot_exception_tmux_send_queue()
+
+          if master_generation is None:
+            pending_value, _pending_request_generation = parse_carrot_exception_request(
+              self.params.get("CarrotException"),
+            )
+            if pending_value == "tmux_send":
+              self.params.put("CarrotException", "")
+            if pending_tmux_reason == "tmux_send":
+              pending_tmux_reason = None
+              pending_tmux_generation = None
+              pending_tmux_master_generation = None
+              pending_tmux_next_attempt_at = 0.0
+              reset_carrot_exception_tmux_send_queue()
+
+          if (
+            pending_tmux_master_generation is not None
+            and not third_party_data_sharing_generation_matches(pending_tmux_master_generation, self.params)
+          ):
+            current_exception, _current_request_generation = parse_carrot_exception_request(
+              self.params.get("CarrotException"),
+            )
+            if current_exception in CARROT_EXCEPTION_TMUX_REASONS:
+              self.params.put("CarrotException", "")
+            pending_tmux_reason = None
+            pending_tmux_generation = None
+            pending_tmux_master_generation = None
+            pending_tmux_next_attempt_at = 0.0
+            reset_carrot_exception_tmux_send_queue()
 
           if (
             pending_tmux_generation is not None
             and not community_data_sharing_generation_matches(pending_tmux_generation, self.params)
           ):
-            if self.params.get("CarrotException") in AUTOMATIC_EXCEPTION_TMUX_REASONS:
+            current_exception, _current_request_generation = parse_carrot_exception_request(
+              self.params.get("CarrotException"),
+            )
+            if current_exception in AUTOMATIC_EXCEPTION_TMUX_REASONS:
               self.params.put("CarrotException", "")
             pending_tmux_reason = None
             pending_tmux_generation = None
+            pending_tmux_master_generation = None
             pending_tmux_next_attempt_at = 0.0
             reset_carrot_exception_tmux_send_queue()
           if (
@@ -1306,27 +1459,33 @@ class CarrotMan:
           ):
             onroad_tmux_captured = False
             onroad_tmux_generation = None
+            onroad_tmux_master_generation = None
             onroad_tmux_next_attempt_at = 0.0
 
           # This setting is an explicit opt-in. Drop any pending automatic
           # capture/retry state as soon as consent is withdrawn so enabling it
           # later cannot upload an exception that happened while sharing was
-          # disabled. An explicit Tools request stored as `tmux_send` remains
-          # eligible for the configured DSM/custom webhook; the built-in
-          # Carrot destinations remain gated in their sender functions.
+          # disabled. An explicit Tools request stored as `tmux_send` does not
+          # require community consent, but every destination still requires
+          # the exact master-consent generation captured for that request.
           if not community_data_sharing:
-            pending_value = self.params.get("CarrotException")
+            pending_value, _pending_request_generation = parse_carrot_exception_request(
+              self.params.get("CarrotException"),
+            )
             if (pending_value in AUTOMATIC_EXCEPTION_TMUX_REASONS
                 or pending_tmux_reason in AUTOMATIC_EXCEPTION_TMUX_REASONS):
               if pending_value in AUTOMATIC_EXCEPTION_TMUX_REASONS:
                 self.params.put("CarrotException", "")
               pending_tmux_reason = None
               pending_tmux_generation = None
+              pending_tmux_master_generation = None
               pending_tmux_next_attempt_at = 0.0
               reset_carrot_exception_tmux_send_queue()
             is_tmux_sent = False
+            onroad_start_at = None
             onroad_tmux_captured = False
             onroad_tmux_generation = None
+            onroad_tmux_master_generation = None
             onroad_tmux_next_attempt_at = 0.0
             can_error_detected_at = None
             can_error_tmux_requested = False
@@ -1359,19 +1518,23 @@ class CarrotMan:
               if self.make_tmux_data():
                 onroad_tmux_captured = True
                 onroad_tmux_generation = community_generation
+                onroad_tmux_master_generation = master_generation
                 onroad_tmux_next_attempt_at = 0.0
                 print(f"[carrot_man] onroad tmux captured after {onroad_elapsed:.1f}s; waiting for network upload")
               else:
                 onroad_tmux_next_attempt_at = now + CARROT_EXCEPTION_UPLOAD_RETRY_SECONDS
 
             if (onroad_tmux_captured and networkConnected and now >= onroad_tmux_next_attempt_at
-                and community_data_sharing_generation_matches(onroad_tmux_generation, self.params)):
+                and community_data_sharing_generation_matches(onroad_tmux_generation, self.params)
+                and third_party_data_sharing_generation_matches(onroad_tmux_master_generation, self.params)):
               web_response = self.send_tmux_web(
                 "onroad", send_settings=True, consent_generation=onroad_tmux_generation,
+                master_generation=onroad_tmux_master_generation,
               )
               web_ok = web_response is not None and getattr(web_response, "ok", False)
               carrot_logs_response = self.send_tmux_carrot_logs(
                 "onroad", send_settings=True, consent_generation=onroad_tmux_generation,
+                master_generation=onroad_tmux_master_generation,
               )
               carrot_logs_ok = carrot_logs_response is not None and getattr(carrot_logs_response, "ok", False)
               if web_ok or carrot_logs_ok:
@@ -1379,22 +1542,42 @@ class CarrotMan:
                 is_tmux_sent = True
               else:
                 onroad_tmux_next_attempt_at = now + CARROT_EXCEPTION_UPLOAD_RETRY_SECONDS
-          carrot_exception = self.params.get("CarrotException")
+          carrot_exception, requested_consent_generation = parse_carrot_exception_request(
+            self.params.get("CarrotException"),
+          )
+          if (
+            carrot_exception in CARROT_EXCEPTION_TMUX_REASONS
+            and not carrot_exception_request_allowed(
+              carrot_exception,
+              requested_consent_generation,
+              self.params,
+            )
+          ):
+            self.params.put("CarrotException", "")
+            carrot_exception = None
+            requested_consent_generation = None
           if not is_onroad and (carrot_exception == "can_error" or pending_tmux_reason == "can_error"):
             if carrot_exception == "can_error":
               self.params.put("CarrotException", "")
             pending_tmux_reason = None
             pending_tmux_generation = None
+            pending_tmux_master_generation = None
             pending_tmux_next_attempt_at = 0.0
             reset_carrot_exception_tmux_send_queue()
             carrot_exception = None
             print("[carrot_man] CAN error tmux canceled after going offroad")
 
-          if carrot_tmux_reason_allowed(carrot_exception, community_data_sharing) \
+          if (master_generation is not None
+              and carrot_tmux_reason_allowed(carrot_exception, community_data_sharing)) \
               and pending_tmux_reason is None and now >= pending_tmux_next_attempt_at:
             if self.make_tmux_data():
               pending_tmux_reason = carrot_exception
-              pending_tmux_generation = community_generation if carrot_exception != "tmux_send" else None
+              pending_tmux_generation = (
+                requested_consent_generation if carrot_exception != "tmux_send" else None
+              )
+              pending_tmux_master_generation = (
+                requested_consent_generation if carrot_exception == "tmux_send" else master_generation
+              )
               pending_tmux_next_attempt_at = 0.0
               print(f"[carrot_man] tmux captured for {carrot_exception}; waiting for network upload")
             else:
@@ -1406,17 +1589,20 @@ class CarrotMan:
               and (
                 pending_tmux_reason == "tmux_send"
                 or community_data_sharing_generation_matches(pending_tmux_generation, self.params)
-              )):
+              )
+              and third_party_data_sharing_generation_matches(pending_tmux_master_generation, self.params)):
             web_response = self.send_tmux_web(
               pending_tmux_reason,
               send_settings=False,
               consent_generation=pending_tmux_generation,
+              master_generation=pending_tmux_master_generation,
             )
             web_ok = web_response is not None and getattr(web_response, "ok", False)
             carrot_logs_response = self.send_tmux_carrot_logs(
               pending_tmux_reason,
               send_settings=False,
               consent_generation=pending_tmux_generation,
+              master_generation=pending_tmux_master_generation,
             )
             carrot_logs_ok = carrot_logs_response is not None and getattr(carrot_logs_response, "ok", False)
             discord_ok = self.send_tmux_discord(
@@ -1424,6 +1610,7 @@ class CarrotMan:
               web_ok,
               web_response,
               consent_generation=pending_tmux_generation,
+              master_generation=pending_tmux_master_generation,
             )
             if web_ok or carrot_logs_ok or discord_ok:
               print(f"[carrot_man] tmux upload complete for {pending_tmux_reason}: web_ok={web_ok}, carrot_logs_ok={carrot_logs_ok}, discord_ok={discord_ok}")
@@ -1432,6 +1619,7 @@ class CarrotMan:
               self.params.put("CarrotException", "")
               pending_tmux_reason = None
               pending_tmux_generation = None
+              pending_tmux_master_generation = None
               pending_tmux_next_attempt_at = 0.0
               reset_carrot_exception_tmux_send_queue()
             else:
@@ -1453,12 +1641,19 @@ class CarrotMan:
           #print(echo)
           socket.send(echo.encode())
         elif 'tmux_send' in json_obj:
-          tmux_created = self.make_tmux_data()
-          web_response = self.send_tmux_web("tmux_send") if tmux_created else None
+          master_generation = third_party_data_sharing_generation(self.params)
+          tmux_created = master_generation is not None and self.make_tmux_data()
+          web_response = self.send_tmux_web(
+            "tmux_send", master_generation=master_generation,
+          ) if tmux_created else None
           web_ok = web_response is not None and getattr(web_response, "ok", False)
-          carrot_logs_response = self.send_tmux_carrot_logs("tmux_send") if tmux_created else None
+          carrot_logs_response = self.send_tmux_carrot_logs(
+            "tmux_send", master_generation=master_generation,
+          ) if tmux_created else None
           carrot_logs_ok = carrot_logs_response is not None and getattr(carrot_logs_response, "ok", False)
-          discord_ok = self.send_tmux_discord("tmux_send", web_ok, web_response) if tmux_created else False
+          discord_ok = self.send_tmux_discord(
+            "tmux_send", web_ok, web_response, master_generation=master_generation,
+          ) if tmux_created else False
           result = "success" if web_ok or carrot_logs_ok or discord_ok else "failed"
           echo = json.dumps({"tmux_send": True, "result": result, "web_ok": web_ok, "carrot_logs_ok": carrot_logs_ok, "discord_ok": discord_ok})
           socket.send(echo.encode())

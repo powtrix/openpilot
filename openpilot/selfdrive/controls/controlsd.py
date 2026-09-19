@@ -137,6 +137,20 @@ class Controls:
     except Exception:
       pass
 
+    # Startup-only opt-in: OFF keeps the legacy numerical path and never even
+    # imports/constructs the experimental controller. The web setting is saved
+    # only offroad and latched at the next controls start; no mid-corner swap.
+    self.dk_experimental_steering = None
+    try:
+      if (self.dk_ka4_stock_scc_resume_gate and
+          self.CP.steerControlType == car.CarParams.SteerControlType.torque and
+          not self.CP.flags & HyundaiFlags.ANGLE_CONTROL and
+          self.CP.lateralTuning.which() == 'torque' and self.params.get_bool("DkExperimentalSteering")):
+        from openpilot.selfdrive.controls.lib.dk_experimental_steering import DkExperimentalSteering
+        self.dk_experimental_steering = DkExperimentalSteering(cloudlog.debug)
+    except Exception:
+      cloudlog.exception("DK experimental steering unavailable; retaining legacy control")
+
   def update(self):
     self.sm.update(15)
     if self.sm.updated["liveCalibration"]:
@@ -228,6 +242,12 @@ class Controls:
       alpha = 1 - np.exp(-DT_CTRL / tau) if tau > 0 else 1
       return alpha * val + (1 - alpha) * prev_val
 
+    dk_experimental = getattr(self, 'dk_experimental_steering', None)
+    # An independent legacy shadow prevents a bounded preview correction from
+    # accumulating through the next tick's legacy smoothing/filter state.
+    smoothing_previous = (dk_experimental.legacy_curvature if dk_experimental is not None
+                          else self.desired_curvature)
+
     if not CC.latActive:
       new_desired_curvature = self.curvature
     elif self.is_vw_meb:
@@ -237,7 +257,7 @@ class Controls:
       if self.lanefull_mode_enabled and len(lat_plan.curvatures) > 0:
         curvature = get_lag_adjusted_curvature(self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
                                                steer_actuator_delay + lat_smooth_seconds, lat_plan.distances)
-        new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
+        new_desired_curvature = smooth_value(curvature, smoothing_previous, lat_smooth_seconds)
       else:
         new_desired_curvature = float(model_v2.action.desiredCurvature)  # raw 모델곡률 (if2 기본과 동일)
     elif self.lanefull_mode_enabled:
@@ -248,9 +268,21 @@ class Controls:
           self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
           steer_actuator_delay + lat_smooth_seconds, lat_plan.distances,
         )
-        new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
+        new_desired_curvature = smooth_value(curvature, smoothing_previous, lat_smooth_seconds)
     else:
-      new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, self.desired_curvature, 0.1)
+      new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, smoothing_previous, 0.1)
+
+    if dk_experimental is not None:
+      try:
+        experimental_curvature = float(dk_experimental.update_from_controls(self, CC, new_desired_curvature, steer_actuator_delay))
+        if not math.isfinite(experimental_curvature):
+          raise ValueError("nonfinite experimental steering proposal")
+        new_desired_curvature = experimental_curvature
+      except Exception:
+        # A broken optional feature must not stop controlsd or create a retry
+        # storm. Existing clipping still bounds the transition to legacy.
+        self.dk_experimental_steering = None
+        cloudlog.exception("DK experimental steering disabled after failure")
 
     dk_previous_desired_curvature = self.desired_curvature  # observation only
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
@@ -499,6 +531,12 @@ class Controls:
     cc_send.valid = CS.canValid
     cc_send.carControl = CC
     self.pm.send('carControl', cc_send)
+
+    if getattr(self, 'dk_experimental_steering', None) is not None:
+      try:
+        self.dk_experimental_steering.emit(float(CC.actuators.torque), float(self.desired_curvature))
+      except Exception:
+        pass
 
     # Runs after both existing publications; diagnostic state is never an input
     # to the control calculations. The helper bounds logging to at most 10 Hz.

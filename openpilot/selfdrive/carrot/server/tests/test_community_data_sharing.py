@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 import openpilot.common.params as params_module
+import pytest
 from openpilot.common.external_data import DK_THIRD_PARTY_DATA_SHARING_PARAM
 from openpilot.selfdrive.carrot import community_data, cweb_push
 from openpilot.selfdrive.carrot.server.features import setting_popular_values
@@ -90,13 +91,26 @@ def test_community_data_gate_also_requires_dk_master_consent():
   assert community_data.community_data_sharing_enabled(params)
 
 
+def test_community_consent_body_caps_each_read_and_rejects_off_on_aba():
+  params = FakeParams(True)
+  generation = community_data.community_data_sharing_generation(params)
+  assert generation is not None
+  body = community_data.CommunityConsentBoundBytes(b"x" * (128 * 1024), params, generation)
+
+  assert body.read() == b"x" * (64 * 1024)
+  params._dk_consent_generation = "generation-2"
+
+  with pytest.raises(PermissionError, match="consent changed"):
+    body.read()
+
+
 def test_heartbeat_rechecks_consent_before_urlopen(monkeypatch):
   params = SequencedParams(
     [True, False],
     {"Version": "v1", "GithubUsername": "user", "IsOnroad": False},
   )
   monkeypatch.setattr(heartbeat, "get_local_ip", lambda: "192.168.1.10")
-  monkeypatch.setattr(heartbeat.urllib.request, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network called")))
+  monkeypatch.setattr(heartbeat, "open_url_no_redirect", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network called")))
 
   assert heartbeat.register_my_ip_sync(params) == (False, "Community data sharing disabled")
 
@@ -122,7 +136,7 @@ def test_heartbeat_enabled_preserves_post(monkeypatch):
 
   params = FakeParams(True, {"Version": "v1", "GithubUsername": "user", "IsOnroad": False})
   monkeypatch.setattr(heartbeat, "get_local_ip", lambda: "192.168.1.10")
-  monkeypatch.setattr(heartbeat.urllib.request, "urlopen", fake_urlopen)
+  monkeypatch.setattr(heartbeat, "open_url_no_redirect", fake_urlopen)
 
   assert heartbeat.register_my_ip_sync(params) == (True, "ok")
   assert len(calls) == 1
@@ -284,6 +298,28 @@ def test_popular_value_enabled_preserves_upload_and_download(monkeypatch):
   assert asyncio.run(popular_values.popular_value_upload_once(session))
   assert asyncio.run(popular_values.download_popular_values_once(session))["car_key"] == "CAR"
   assert [call[0] for call in session.calls] == ["POST", "GET"]
+  assert all(call[2]["allow_redirects"] is False for call in session.calls)
+
+
+def test_popular_value_response_is_discarded_after_master_off_on_aba(monkeypatch):
+  params = FakeParams(True, {"CarSelected3": "CAR"})
+  monkeypatch.setattr(popular_values, "HAS_PARAMS", True)
+  monkeypatch.setattr(popular_values, "Params", lambda: params)
+  monkeypatch.setattr(popular_values, "_popular_url", lambda _params: "https://example.test/popular")
+  monkeypatch.setattr(popular_values, "_current_settings_hash", lambda: "hash")
+  monkeypatch.setattr(popular_values, "_request_headers", lambda _params: {})
+
+  class RevokingResponse(FakeResponse):
+    async def json(self, content_type=None):
+      params._dk_consent_generation = "generation-2"
+      return await super().json(content_type)
+
+  class Session:
+    def get(self, _url, **kwargs):
+      assert kwargs["allow_redirects"] is False
+      return RevokingResponse(json_data={"ok": True, "car_key": "CAR", "popular_values": {}})
+
+  assert asyncio.run(popular_values.download_popular_values_once(Session())) is None
 
 
 def test_manual_popular_refresh_cannot_bypass_disabled_gate(monkeypatch):

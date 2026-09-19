@@ -1,4 +1,5 @@
 """Install exception handler for process crash."""
+from contextlib import contextmanager
 import threading
 
 import sentry_sdk
@@ -13,12 +14,53 @@ from openpilot.common.external_data import (
   third_party_data_sharing_generation_matches,
 )
 from openpilot.common.params import Params
+from openpilot.selfdrive.carrot.community_data import automatic_diagnostic_request
 from openpilot.system.athena.registration import is_registered_device
 from openpilot.system.hardware import HARDWARE, PC
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.version import get_build_metadata, get_version
 
 SENTRY_CONSENT_GENERATION_FIELD = "_dk_consent_generation"
+SENTRY_UPLOAD_CHUNK_SIZE = 64 * 1024
+_sentry_event_state = threading.local()
+
+
+class _ConsentBoundBody:
+  """File-like Sentry body that rechecks the exact consent write per chunk."""
+
+  def __init__(self, payload: bytes, consent_generation: str):
+    self._payload = payload
+    self._consent_generation = consent_generation
+    self._offset = 0
+
+  def read(self, size: int = -1) -> bytes:
+    if not third_party_data_sharing_generation_matches(self._consent_generation):
+      raise RuntimeError("Sentry consent generation changed during network write")
+    if self._offset >= len(self._payload):
+      return b""
+    requested = SENTRY_UPLOAD_CHUNK_SIZE if size is None or size < 0 else min(size, SENTRY_UPLOAD_CHUNK_SIZE)
+    end = min(len(self._payload), self._offset + requested)
+    chunk = self._payload[self._offset:end]
+    self._offset = end
+    if not third_party_data_sharing_generation_matches(self._consent_generation):
+      raise RuntimeError("Sentry consent generation changed during network write")
+    return chunk
+
+
+@contextmanager
+def _bind_event_consent_generation(consent_generation: str):
+  previous = getattr(_sentry_event_state, "consent_generation", None)
+  _sentry_event_state.consent_generation = consent_generation
+  try:
+    yield
+  finally:
+    if previous is None:
+      try:
+        del _sentry_event_state.consent_generation
+      except AttributeError:
+        pass
+    else:
+      _sentry_event_state.consent_generation = previous
 
 
 class SentryProject(Enum):
@@ -57,13 +99,32 @@ class ConsentHttpTransport(HttpTransport):
     generation = getattr(self._dk_transport_state, "consent_generation", None)
     if not third_party_data_sharing_generation_matches(generation):
       raise RuntimeError("Sentry consent generation changed before network write")
-    return super()._request(method, endpoint_type, body, headers)
+    if not isinstance(body, (bytes, bytearray, memoryview)):
+      raise RuntimeError("Sentry request body cannot be consent guarded")
+
+    payload = bytes(body)
+    guarded_body = _ConsentBoundBody(payload, generation)
+    request_headers = dict(headers)
+    request_headers.setdefault("Content-Length", str(len(payload)))
+    response = self._pool.request(
+      method,
+      self._auth.get_api_url(endpoint_type),
+      body=guarded_body,
+      headers=request_headers,
+      redirect=False,
+    )
+    if not third_party_data_sharing_generation_matches(generation):
+      response.close()
+      raise RuntimeError("Sentry consent generation changed during network request")
+    return response
 
 
 def _before_send(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str, Any] | None:
   """Recheck consent after event enrichment, immediately before SDK transport."""
   try:
-    generation = third_party_data_sharing_generation()
+    generation = getattr(_sentry_event_state, "consent_generation", None)
+    if generation is None:
+      generation = third_party_data_sharing_generation()
     if generation is None:
       return None
     event[SENTRY_CONSENT_GENERATION_FIELD] = generation
@@ -80,31 +141,42 @@ def _ensure_initialized(project: SentryProject) -> bool:
 
 def report_tombstone(fn: str, message: str, contents: str) -> None:
   cloudlog.error({'tombstone': message})
-  if not third_party_data_sharing_enabled():
+  consent_generation = third_party_data_sharing_generation()
+  if consent_generation is None:
     return
   if not _ensure_initialized(SentryProject.SELFDRIVE_NATIVE):
     return
+  if not third_party_data_sharing_generation_matches(consent_generation):
+    return
 
-  with sentry_sdk.configure_scope() as scope:
-    scope.set_extra("tombstone_fn", fn)
-    scope.set_extra("tombstone", contents)
-    sentry_sdk.capture_message(message=message)
-    sentry_sdk.flush()
+  with _bind_event_consent_generation(consent_generation):
+    with sentry_sdk.configure_scope() as scope:
+      scope.set_extra("tombstone_fn", fn)
+      scope.set_extra("tombstone", contents)
+      sentry_sdk.capture_message(message=message)
+      sentry_sdk.flush()
 
 
 def capture_exception(*args, **kwargs) -> None:
   cloudlog.error("crash", exc_info=kwargs.get('exc_info', 1))
   params = Params()
+  consent_generation = third_party_data_sharing_generation(params)
   if not params.get_bool("CarrotExceptionSent"):
-    params.put("CarrotException", "exception")
-  if not third_party_data_sharing_enabled(params):
+    params.put(
+      "CarrotException",
+      automatic_diagnostic_request("exception", params) or "exception",
+    )
+  if consent_generation is None:
     return
   if not _ensure_initialized(SentryProject.SELFDRIVE):
     return
+  if not third_party_data_sharing_generation_matches(consent_generation, params):
+    return
 
   try:
-    sentry_sdk.capture_exception(*args, **kwargs)
-    sentry_sdk.flush()  # https://github.com/getsentry/sentry-python/issues/291
+    with _bind_event_consent_generation(consent_generation):
+      sentry_sdk.capture_exception(*args, **kwargs)
+      sentry_sdk.flush()  # https://github.com/getsentry/sentry-python/issues/291
   except Exception:
     cloudlog.exception("sentry exception")
 

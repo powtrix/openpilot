@@ -194,16 +194,49 @@ def diagnostic_statement(node):
   return False
 
 
+def experimental_off_method(node):
+  """Evaluate only the explicit opt-in hooks with the startup option OFF.
+
+  Retain the pre-existing baseline hashes below: the new option must not turn
+  a test of legacy equivalence into a freshly blessed changed baseline.
+  """
+  class OffPrevious(ast.NodeTransformer):
+    def visit_Name(self, name):
+      if name.id == "smoothing_previous":
+        return ast.copy_location(ast.Attribute(value=ast.Name(id="self", ctx=ast.Load()),
+                                               attr="desired_curvature", ctx=ast.Load()), name)
+      return name
+
+  retained = []
+  for statement in node.body:
+    if isinstance(statement, ast.Try) and "dk_experimental_steering" in ast.unparse(statement):
+      continue
+    if isinstance(statement, ast.Assign) and any(ast.unparse(target) in (
+        "self.dk_experimental_steering", "dk_experimental", "smoothing_previous") for target in statement.targets):
+      if any(ast.unparse(target) == "smoothing_previous" for target in statement.targets):
+        assert isinstance(statement.value, ast.IfExp)
+        assert ast.unparse(statement.value.orelse) == "self.desired_curvature"
+      continue
+    if isinstance(statement, ast.If) and any(token in ast.unparse(statement.test) for token in (
+        "get_bool('DkExperimentalSteering')", "dk_experimental is not None", "'dk_experimental_steering'")):
+      assert not statement.orelse
+      continue
+    retained.append(statement)
+  node.body = retained
+  return OffPrevious().visit(node)
+
+
 @pytest.mark.parametrize("method,baseline_hash", [
   ("__init__", "d40c3dfa12df0cc6740c5fe49c5c7688affefb24140c03dff7c27b9569562821"),
   ("state_control", "19e31d33648a56646e9c1550c2842ab98952b9f913b4a488e4f84279c2cace0f"),
   ("publish", "ce8c17ca6491eb9d733bed6878514070f721544c2d9ee385ac81e1f9cf9e23b0"),
 ])
 def test_control_math_order_and_publication_are_identical_to_pre_observer_baseline(method, baseline_hash):
-  # Baseline: shipped 6810e4e9bb. Removing only the explicit observer hooks must
+  # Baseline: shipped 6810e4e9bb. With the explicit experiment OFF, removing observer hooks must
   # leave every existing control expression and ordering byte-for-byte AST equal.
   node = method_ast(method)
   node.body = [statement for statement in node.body if not diagnostic_statement(statement)]
+  node = experimental_off_method(node)
   digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
   assert digest == baseline_hash
 
@@ -290,6 +323,19 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
     plan = NS(useLaneLines=lane_mode, mpcSolutionValid=True, modelMonoTime=1_000_000_000,
               curvatures=[0.02] * 17, psis=[0.004 * i for i in range(17)], distances=[i * 0.2 for i in range(17)])
     controls = Controls.__new__(Controls)
+    if mode in ("experiment_throws", "experiment_nan"):
+      def experimental_failure(*args):
+        if mode == "experiment_throws":
+          raise RuntimeError("injected experimental control failure")
+        return float("nan")
+      controls.dk_experimental_steering = NS(legacy_curvature=0.0, update_from_controls=experimental_failure)
+    if mode == "legacy_ast":
+      from types import MethodType
+      import openpilot.selfdrive.controls.controlsd as controls_module
+      legacy_node = experimental_off_method(method_ast("state_control"))
+      namespace = dict(vars(controls_module))
+      exec(compile(ast.fix_missing_locations(ast.Module(body=[legacy_node], type_ignores=[])), str(CONTROLSD), "exec"), namespace)
+      controls.state_control = MethodType(namespace["state_control"], controls)
     CP = controls.CP = car.CarParams.new_message()
     controls.params = FakeParams()
     controls.sm = SubMaster()
@@ -331,7 +377,7 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
     controls.sm["carState"].steeringAngleDeg = 25.0
     observer = DkLateralDiagnostics(broken if mode == "logger_fails" else records.append,
                                      lambda: controls.sm.frame * 10_000_000)
-    controls.dk_lateral_diagnostics = (None if mode == "disabled" else
+    controls.dk_lateral_diagnostics = (None if mode in ("disabled", "legacy_ast") else
                                        NS(capture=broken, emit=broken) if mode == "hook_fails" else observer)
     samples = []
     for frame in range(1, 41):
@@ -342,12 +388,19 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
       if controls.dk_lateral_diagnostics is observer:
         observer.emit(controls, CC)
       samples.append((CC.to_dict(), lateral.to_dict(), controls.LaC.pid.i, controls.desired_curvature))
+    if mode in ("experiment_throws", "experiment_nan"):
+      assert controls.dk_experimental_steering is None
     return samples, records
 
   baseline, _ = run("disabled")
+  # Compare the actual OFF code path with the pre-experiment method whose
+  # complete AST is independently pinned to the historical hash above.
+  assert run("legacy_ast")[0] == baseline
   observed, records = run("enabled")
   assert observed == baseline
   assert len(records) == 4  # Actual control path produced stage records, not merely swallowed exceptions.
   assert records[-1]["target_source"] == ("lane" if lane_mode else "model")
   assert run("logger_fails")[0] == baseline
   assert run("hook_fails")[0] == baseline
+  assert run("experiment_throws")[0] == baseline
+  assert run("experiment_nan")[0] == baseline

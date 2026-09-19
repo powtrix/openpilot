@@ -44,8 +44,18 @@ def load_dk_deployment_text(branch: str | bytes | None, path: Path = DK_RELEASE_
     deployed = datetime.strptime(deployed_at, timestamp_format)
     if deployed.strftime(timestamp_format) != deployed_at:
       return ""
+    # A requested release label may name a different date from its preparation
+    # timestamp. Keep the two explicit instead of inventing a deployment time.
+    label_date = deployed
+    if "label_date" in metadata:
+      value = metadata["label_date"]
+      if not isinstance(value, str):
+        return ""
+      label_date = datetime.strptime(value, "%Y-%m-%d")
+      if label_date.strftime("%Y-%m-%d") != value:
+        return ""
   except (OSError, ValueError, UnicodeError, RecursionError):
     return ""
 
   # A deployment date is not the device's installation date or Git commit date.
-  return f"{deployed:%m%d} {label}"
+  return f"{label_date:%m%d} {label}"

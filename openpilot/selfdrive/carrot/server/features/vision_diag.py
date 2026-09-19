@@ -2,6 +2,9 @@ import asyncio
 
 from aiohttp import web
 
+from openpilot.common.external_data import third_party_data_sharing_generation
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_generation
+
 from ..services.vision_diag import get_server_diagnostic_snapshot, upload_diagnostic_bundle_to_discord
 
 
@@ -11,6 +14,13 @@ async def api_vision_diag_server_snapshot(_request: web.Request) -> web.Response
 
 
 async def api_vision_diag_upload_discord(request: web.Request) -> web.Response:
+  consent_generation = third_party_data_sharing_generation()
+  community_generation = community_data_sharing_generation()
+  if consent_generation is None:
+    return web.json_response({
+      "ok": False,
+      "error": "third-party data sharing is disabled",
+    }, status=403)
   try:
     body = await request.json()
   except web.HTTPRequestEntityTooLarge:
@@ -26,6 +36,8 @@ async def api_vision_diag_upload_discord(request: web.Request) -> web.Response:
     console_text=str(body.get("console") or ""),
     console_filename=body.get("consoleFilename") or body.get("console_filename"),
     source=str(body.get("source") or "web"),
+    consent_generation=consent_generation,
+    community_generation=community_generation,
   )
   status = 200 if result.get("ok") or result.get("skipped") else 502
   return web.json_response({"ok": bool(result.get("ok")), "discord": result}, status=status)

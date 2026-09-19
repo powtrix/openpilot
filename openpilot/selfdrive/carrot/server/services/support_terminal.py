@@ -12,6 +12,9 @@ from typing import Any
 
 from aiohttp import web, WSMsgType
 
+from openpilot.common.external_data import third_party_data_sharing_generation
+from openpilot.selfdrive.carrot.community_data import community_data_sharing_generation
+
 from ..config import WEB_DIR
 from ..terminal_commands import translate_meta_command
 from .support_discord import send_support_webhook, support_metadata
@@ -129,6 +132,8 @@ class SupportSession:
   expires_at: float
   ttl_seconds: int
   command_timeout_seconds: int
+  diagnostic_consent_generation: str | None = None
+  diagnostic_community_generation: str | None = None
   state: str = "starting"
   permission_mode: str = "approve_each"
   tunnel_url: str = ""
@@ -235,6 +240,8 @@ class SupportTerminalManager:
         ttl_seconds=ttl,
         permission_mode=permission,
         command_timeout_seconds=command_timeout,
+        diagnostic_consent_generation=third_party_data_sharing_generation(),
+        diagnostic_community_generation=community_data_sharing_generation(),
       )
       self._session = session
 
@@ -270,20 +277,25 @@ class SupportTerminalManager:
       metadata = await asyncio.to_thread(support_metadata)
       if await self._abort_if_not_current(session):
         return self.snapshot(None)
-      session.discord = await send_support_webhook(app.get("http"), {
-        "server": "Carrot",
-        "device": os.environ.get("CARROT_DEVICE_NAME", socket.gethostname()),
-        "sessionId": session.id,
-        "createdAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session.created_at)),
-        "url": session.tunnel_url,
-        "pin": session.pin,
-        "ttl_minutes": "unlimited" if session.ttl_seconds <= 0 else max(1, session.ttl_seconds // 60),
-        "permissionMode": session.permission_mode,
-        "commandTimeoutSeconds": session.command_timeout_seconds,
-        "terminalSession": PTY_SESSION.session,
-        "meta": metadata,
-        "note": session.note,
-      })
+      session.discord = await send_support_webhook(
+        app.get("http"),
+        {
+          "server": "Carrot",
+          "device": os.environ.get("CARROT_DEVICE_NAME", socket.gethostname()),
+          "sessionId": session.id,
+          "createdAt": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session.created_at)),
+          "url": session.tunnel_url,
+          "pin": session.pin,
+          "ttl_minutes": "unlimited" if session.ttl_seconds <= 0 else max(1, session.ttl_seconds // 60),
+          "permissionMode": session.permission_mode,
+          "commandTimeoutSeconds": session.command_timeout_seconds,
+          "terminalSession": PTY_SESSION.session,
+          "meta": metadata,
+          "note": session.note,
+        },
+        consent_generation=session.diagnostic_consent_generation,
+        community_generation=session.diagnostic_community_generation,
+      )
       if await self._abort_if_not_current(session):
         return self.snapshot(None)
       await self._set_status(session, "Ready")

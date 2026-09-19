@@ -761,10 +761,22 @@ def _tool_action(action: str, payload: dict) -> dict:
       return {"ok": False, "error": err or "tmux capture failed"}
     return {"ok": True, "file": "/download/tmux.log"}
   if action == "server_tmux_log":
+    master_generation = _third_party_data_sharing_generation()
+    community_generation = _community_data_sharing_generation()
+    if not _third_party_data_sharing_generation_matches(master_generation):
+      return {
+        "ok": False,
+        "error": "Third-party data sharing is disabled",
+        "disabled_by_third_party_sharing": True,
+      }
     rc, err = _capture_tmux_log()
     if rc != 0:
       return {"ok": False, "error": err or "tmux capture failed"}
-    result = _send_tmux_destinations("tmux_send")
+    result = _send_tmux_destinations(
+      "tmux_send",
+      master_generation=master_generation,
+      community_generation=community_generation,
+    )
     result["file"] = "/download/tmux.log"
     return result
   return {"ok": False, "error": f"unknown action: {action}"}
@@ -884,6 +896,40 @@ def _community_data_sharing_generation_matches(expected: str | None) -> bool:
   return expected is not None and _community_data_sharing_generation() == expected
 
 
+def _third_party_data_sharing_generation() -> str | None:
+  return _consent_param_generation(THIRD_PARTY_DATA_SHARING_PARAM)
+
+
+def _third_party_data_sharing_generation_matches(expected: str | None) -> bool:
+  return expected is not None and _third_party_data_sharing_generation() == expected
+
+
+_CONSENT_GENERATION_UNSET = object()
+CONSENT_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+class _ConsentBoundBytes:
+  def __init__(self, payload: bytes, request_allowed: Callable[[], bool]) -> None:
+    self.payload = payload
+    self.request_allowed = request_allowed
+    self.offset = 0
+
+  def read(self, size: int = -1) -> bytes:
+    if not self.request_allowed():
+      raise PermissionError("third-party data sharing consent changed")
+    if self.offset >= len(self.payload):
+      return b""
+    if size is None or size < 0:
+      size = CONSENT_STREAM_CHUNK_SIZE
+    size = min(int(size), CONSENT_STREAM_CHUNK_SIZE)
+    end = min(len(self.payload), self.offset + size)
+    chunk = self.payload[self.offset:end]
+    self.offset = end
+    if not self.request_allowed():
+      raise PermissionError("third-party data sharing consent changed")
+    return chunk
+
+
 class _CommunityConsentBoundBytes:
   def __init__(self, payload: bytes, consent_generation: str) -> None:
     self.payload = payload
@@ -895,9 +941,14 @@ class _CommunityConsentBoundBytes:
       raise PermissionError("community data sharing consent changed")
     if self.offset >= len(self.payload):
       return b""
-    end = len(self.payload) if size is None or size < 0 else min(len(self.payload), self.offset + size)
+    if size is None or size < 0:
+      size = CONSENT_STREAM_CHUNK_SIZE
+    size = min(int(size), CONSENT_STREAM_CHUNK_SIZE)
+    end = min(len(self.payload), self.offset + size)
     chunk = self.payload[self.offset:end]
     self.offset = end
+    if not _community_data_sharing_generation_matches(self.consent_generation):
+      raise PermissionError("community data sharing consent changed")
     return chunk
 
 
@@ -1243,9 +1294,11 @@ def _request_result(
   try:
     if request_allowed is not None and not request_allowed():
       raise PermissionError("upload request is no longer allowed")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _open_no_redirect(request, timeout) as response:
       status = int(response.status)
       response_data = response.read(1024 * 1024)
+      if request_allowed is not None and not request_allowed():
+        raise PermissionError("upload request is no longer allowed")
       try:
         response_body = json.loads(response_data.decode("utf-8")) if response_data else None
       except Exception:
@@ -1261,13 +1314,30 @@ def _request_result(
     return {"configured": True, "ok": False, "error": str(exc)}
 
 
-def _post_json(url: str, payload: dict, timeout: int = 12) -> dict:
-  request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    return None
+
+
+def _open_no_redirect(request: urllib.request.Request, timeout: int):
+  return urllib.request.build_opener(_NoRedirectHandler()).open(request, timeout=timeout)
+
+
+def _post_json(
+  url: str,
+  payload: dict,
+  timeout: int = 12,
+  request_allowed: Callable[[], bool] | None = None,
+) -> dict:
+  encoded = json.dumps(payload).encode()
+  data = _ConsentBoundBytes(encoded, request_allowed) if request_allowed is not None else encoded
+  request = urllib.request.Request(url, data=data, headers={
     "Content-Type": "application/json",
+    "Content-Length": str(len(encoded)),
     "Accept": "application/json",
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
-  return _request_result(request, timeout)
+  return _request_result(request, timeout, request_allowed)
 
 
 def _post_tmux_upload(
@@ -1278,9 +1348,11 @@ def _post_tmux_upload(
   request_allowed: Callable[[], bool] | None = None,
 ) -> dict:
   body, boundary = _multipart_form(payload, [("files[0]", "tmux.log", "text/plain", raw)])
-  request = urllib.request.Request(url, data=body, headers={
+  data = _ConsentBoundBytes(body, request_allowed) if request_allowed is not None else body
+  request = urllib.request.Request(url, data=data, headers={
     **headers,
     "Content-Type": f"multipart/form-data; boundary={boundary}",
+    "Content-Length": str(len(body)),
     "Accept": "application/json",
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
@@ -1292,10 +1364,28 @@ def _post_tmux_upload(
       "disabled_by_community_sharing": True,
       "error": "Carrot community data sharing is disabled",
     }
-  return _request_result(request, 30)
+  return _request_result(request, 30, request_allowed)
 
 
-def _send_tmux_dsm(payload: dict[str, str], raw: bytes) -> dict:
+def _send_tmux_dsm(
+  payload: dict[str, str],
+  raw: bytes,
+  master_generation=_CONSENT_GENERATION_UNSET,
+) -> dict:
+  if master_generation is _CONSENT_GENERATION_UNSET:
+    master_generation = _third_party_data_sharing_generation()
+
+  def request_allowed() -> bool:
+    return _third_party_data_sharing_generation_matches(master_generation)
+
+  if not request_allowed():
+    return {
+      "configured": True,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_third_party_sharing": True,
+      "error": "Third-party data sharing is disabled",
+    }
   try:
     base_url = _web_upload_base_url()
     token = os.environ.get("CARROT_WEB_UPLOAD_TOKEN", "").strip()
@@ -1303,7 +1393,11 @@ def _send_tmux_dsm(payload: dict[str, str], raw: bytes) -> dict:
       session_payload = {key: str(value or "")[:160] for key, value in payload.items()}
       session_payload["deviceId"] = payload.get("dongle_id") or payload.get("device_serial") or "unknown"
       session_payload["purpose"] = "tmux"
-      session = _post_json(f"{base_url}/api/v1/session", session_payload)
+      session = _post_json(
+        f"{base_url}/api/v1/session",
+        session_payload,
+        request_allowed=request_allowed,
+      )
       body = session.get("body") if isinstance(session.get("body"), dict) else {}
       token = str(body.get("token") or "").strip()
       if not session.get("ok") or not body.get("ok") or not token:
@@ -1313,13 +1407,30 @@ def _send_tmux_dsm(payload: dict[str, str], raw: bytes) -> dict:
       {"Authorization": f"Bearer {token}"},
       payload,
       raw,
+      request_allowed,
     )
   except Exception as exc:
     return {"configured": True, "ok": False, "error": str(exc)}
 
 
-def _send_tmux_carrot_logs(payload: dict[str, str], raw: bytes) -> dict:
-  if not _community_data_sharing_enabled():
+def _send_tmux_carrot_logs(
+  payload: dict[str, str],
+  raw: bytes,
+  master_generation=_CONSENT_GENERATION_UNSET,
+  community_generation=_CONSENT_GENERATION_UNSET,
+) -> dict:
+  if master_generation is _CONSENT_GENERATION_UNSET:
+    master_generation = _third_party_data_sharing_generation()
+  if community_generation is _CONSENT_GENERATION_UNSET:
+    community_generation = _community_data_sharing_generation()
+
+  def request_allowed() -> bool:
+    return (
+      _third_party_data_sharing_generation_matches(master_generation)
+      and _community_data_sharing_generation_matches(community_generation)
+    )
+
+  if not request_allowed():
     return {
       "configured": True,
       "ok": False,
@@ -1329,17 +1440,46 @@ def _send_tmux_carrot_logs(payload: dict[str, str], raw: bytes) -> dict:
     }
   try:
     return _post_tmux_upload(
-      _carrot_logs_url(), {}, payload, raw, _community_data_sharing_enabled,
+      _carrot_logs_url(), {}, payload, raw, request_allowed,
     )
   except Exception as exc:
     return {"configured": True, "ok": False, "error": str(exc)}
 
 
-def _send_tmux_discord(reason: str, raw: bytes | None = None, web_result: dict | None = None) -> dict:
+def _send_tmux_discord(
+  reason: str,
+  raw: bytes | None = None,
+  web_result: dict | None = None,
+  master_generation=_CONSENT_GENERATION_UNSET,
+  community_generation=_CONSENT_GENERATION_UNSET,
+) -> dict:
+  if master_generation is _CONSENT_GENERATION_UNSET:
+    master_generation = _third_party_data_sharing_generation()
+  if not _third_party_data_sharing_generation_matches(master_generation):
+    return {
+      "configured": False,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_third_party_sharing": True,
+      "error": "Third-party data sharing is disabled",
+    }
   url = _exception_webhook_url()
   if not url or not url.startswith(("http://", "https://")):
     return {"configured": bool(url), "ok": False, "error": "Discord webhook is not configured"}
-  if url == _default_exception_webhook_url() and not _community_data_sharing_enabled():
+  requires_community_consent = url == _default_exception_webhook_url()
+  if community_generation is _CONSENT_GENERATION_UNSET:
+    community_generation = _community_data_sharing_generation()
+
+  def request_allowed() -> bool:
+    return (
+      _third_party_data_sharing_generation_matches(master_generation)
+      and (
+        not requires_community_consent
+        or _community_data_sharing_generation_matches(community_generation)
+      )
+    )
+
+  if not request_allowed():
     return {
       "configured": True,
       "ok": False,
@@ -1369,12 +1509,13 @@ def _send_tmux_discord(reason: str, raw: bytes | None = None, web_result: dict |
     "flags": 4,
   }
   body, boundary = _discord_multipart(payload, filename, raw)
-  request = urllib.request.Request(url, data=body, headers={
+  request = urllib.request.Request(url, data=_ConsentBoundBytes(body, request_allowed), headers={
     "Content-Type": f"multipart/form-data; boundary={boundary}",
+    "Content-Length": str(len(body)),
     "Accept": "application/json",
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
-  if url == _default_exception_webhook_url() and not _community_data_sharing_enabled():
+  if not request_allowed():
     return {
       "configured": True,
       "ok": False,
@@ -1382,20 +1523,36 @@ def _send_tmux_discord(reason: str, raw: bytes | None = None, web_result: dict |
       "disabled_by_community_sharing": True,
       "error": "Carrot community data sharing is disabled",
     }
-  result = _request_result(request, 12)
+  result = _request_result(request, 12, request_allowed)
   result.pop("body", None)
   return result
 
 
-def _send_tmux_destinations(reason: str) -> dict:
+def _send_tmux_destinations(
+  reason: str,
+  master_generation=_CONSENT_GENERATION_UNSET,
+  community_generation=_CONSENT_GENERATION_UNSET,
+) -> dict:
+  if master_generation is _CONSENT_GENERATION_UNSET:
+    master_generation = _third_party_data_sharing_generation()
+  if community_generation is _CONSENT_GENERATION_UNSET:
+    community_generation = _community_data_sharing_generation()
+  if not _third_party_data_sharing_generation_matches(master_generation):
+    return {
+      "ok": False,
+      "partial": False,
+      "destinations": {},
+      "error": "Third-party data sharing is disabled",
+      "disabled_by_third_party_sharing": True,
+    }
   try:
     raw = Path(TMUX_LOG_PATH).read_bytes()
   except Exception as exc:
     return {"ok": False, "error": f"tmux log read failed: {exc}"}
   payload = _tmux_upload_payload(reason)
-  dsm = _send_tmux_dsm(payload, raw)
-  carrot_logs = _send_tmux_carrot_logs(payload, raw)
-  discord = _send_tmux_discord(reason, raw, dsm)
+  dsm = _send_tmux_dsm(payload, raw, master_generation)
+  carrot_logs = _send_tmux_carrot_logs(payload, raw, master_generation, community_generation)
+  discord = _send_tmux_discord(reason, raw, dsm, master_generation, community_generation)
   destinations = {"dsm": dsm, "carrot_logs": carrot_logs, "discord": discord}
   ok = any(result.get("ok") for result in destinations.values())
   failed = [name for name, result in destinations.items() if not result.get("ok")]
@@ -1455,40 +1612,71 @@ def _support_message(payload: dict) -> str:
   return "\n".join(lines)[:1900]
 
 
-def _send_support_webhook(payload: dict) -> dict:
+def _send_support_webhook(
+  payload: dict,
+  consent_generation=_CONSENT_GENERATION_UNSET,
+  community_generation=_CONSENT_GENERATION_UNSET,
+) -> dict:
+  if consent_generation is _CONSENT_GENERATION_UNSET:
+    consent_generation = _third_party_data_sharing_generation()
+
+  def master_request_allowed() -> bool:
+    return _third_party_data_sharing_generation_matches(consent_generation)
+
+  if not master_request_allowed():
+    return {
+      "configured": False,
+      "ok": False,
+      "skipped": True,
+      "disabled_by_third_party_sharing": True,
+    }
   if os.environ.get("CARROT_SUPPORT_DISCORD_WEBHOOK_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
     return {"configured": True, "ok": False, "skipped": True, "disabled": True}
   url = _support_webhook_url()
   if not url or not url.startswith(("http://", "https://")):
     return {"configured": bool(url), "ok": False, "skipped": True}
-  if url == _default_support_webhook_url() and not _community_data_sharing_enabled():
-    return {
-      "configured": True,
-      "ok": False,
-      "skipped": True,
-      "disabled_by_community_sharing": True,
-    }
+  requires_community_consent = url == _default_support_webhook_url()
+  if community_generation is _CONSENT_GENERATION_UNSET:
+    community_generation = _community_data_sharing_generation()
+
+  def request_allowed() -> bool:
+    return (
+      master_request_allowed()
+      and (
+        not requires_community_consent
+        or _community_data_sharing_generation_matches(community_generation)
+      )
+    )
+
+  def blocked_result() -> dict:
+    reason = (
+      "disabled_by_community_sharing"
+      if master_request_allowed() and requires_community_consent
+      else "disabled_by_third_party_sharing"
+    )
+    return {"configured": True, "ok": False, "skipped": True, reason: True}
+
+  if not request_allowed():
+    return blocked_result()
   body = json.dumps({
     "username": "Carrot Support",
     "content": _support_message(payload),
     "allowed_mentions": {"parse": []},
     "flags": 4,
   }).encode("utf-8")
-  req = urllib.request.Request(url, data=body, headers={
+  req = urllib.request.Request(url, data=_ConsentBoundBytes(body, request_allowed), headers={
     "Content-Type": "application/json",
+    "Content-Length": str(len(body)),
     "Accept": "application/json",
     # Discord rejects urllib's default Python-urllib user agent with HTTP 403.
     "User-Agent": "CarrotRecovery/2.0",
   }, method="POST")
-  if url == _default_support_webhook_url() and not _community_data_sharing_enabled():
-    return {
-      "configured": True,
-      "ok": False,
-      "skipped": True,
-      "disabled_by_community_sharing": True,
-    }
+  if not request_allowed():
+    return blocked_result()
   try:
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with _open_no_redirect(req, 12) as resp:
+      if not request_allowed():
+        raise PermissionError("third-party data sharing consent changed")
       return {"configured": True, "ok": 200 <= resp.status < 300, "status": resp.status}
   except urllib.error.HTTPError as exc:
     try:
@@ -1639,6 +1827,8 @@ class SupportSession:
     self.owner_conns: set = set()    # WsConn
     self.guest_conns: set = set()    # WsConn
     self.controller = None           # WsConn
+    self.diagnostic_consent_generation = _third_party_data_sharing_generation()
+    self.diagnostic_community_generation = _community_data_sharing_generation()
 
   def is_expired(self) -> bool:
     return self.expires_at > 0 and _now() >= self.expires_at
@@ -1739,7 +1929,7 @@ class SupportManager:
           "permissionMode": session.permission_mode,
           "commandTimeoutSeconds": session.command_timeout_seconds,
           "meta": _support_metadata(), "note": session.note,
-        })
+        }, session.diagnostic_consent_generation, session.diagnostic_community_generation)
         self.broadcast_owner({"type": "session_status", **self.snapshot(session)})
       threading.Thread(target=_notify, daemon=True).start()
       self._set_status(session, "Ready")

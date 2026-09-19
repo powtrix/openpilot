@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from openpilot.selfdrive.carrot import carrot_man
 from openpilot.selfdrive.carrot.carrot_man import (
   AUTOMATIC_EXCEPTION_TMUX_REASONS,
@@ -8,8 +10,25 @@ from openpilot.selfdrive.carrot.carrot_man import (
   carrot_can_error,
   carrot_can_error_sources,
   carrot_can_error_send_ready,
+  carrot_exception_request_allowed,
   carrot_tmux_reason_allowed,
+  diagnostic_consent_generation_changed,
+  parse_carrot_exception_request,
 )
+
+
+@pytest.fixture(autouse=True)
+def enabled_master_consent(monkeypatch):
+  monkeypatch.setattr(
+    carrot_man,
+    "third_party_data_sharing_generation",
+    lambda params=None: f"master:{getattr(params, '_dk_consent_generation', 'g1')}",
+  )
+  monkeypatch.setattr(
+    carrot_man,
+    "third_party_data_sharing_generation_matches",
+    lambda expected, params=None: expected == f"master:{getattr(params, '_dk_consent_generation', 'g1')}",
+  )
 
 
 def test_spi_error_requests_tmux_capture():
@@ -63,6 +82,8 @@ def test_can_error_ignores_stale_previous_onroad_state():
 class _FakeParams:
   def __init__(self, values=None):
     self.values = dict(values or {})
+    self.values.setdefault("DkThirdPartyDataSharing", "1")
+    self.values.setdefault("CarrotCommunityDataSharing", "1")
     self._dk_consent_generation = "g1"
 
   def get(self, key):
@@ -73,7 +94,7 @@ class _FakeParams:
 
 
 def test_automatic_exception_tmux_queue_fails_closed_without_community_consent(monkeypatch):
-  params = _FakeParams()
+  params = _FakeParams({"CarrotCommunityDataSharing": "0"})
   monkeypatch.setattr(carrot_man, "Params", lambda: params)
   monkeypatch.setattr(carrot_man, "community_data_sharing_enabled", lambda _params=None: False)
   carrot_man.reset_carrot_exception_tmux_send_queue()
@@ -89,8 +110,10 @@ def test_automatic_exception_tmux_queue_keeps_automatic_provenance(monkeypatch):
   carrot_man.reset_carrot_exception_tmux_send_queue()
 
   assert carrot_man.queue_carrot_exception_tmux_send("automatic failure")
-  assert params.values["CarrotException"] == "exception"
-  assert params.values["CarrotException"] in AUTOMATIC_EXCEPTION_TMUX_REASONS
+  reason, generation = parse_carrot_exception_request(params.values["CarrotException"])
+  assert reason == "exception"
+  assert generation is not None
+  assert carrot_exception_request_allowed(reason, generation, params)
   assert params.values["CarrotException"] != "tmux_send"
 
 
@@ -100,6 +123,37 @@ def test_explicit_tools_tmux_send_remains_allowed_without_community_consent():
   assert not carrot_tmux_reason_allowed("exception", False)
   assert not carrot_tmux_reason_allowed("can_error", False)
   assert carrot_tmux_reason_allowed("exception", True)
+
+
+def test_explicit_tmux_request_carries_exact_master_generation():
+  assert parse_carrot_exception_request("tmux_send:generation-1") == (
+    "tmux_send",
+    "generation-1",
+  )
+  # Legacy/unbound requests fail closed in the command loop because they have
+  # no exact generation to match.
+  assert parse_carrot_exception_request("tmux_send") == ("tmux_send", None)
+
+
+def test_automatic_tmux_request_rejects_legacy_and_off_on_aba():
+  params = _FakeParams({"CarrotCommunityDataSharing": "1"})
+  request = carrot_man.automatic_diagnostic_request("exception", params)
+  reason, generation = parse_carrot_exception_request(request)
+
+  assert reason == "exception"
+  assert generation is not None
+  assert carrot_exception_request_allowed(reason, generation, params)
+  assert not carrot_exception_request_allowed("exception", None, params)
+
+  params._dk_consent_generation = "g2"
+  assert not carrot_exception_request_allowed(reason, generation, params)
+
+
+def test_onroad_diagnostic_state_resets_for_off_on_generation_change():
+  sentinel = carrot_man._CONSENT_GENERATION_UNSET
+  assert not diagnostic_consent_generation_changed(sentinel, sentinel, "master-1", "community-1")
+  assert diagnostic_consent_generation_changed("master-1", "community-1", "master-2", "community-2")
+  assert diagnostic_consent_generation_changed("master-1", "community-1", None, None)
 
 
 def test_carrot_logs_and_bundled_exception_discord_are_gated(monkeypatch):
@@ -131,6 +185,26 @@ def test_custom_exception_discord_remains_independent(monkeypatch):
   assert instance._tmux_discord_webhook_url() == "https://operator.example/webhook"
 
 
+def test_master_off_blocks_explicit_custom_tmux_destinations_before_payload(monkeypatch):
+  instance = object.__new__(carrot_man.CarrotMan)
+  instance.params = _FakeParams()
+  monkeypatch.setattr(carrot_man, "third_party_data_sharing_generation", lambda _params=None: None)
+  monkeypatch.setattr(
+    carrot_man,
+    "third_party_data_sharing_generation_matches",
+    lambda *_args, **_kwargs: False,
+  )
+  monkeypatch.setenv("CARROT_EXCEPTION_DISCORD_WEBHOOK_URL", "https://operator.example/webhook")
+  monkeypatch.setattr(
+    instance,
+    "_tmux_upload_payload",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("payload must not be collected")),
+  )
+
+  assert instance.send_tmux_web("tmux_send") is None
+  assert instance.send_tmux_discord("tmux_send") is False
+
+
 def test_automatic_discord_multipart_stops_after_mid_file_revocation(monkeypatch, tmp_path):
   chunk_size = 64 * 1024
   tmux = tmp_path / "tmux.log"
@@ -151,8 +225,9 @@ def test_automatic_discord_multipart_stops_after_mid_file_revocation(monkeypatch
 
   sent_file_chunks = []
 
-  def fake_post(_url, *, data, headers, timeout):
+  def fake_post(_url, *, data, headers, timeout, allow_redirects):
     del headers, timeout
+    assert allow_redirects is False
     for chunk in data:
       if chunk == b"x" * chunk_size:
         sent_file_chunks.append(chunk)

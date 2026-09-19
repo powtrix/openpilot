@@ -36,6 +36,48 @@ def _multipart_token(value: Any) -> str:
   return str(value).replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
 
 
+def _request_is_allowed(request_allowed: Callable[[], bool]) -> bool:
+  try:
+    return bool(request_allowed())
+  except Exception:
+    return False
+
+
+async def guarded_async_bytes(payload: bytes, request_allowed: Callable[[], bool]):
+  for offset in range(0, len(payload), GUARDED_MULTIPART_CHUNK_SIZE):
+    if not _request_is_allowed(request_allowed):
+      raise PermissionError("upload request is no longer allowed")
+    yield payload[offset:offset + GUARDED_MULTIPART_CHUNK_SIZE]
+  if not _request_is_allowed(request_allowed):
+    raise PermissionError("upload request is no longer allowed")
+
+
+class GuardedBytesBody:
+  """File-like bytes body that rechecks authorization for each sync chunk."""
+
+  def __init__(self, payload: bytes, request_allowed: Callable[[], bool]) -> None:
+    self.payload = payload
+    self._request_allowed = request_allowed
+    self.offset = 0
+
+  def __len__(self) -> int:
+    return len(self.payload)
+
+  def read(self, size: int = -1) -> bytes:
+    if not _request_is_allowed(self._request_allowed):
+      raise PermissionError("upload request is no longer allowed")
+    if self.offset >= len(self.payload):
+      return b""
+    if size is None or size < 0:
+      size = GUARDED_MULTIPART_CHUNK_SIZE
+    end = min(len(self.payload), self.offset + min(size, GUARDED_MULTIPART_CHUNK_SIZE))
+    chunk = self.payload[self.offset:end]
+    self.offset = end
+    if not _request_is_allowed(self._request_allowed):
+      raise PermissionError("upload request is no longer allowed")
+    return chunk
+
+
 class GuardedMultipartBody:
   """Streaming multipart body that checks an authorization callback per chunk."""
 
@@ -101,6 +143,10 @@ class GuardedMultipartBody:
         if not chunk:
           break
         yield chunk
+
+  async def __aiter__(self):
+    for chunk in self:
+      yield chunk
 
 
 def normalize_base_url(value: Any, default: str = "") -> str:
@@ -334,11 +380,34 @@ async def create_web_upload_session(
   base_url: str,
   metadata: Mapping[str, Any],
   purpose: str = "dashcam",
+  request_allowed: Callable[[], bool] | None = None,
 ) -> str:
+  if request_allowed is not None and not request_allowed():
+    raise PermissionError("upload request is no longer allowed")
   timeout = ClientTimeout(total=12)
   async with ClientSession(timeout=timeout) as session:
-    async with session.post(api_url(base_url, "session"), json=_session_payload(metadata, purpose)) as resp:
+    if request_allowed is not None and not request_allowed():
+      raise PermissionError("upload request is no longer allowed")
+    payload = _session_payload(metadata, purpose)
+    if request_allowed is None:
+      request_kwargs = {"json": payload}
+    else:
+      encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+      request_kwargs = {
+        "data": guarded_async_bytes(encoded, request_allowed),
+        "headers": {
+          "Content-Type": "application/json",
+          "Content-Length": str(len(encoded)),
+        },
+      }
+    async with session.post(
+      api_url(base_url, "session"),
+      allow_redirects=False,
+      **request_kwargs,
+    ) as resp:
       text = await resp.text()
+      if request_allowed is not None and not request_allowed():
+        raise PermissionError("upload request is no longer allowed")
       try:
         body = json.loads(text)
       except Exception:
@@ -434,11 +503,26 @@ def create_web_upload_session_sync(
 ) -> str:
   if request_allowed is not None and not request_allowed():
     raise PermissionError("upload request is no longer allowed")
+  payload = _session_payload(metadata, purpose)
+  if request_allowed is None:
+    request_kwargs = {"json": payload}
+  else:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_kwargs = {
+      "data": GuardedBytesBody(encoded, request_allowed),
+      "headers": {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(encoded)),
+      },
+    }
   response = post(
     api_url(base_url, "session"),
-    json=_session_payload(metadata, purpose),
     timeout=12,
+    allow_redirects=False,
+    **request_kwargs,
   )
+  if request_allowed is not None and not request_allowed():
+    raise PermissionError("upload request is no longer allowed")
   try:
     body = response.json()
   except Exception:
@@ -477,36 +561,52 @@ def post_tmux_web(
         "Content-Type": body.content_type,
         "Content-Length": str(body.content_length),
       }
-      return post(
+      response = post(
         url,
         headers=guarded_headers,
         data=body,
         timeout=30,
+        allow_redirects=False,
       )
+      if not request_allowed():
+        raise PermissionError("upload request is no longer allowed")
+      return response
     return post(
       url,
       headers=dict(headers),
       data=dict(payload),
       files=files,
       timeout=30,
+      allow_redirects=False,
     )
 
 
-async def check_web_upload_health(base_url: str, token: str) -> dict[str, Any]:
+async def check_web_upload_health(
+  base_url: str,
+  token: str,
+  request_allowed: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
   started = time.monotonic()
 
   def elapsed_ms() -> int:
     return int((time.monotonic() - started) * 1000)
 
   try:
+    if request_allowed is not None and not request_allowed():
+      raise PermissionError("upload request is no longer allowed")
     timeout = ClientTimeout(total=12)
     async with ClientSession(timeout=timeout) as session:
       headers = {"Authorization": f"Bearer {token}"} if token else {}
+      if request_allowed is not None and not request_allowed():
+        raise PermissionError("upload request is no longer allowed")
       async with session.get(
         api_url(base_url, "health"),
         headers=headers,
+        allow_redirects=False,
       ) as resp:
         text = await resp.text()
+        if request_allowed is not None and not request_allowed():
+          raise PermissionError("upload request is no longer allowed")
         if resp.status == 200:
           result: dict[str, Any] = {"ok": True, "status": resp.status, "elapsed_ms": elapsed_ms()}
           try:
@@ -604,7 +704,12 @@ async def upload_folder_to_web(
       for _attempt in range(2):
         check_cancel()
         try:
-          async with session.put(url, data=send_file(), headers={"X-File-Size": str(file_size)}) as resp:
+          async with session.put(
+            url,
+            data=send_file(),
+            headers={"X-File-Size": str(file_size)},
+            allow_redirects=False,
+          ) as resp:
             text = await resp.text()
             try:
               body = json.loads(text)
@@ -737,18 +842,41 @@ async def upload_validation_folder_to_web(
   return True
 
 
-async def send_web_upload_complete(base_url: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def send_web_upload_complete(
+  base_url: str,
+  token: str,
+  payload: dict[str, Any],
+  request_allowed: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
   if not token:
     return {"ok": False, "error": "upload session is not configured"}
   try:
+    if request_allowed is not None and not request_allowed():
+      raise PermissionError("upload request is no longer allowed")
     timeout = ClientTimeout(total=12)
     async with ClientSession(timeout=timeout) as session:
+      if request_allowed is not None and not request_allowed():
+        raise PermissionError("upload request is no longer allowed")
+      encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+      if request_allowed is None:
+        request_kwargs = {"json": payload}
+        headers = {"Authorization": f"Bearer {token}"}
+      else:
+        request_kwargs = {"data": guarded_async_bytes(encoded, request_allowed)}
+        headers = {
+          "Authorization": f"Bearer {token}",
+          "Content-Type": "application/json",
+          "Content-Length": str(len(encoded)),
+        }
       async with session.post(
         api_url(base_url, "complete"),
-        json=payload,
-        headers={"Authorization": f"Bearer {token}"},
+        headers=headers,
+        allow_redirects=False,
+        **request_kwargs,
       ) as resp:
         text = await resp.text()
+        if request_allowed is not None and not request_allowed():
+          raise PermissionError("upload request is no longer allowed")
         try:
           body = json.loads(text)
         except Exception:

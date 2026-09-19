@@ -42,3 +42,24 @@ def test_xiaoge_packet_stops_before_payload_after_mid_send_revoke():
   assert not broadcaster.send_packet_to_client(FakeConnection(), b"private-payload", generation)
   assert len(writes) == 1
   assert b"private-payload" not in writes
+
+
+def test_xiaoge_packet_stops_between_bounded_payload_chunks_after_revoke():
+  params = FakeParams()
+  broadcaster = object.__new__(xiaoge_data.XiaogeDataBroadcaster)
+  broadcaster.params = params
+  writes = []
+
+  class FakeConnection:
+    def sendall(self, data):
+      writes.append(bytes(data))
+      if len(writes) == 2:
+        params._dk_consent_generation = "generation-2"
+
+  packet = b"x" * (xiaoge_data.CONSENT_STREAM_CHUNK_SIZE * 2 + 1)
+  generation = xiaoge_data.third_party_data_sharing_generation(params)
+  assert generation is not None
+  assert not broadcaster.send_packet_to_client(FakeConnection(), packet, generation)
+  assert len(writes) == 2
+  assert len(writes[1]) == xiaoge_data.CONSENT_STREAM_CHUNK_SIZE
+  assert sum(map(len, writes[1:])) < len(packet)

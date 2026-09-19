@@ -913,3 +913,18 @@ def test_service_write_requires_explicit_enable_capability(param_runtime):
     allow_third_party_data_sharing_enable=True,
   )
   assert param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] == 1
+
+
+def test_disabling_master_also_persists_community_off(param_runtime):
+  setting = {"default": 0, "min": 0, "max": 1}
+  param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] = 1
+  param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] = 1
+
+  params_service.set_param_value(
+    params_service.THIRD_PARTY_DATA_SHARING_PARAM,
+    0,
+    setting,
+  )
+
+  assert param_runtime.values[params_service.THIRD_PARTY_DATA_SHARING_PARAM] == 0
+  assert param_runtime.values[params_service.COMMUNITY_DATA_SHARING_PARAM] == 0

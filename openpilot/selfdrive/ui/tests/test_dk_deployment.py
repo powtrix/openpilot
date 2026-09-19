@@ -36,8 +36,18 @@ def test_release_label_is_configurable_and_date_prefix_tracks_metadata(tmp_path,
   assert load_dk_deployment_text("dkcarrot-wip", path) == f"1231 {label}"
 
 
-def test_installed_release_displays_braking_and_turn_return_log_label():
-  assert load_dk_deployment_text("dkcarrot-wip") == "0918 브레이크게이지/핸들복원로그"
+def test_installed_release_displays_requested_corner_and_steering_label():
+  assert load_dk_deployment_text("dkcarrot-wip") == "0920 코너/조향 개선"
+
+
+def test_explicit_label_date_does_not_invent_deployment_timestamp(tmp_path):
+  metadata = release_metadata(deployed_at="2026-09-19 22:28 KST", label_date="2026-09-20", label="코너/조향 개선")
+  assert load_dk_deployment_text("dkcarrot-wip", write_metadata(tmp_path, metadata)) == "0920 코너/조향 개선"
+
+
+@pytest.mark.parametrize("date", [None, False, 920, [], "0920", "2026-9-20", "2026-02-30", "2026-09-20\n"])
+def test_invalid_explicit_label_date_is_hidden(tmp_path, date):
+  assert load_dk_deployment_text("dkcarrot-wip", write_metadata(tmp_path, release_metadata(label_date=date))) == ""
 
 
 @pytest.mark.parametrize("label", [

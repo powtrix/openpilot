@@ -99,18 +99,18 @@ Ignoring `x0.01`, `x0.001`, `cm`, `km/h`, or `%` can make a value appear one hun
 
 ## Settings map
 
-The current `carrot_settings.json` contains **177 parameters**. Every entry is assigned to one of these menus:
+The current `dkcarrot-wip` `carrot_settings.json` contains **178 parameters**. Every entry is assigned to one of these menus:
 
 | Category | Count | Groups |
 |---|---:|---|
-| Driving control | 111 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
+| Driving control | 112 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
 | Vehicle and hardware | 14 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
 | Display | 37 | Information, path, brightness/on-road view, external HUD |
 | System | 15 | Recording/power, camera, network/map, sound, software |
 
 ## Driving control
 
-These 111 settings can affect vehicle motion. Change one item at a time.
+These 112 settings can affect vehicle motion. Change one item at a time.
 
 <a id="start-auto"></a>
 ### Startup and auto — 9 settings
@@ -141,12 +141,13 @@ Select a section title for the code-based state machine, units, and application 
 The result depends heavily on whether the car uses stock SCC and which button message the vehicle accepts. Diagnose unexpected behavior with the normal `CruiseButtonMode=0` behavior first.
 
 <a id="vehicle-steering"></a>
-### Vehicle steering — 36 settings
+### Vehicle steering — 37 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | Centering | `PathOffset`, `CameraYawTrimDeg` | Path position and camera-yaw trim |
 | Steering feel | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | Timing, smoothing, suspension angle, and steering ratio |
+| Experimental Steering | `DkExperimentalSteering` | Future-path-based corner-entry and automatic turn-exit target correction experiment |
 | [Lane change](lane-change.md) and automatic turn | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | Lane-change entry conditions and ATC behavior |
 | Lane mode | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | Lane-mode MPC weights and lane-line conditions |
 | Advanced torque | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | Custom torque-control gains |
@@ -157,6 +158,20 @@ A larger `SteerActuatorDelay` compensates by commanding earlier. A larger `LatSm
 The default `SteerRatioRate` of `100%` applies the learned steering ratio without scaling. It is used when `CustomSR=0`; a stored rate outside the allowed range (`30–200%`) safely falls back to `100%`.
 
 `LateralTorqueCustom` and `CustomSteer*` are advanced settings that can affect the vehicle tune and safety limits. Do not alter them without a vehicle-specific validated baseline and a recovery path.
+
+#### Experimental Steering Improvement
+
+Open **Settings → Driving → Steering → Experimental Steering**. `DkExperimentalSteering` is **OFF by default** and applies only to KA4 stock-SCC, torque-steering configurations on `dkcarrot-wip`.
+
+- **ON:** Corrects the steering target at corner entry and exit using the future path. The driver does not have to unwind first to trigger the experiment.
+- **Scope:** Corrections apply only in model mode at approximately **14–60 km/h**. Lane mode, lane changes, or invalid inputs return to existing control, withdrawing any residual correction within the limits.
+- **OFF:** Uses the existing steering calculation. Vehicle steering safety limits remain intact with either selection.
+- **Apply or restore:** Save the selection while parked/offroad. Both ON and OFF apply **when controls next starts**; **restart the device** after changing the selection to ensure application. Saving does not switch the currently running controller. The server also rejects changes while driving.
+- **Backups:** The experiment is excluded from file/QR backups and cannot be enabled by restores or profiles, preventing an accidental opt-in on another device or later restore. Enable it directly through this setting.
+
+> [!CAUTION]
+> This experiment has not completed on-road validation and does not guarantee corner tracking or automatic recovery. It does not apply to other vehicles or branches; remain ready to steer manually.
+> Output limits can leave the actual steering command unchanged even when its target is corrected. A changed target or recorded-log replay alone does not establish improved physical steering return.
 
 ### Speed and deceleration — 22 settings
 
@@ -280,18 +295,18 @@ The 15 system settings cover recording, power, cameras, network, maps, sound, an
 
 | Group | Parameters | Purpose |
 |---|---|---|
-| Recording and power | `RecordRoadCam`, `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `CarrotValidationAutoUpload`, `MaxTimeOffroadMin` | Road-camera storage, master external log/diagnostic consent, Carrot community data sharing, automatic KA4 validation-log upload, and delayed shutdown |
+| Recording and power | `RecordRoadCam`, `CarrotValidationAutoUpload`, `DkThirdPartyDataSharing`, `CarrotCommunityDataSharing`, `MaxTimeOffroadMin` | Road-camera storage, DK private-NAS KA4 validation, every other external log/diagnostic transfer, Carrot community data sharing, and delayed shutdown |
 | YouTube Live | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | Video streaming, quality, and timestamp |
 | Camera | `UseWideCamera` | Input fallback for a failed wide road camera |
 | Network and map | `HotspotOnBoot`, `MapboxStyle` | Boot hotspot and map background style |
 | Sound | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | Prompt language and volume |
 | Software | `SoftwareMenu` | Software-update menu availability |
 
-`DkThirdPartyDataSharing` is the master consent for automatic log and diagnostic transfers to outside third-party services, and is off by default. Enabling is accepted only from Carrot Web opened directly on the phone providing the tether, or from a device-local connection; another LAN client on the same hotspot cannot enable it. Confirming it while safely parked permits the comma Athena remote connection; completed cloudlogs and statistics; location, device, and exception details in logs; server-requested rlog/qlog/qcamera and camera files; live messages, snapshots, SIM and nearby-network information; remote SSH; Prime/Firehose status; Sentry; the stock uploader; and the Xiaoge data/vision service when its separate `ShareData` switch is on. Transfers are not reconfirmed file by file, and phone tethering may use mobile data. Every automatic transfer is bound to the exact current enabled-consent session. Turning the setting off closes live connections, aborts queued or in-progress automatic transfers, and discards the Athena queue; quickly turning it back on does not revive work from the previous session. Cloudlogs, statistics, and route/camera artifacts that existed before the current enabled session—including data created while this setting was off—are permanently excluded from Athena and stock-uploader replay. Local driving logs and storage cleanup, separately consented KA4 automatic validation to the fixed private NAS, and explicitly started personal-NAS, Discord, or dashcam uploads remain independent. Git updates, online routing/maps, GPS/time assistance, first-time registration, YouTube Live, and a user-started support tunnel are separate internet features. The consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically, and no vehicle-control setting is changed.
+`CarrotValidationAutoUpload`, shown as **DK Private-NAS KA4 Automatic Validation Logs (Experimental)**, is off by default. The campaign arms only on the owner's allowlisted DK device with the exact KA4 CAN FD HDA1 stock-radar-SCC, non-longitudinal topology and no HDA2 flag; the branch stores only a one-way hash of its identifier. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It observes an engaged standstill after about 0.5 seconds. The collector itself never injects RES or changes a vehicle message, and toggling this logging consent does not change the separately automatic KA4 resume-retention behavior. A new campaign selects at most 3 full rlogs per event capture and 10 captures / 30 distinct rlogs overall. The compatibility ceiling for legacy records already retained by an older build is 14 / 42; these are selected-item limits, not limits on transmission count or bytes. At most 5 captures / 750 MiB can wait at once, but the client has no cumulative transfer cap and can resend a failed file or whole capture for up to seven days. After the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. The destination is pinned to the exact root `https://adot.synology.me` on standard HTTPS port 443; other ports, paths, domains, and deployment-environment overrides are rejected, and the ordinary Web upload destination cannot redirect it. This consent works independently of the two sharing switches below. The row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
 
-`CarrotCommunityDataSharing` is off by default and works only while both it and `DkThirdPartyDataSharing` are enabled. Enabling is accepted only from Carrot Web opened directly on the phone providing the tether, or from a device-local connection; another LAN client on the same hotspot cannot enable it. Explicitly enabling it while parked permits Carrot community services to receive device identifiers, vehicle name, branch/commit, local network address and heartbeat status, all setting values and the catalog, automatic onroad/exception tmux diagnostics, and setting snapshots. It also permits popular-setting downloads, CWP address registration, and bundled Discord notifications for Support Terminal, Vision diagnostics, and manual dashcam-upload completion. Each automatic request and streamed diagnostic is bound to the exact current writes of both consent switches. Turning either setting off immediately blocks new requests, stops an in-progress streamed body at the next chunk, and discards automatic tmux collection/retries; quickly turning it back on does not send a payload prepared under the previous consent session. A user-configured NAS or Discord URL and an explicitly started manual dashcam upload itself remain independent, but its bundled Discord completion notification is blocked. `CarrotValidationAutoUpload` below is also independent because it has separate consent and a fixed private-NAS receiver. This consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically.
+`DkThirdPartyDataSharing`, shown as **DK Other Logs & Diagnostics Transfer**, is the master consent for **every manual or automatic external log and diagnostic transfer** except the fixed DK private-NAS KA4 validation path above. It is off by default. Off blocks comma Athena, cloudlogs/statistics, remote log requests/SSH, Prime/Firehose, Sentry, the stock uploader, Xiaoge, Carrot community/Discord, and user-started personal-NAS, Discord, dashcam, or tmux transfers. It closes live connections, aborts queued or in-progress work, and discards the previous consent session and Athena queue. Enabling requires the parked confirmation from Carrot Web opened directly on the phone providing the tether or from a device-local connection. The row combines both consents into one of three clear states: `Only my DK NAS validation logs`, `All log transfers blocked`, or `Other logs and diagnostics allowed`. Local driving logs and storage cleanup continue. Git updates, online routing/maps, GPS/time assistance, first-time registration, and YouTube Live are separate non-log internet features. Consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically, and no vehicle-control setting is changed.
 
-`CarrotValidationAutoUpload` is off by default, and this experimental campaign arms only on the owner's allowlisted DK device with the exact KA4 CAN FD HDA1 stock-radar-SCC, non-longitudinal topology and no HDA2 flag; the branch stores only a one-way hash of its identifier. One consent while parked automates log selection and post-drive Wi-Fi upload for up to seven days without per-log confirmation. It observes an engaged standstill after about 0.5 seconds but never injects RES or changes vehicle-control messages. A new campaign selects at most 3 full rlogs per event capture and 10 captures / 30 distinct rlogs overall. The compatibility ceiling for legacy records already retained by an older build is 14 / 42; these are selected-item limits, not limits on transmission count or bytes. At most 5 captures / 750 MiB can wait at once, but the client has no cumulative transfer cap and can resend a failed file or whole capture for up to seven days. After the server's 1 GiB per-device daily limit is reached, retained logs may retry the next day. The destination is pinned to the exact root `https://adot.synology.me` on standard HTTPS port 443; other ports, paths, domains, and deployment-environment overrides are rejected, and the ordinary Web upload destination cannot redirect it. Consent enabling is accepted only from Carrot Web opened directly on the phone providing the tether, or from a device-local connection. The setting row shows a sanitized queue state. Phone tethering may use mobile data, and turning the setting off does not delete data already uploaded. Read [Sending Dashcam Logs for Analysis](dashcam-log-sharing.md#automatic-validation-upload) first for the full scope and privacy details.
+`CarrotCommunityDataSharing` is off by default and works only while both it and `DkThirdPartyDataSharing` are enabled. While the master is off, Carrot Web disables the toggle, explains the block, and the stored community consent is cleared. With both settings on, Carrot community services may exchange device identifiers, vehicle name, branch/commit, local network address and heartbeat, all setting values and the catalog, automatic onroad/exception tmux diagnostics, setting snapshots, popular-setting values, CWP addresses, and bundled Discord notifications. User-configured NAS or Discord and manually started dashcam or tmux transfers are also blocked while the master is off. KA4 automatic validation is independent and goes only to the fixed DK private NAS when its separate consent above is on. Consent is excluded from settings backups, profiles, and QR transfer; already-sent data is not deleted automatically.
 
 `SoftwareMenu` shows the software-update menu. A user-requested `CHECK`, `DOWNLOAD`, or `INSTALL` is available while vehicle power is on without a gear, motion, or openpilot-engagement gate. The `Target Branch` picker shows only this user fork's `dkcarrot-wip`, compatibility `carrot-wip`, and `carrot` branches, while keeping an already installed model-specific branch visible as the current target. Periodic automatic update work remains paused onroad. Disable this setting if the software menu causes a memory problem.
 

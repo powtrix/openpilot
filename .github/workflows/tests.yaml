@@ -85,6 +85,8 @@ jobs:
             openpilot/selfdrive/carrot/tests/test_dk_log_transfer.py \
             openpilot/selfdrive/controls/tests/test_dk_lateral_diagnostics.py \
             openpilot/selfdrive/controls/tests/test_ka4_lateral_sign.py \
+            openpilot/selfdrive/controls/tests/test_dk_experimental_steering.py \
+            openpilot/selfdrive/carrot/server/tests/test_dk_steering_setting.py \
             tools/car_porting/test_dk_diagnostics_report.py \
             tools/dk/tests/test_check_ui_annotations.py
           python tools/dk/check_ui_annotations.py --commit HEAD

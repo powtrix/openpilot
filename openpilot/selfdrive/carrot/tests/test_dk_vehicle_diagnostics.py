@@ -85,6 +85,30 @@ def test_all_initial_param_keys_exist():
     params.get_type(key)
 
 
+def test_experimental_steering_selection_is_recorded_in_session():
+  logs = []
+  observer = make_dk_vehicle_diagnostics(cp(), FakeParams(), logs.append)
+  record(observer, *fixture_objects())
+  assert 'DkExperimentalSteering' in logs[0]['initial_params']
+
+
+def test_optional_setting_unknown_to_native_params_preserves_existing_diagnostics():
+  from openpilot.common.params import UnknownKeyName
+
+  class OlderParams(FakeParams):
+    def get(self, key):
+      if key == 'DkExperimentalSteering':
+        raise UnknownKeyName(key)
+      return super().get(key)
+
+  logs = []
+  observer = make_dk_vehicle_diagnostics(cp(), OlderParams(), logs.append)
+  assert observer is not None
+  record(observer, *fixture_objects())
+  assert logs[0]['initial_params']['DkExperimentalSteering'] is None
+  assert logs[0]['initial_params']['LatSmoothSec'] == 50.0
+
+
 def test_real_cereal_planner_source_enum_is_not_silently_missing():
   from openpilot.cereal import log
 

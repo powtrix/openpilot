@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from aiohttp import web
 
+from openpilot.common.external_data import third_party_data_sharing_generation
 from openpilot.system.hardware import HARDWARE
 
 from ...config import PARAMS_BACKUP_PATH
@@ -33,8 +34,26 @@ from .actions import normalize_action, validate_action, validate_shell_argv
 
 
 TMUX_LOG_PATH = "/data/media/tmux.log"
+TMUX_SEND_REQUEST_PREFIX = "tmux_send:"
 GIT_UPDATE_COMMIT_LIMIT = 20
 GIT_UPDATE_DISPLAY_LIMIT = 3
+
+
+def queue_server_tmux_upload(params: Any | None = None) -> str | None:
+  """Queue a consent-bound manual tmux upload request.
+
+  The generation travels through Params to carrot_man so an OFF -> ON cycle
+  before the request is consumed cannot revive the old request.
+  """
+  target_params = params if params is not None else Params()
+  consent_generation = third_party_data_sharing_generation(target_params)
+  if consent_generation is None:
+    return None
+  target_params.put_nonblocking(
+    "CarrotException",
+    f"{TMUX_SEND_REQUEST_PREFIX}{consent_generation}",
+  )
+  return consent_generation
 
 
 def capture_tmux_log_sync() -> Tuple[int, str]:
@@ -717,8 +736,14 @@ async def run_tool_job(job: Dict[str, Any]) -> None:
 
     if action == "server_tmux_log":
       jobs.progress(job, message="send tmux", current=1, total=1)
-      params = Params()
-      params.put_nonblocking("CarrotException", "tmux_send")
+      if queue_server_tmux_upload() is None:
+        jobs.finish(
+          job,
+          ok=False,
+          result={"ok": False, "error": "third-party data sharing is disabled"},
+          error="third-party data sharing is disabled",
+        )
+        return
       jobs.finish(job, ok=True, result={"ok": True, "out": "tmux send triggered"})
       return
 
@@ -1171,8 +1196,11 @@ async def dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Respo
       })
 
     if action == "server_tmux_log":
-      params = Params()
-      params.put_nonblocking("CarrotException", "tmux_send")
+      if queue_server_tmux_upload() is None:
+        return web.json_response({
+          "ok": False,
+          "error": "third-party data sharing is disabled",
+        }, status=403)
       return web.json_response({"ok": True, "out": "tmux send triggered"})
 
     if action == "backup_settings":

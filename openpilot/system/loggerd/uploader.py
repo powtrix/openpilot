@@ -162,11 +162,17 @@ class Uploader:
 
     return None
 
-  def do_upload(self, key: str, fn: str):
-    _require_third_party_data_sharing(self.params, self.consent_generation)
+  def do_upload(self, key: str, fn: str, consent_generation: str | None = None):
+    if consent_generation is None:
+      consent_generation = self.consent_generation or third_party_data_sharing_generation(self.params)
+    if consent_generation is None:
+      raise AutomaticDataSharingDisabled("automatic third-party data sharing is disabled")
+
+    _require_third_party_data_sharing(self.params, consent_generation)
     if artifact_is_blocked(fn):
       raise AutomaticDataSharingDisabled("artifact predates the current consent session")
     url_resp = self.api.get("v1.4/" + self.dongle_id + "/upload_url/", timeout=10, path=key, access_token=self.api.get_token())
+    _require_third_party_data_sharing(self.params, consent_generation)
     if url_resp.status_code == 412:
       return url_resp
 
@@ -176,26 +182,38 @@ class Uploader:
     cloudlog.debug("upload_url v1.4 %s %s", url, str(headers))
 
     if fake_upload:
+      _require_third_party_data_sharing(self.params, consent_generation)
       return FakeResponse()
 
     stream = None
     try:
       compress = key.endswith('.zst') and not fn.endswith('.zst')
       stream, content_length = get_upload_stream(fn, compress)
-      _require_third_party_data_sharing(self.params, self.consent_generation)
+      _require_third_party_data_sharing(self.params, consent_generation)
       guarded_stream = CallbackReader(
         stream,
-        lambda _current: _require_third_party_data_sharing(self.params, self.consent_generation),
+        lambda _current: _require_third_party_data_sharing(self.params, consent_generation),
       )
       headers = {**headers, "Content-Length": str(content_length)}
-      response = requests.put(url, data=guarded_stream, headers=headers, timeout=10)
+      _require_third_party_data_sharing(self.params, consent_generation)
+      response = requests.put(url, data=guarded_stream, headers=headers, timeout=10, allow_redirects=False)
+      try:
+        _require_third_party_data_sharing(self.params, consent_generation)
+      except Exception:
+        response.close()
+        raise
       return response
     finally:
       if stream:
         stream.close()
 
   def upload(self, name: str, key: str, fn: str, network_type: int, metered: bool) -> bool:
-    if not third_party_data_sharing_enabled(self.params):
+    consent_generation = self.consent_generation or third_party_data_sharing_generation(self.params)
+    if consent_generation is None:
+      return False
+    try:
+      _require_third_party_data_sharing(self.params, consent_generation)
+    except AutomaticDataSharingDisabled:
       return False
     try:
       sz = os.path.getsize(fn)
@@ -217,7 +235,7 @@ class Uploader:
       stat = None
       last_exc = None
       try:
-        stat = self.do_upload(key, fn)
+        stat = self.do_upload(key, fn, consent_generation)
       except Exception as e:
         last_exc = (e, traceback.format_exc())
 

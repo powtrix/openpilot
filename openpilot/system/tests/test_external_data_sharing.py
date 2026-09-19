@@ -235,7 +235,7 @@ def test_personal_nas_manual_upload_target_is_independent_of_master_gate(monkeyp
   assert dashcam_upload.upload_target_settings() == ("https://my-nas.example/private", "")
 
 
-def test_master_gate_off_does_not_block_explicit_manual_upload_start(monkeypatch):
+def test_master_gate_off_blocks_explicit_manual_upload_start(monkeypatch):
   class Request:
     async def json(self):
       return {"segments": ["route--0"]}
@@ -259,13 +259,24 @@ def test_master_gate_off_does_not_block_explicit_manual_upload_start(monkeypatch
   assert not external_data.third_party_data_sharing_enabled()
   response = asyncio.run(dashcam_routes.api_dashcam_upload_start(Request()))
 
-  assert response.status == 200
+  assert response.status == 403
   assert json.loads(response.text) == {
-    "ok": True,
-    "job_id": "manual-job",
-    "status": "running",
+    "ok": False,
+    "error": "third-party data sharing is disabled",
   }
-  assert [job["segments"] for job in started] == [["route--0"]]
+  assert started == []
+
+
+def test_master_gate_off_returns_forbidden_for_manual_upload_health_test(monkeypatch):
+  monkeypatch.setattr(dashcam_routes, "_manual_upload_consent", lambda: (None, None))
+
+  response = asyncio.run(dashcam_routes.api_dashcam_upload_test(None))
+
+  assert response.status == 403
+  assert json.loads(response.text) == {
+    "ok": False,
+    "error": "third-party data sharing is disabled",
+  }
 
 
 def test_updater_and_navigation_process_predicates_ignore_master_gate():
