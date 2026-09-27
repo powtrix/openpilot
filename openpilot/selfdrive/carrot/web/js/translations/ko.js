@@ -5,8 +5,7 @@ window.CarrotTranslations.register("ko", {
   nativeName: "한국어",
   shortName: "KO",
   strings: {
-    setting_dk_steering_confirm: "실험용 조향개선 선택을 저장할까요? 켜기와 끄기 모두 다음 제어 시작 때 적용됩니다. 확실한 적용을 위해 변경 후 장치를 재시작하세요. 현재 실행 중인 제어는 바뀌지 않으며, 실차 검증은 완료되지 않았습니다.",
-    setting_dk_steering_restart: "저장했습니다. 다음 제어 시작 때 적용되므로 확실한 적용을 위해 장치를 재시작하세요. 현재 제어는 아직 바뀌지 않았습니다.",
+    setting_dk_scc_restart: "저장했습니다. 다음 제어 시작 때 적용되므로 확실한 적용을 위해 장치를 재시작하세요. 현재 제어는 아직 바뀌지 않았습니다.",
     egpu_model_title: "eGPU 빅모델",
     egpu_model_checking: "모델 확인 중",
     egpu_model_downloading: "다운로드 중",

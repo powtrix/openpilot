@@ -12,8 +12,8 @@ function commitRuntime(previous, { confirm = true, fail = false } = {}) {
   const calls = [];
   const val = { dataset: { committedValue: String(previous), rawValue: String(previous) } };
   const env = {
-    name: "DkExperimentalSteering", title: "실험용 조향개선", p: { default: 0 }, val,
-    profile: null, el: {}, group: "STEER", originGroup: "STEER", validationUploadStatus: null,
+    name: "DkExperimentalScc", title: "SCC 실험", p: { default: 1 }, val,
+    profile: null, el: {}, group: "START_AUTO", originGroup: "START_AUTO", validationUploadStatus: null,
     VALIDATION_AUTO_UPLOAD_PARAM: "CarrotValidationAutoUpload",
     COMMUNITY_DATA_SHARING_PARAM: "CarrotCommunityDataSharing",
     THIRD_PARTY_DATA_SHARING_PARAM: "DkThirdPartyDataSharing",
@@ -35,24 +35,15 @@ function commitRuntime(previous, { confirm = true, fail = false } = {}) {
 }
 
 for (const next of [0, 1]) {
-  test(`steering ${next ? "ON" : "OFF"} is confirmed and explicitly applies at next controls start`, async () => {
+  test(`SCC ${next ? "ON" : "OFF"} explicitly applies at next controls start`, async () => {
     const runtime = commitRuntime(1 - next);
     assert.equal(await runtime.commit(next), true);
-    assert.equal(runtime.calls[0][0], "confirm");
-    assert.match(runtime.calls[0][1], /ON and OFF apply when controls next starts/);
-    assert.deepEqual(runtime.calls.find(c => c[0] === "write"), ["write", "DkExperimentalSteering", next]);
+    assert.equal(runtime.calls.some(c => c[0] === "confirm"), false);
+    assert.deepEqual(runtime.calls.find(c => c[0] === "write"), ["write", "DkExperimentalScc", next]);
     assert.match(runtime.calls.find(c => c[0] === "toast")[1], /current controller has not changed/);
     assert.equal(runtime.val.dataset.committedValue, String(next));
   });
 }
-
-test("cancelled experimental selection writes nothing and restores the previous choice", async () => {
-  const runtime = commitRuntime(0, { confirm: false });
-  assert.equal(await runtime.commit(1), false);
-  assert.equal(runtime.calls.some(c => c[0] === "write"), false);
-  assert.deepEqual(runtime.calls.at(-1), ["sync", "0"]);
-  assert.equal(runtime.val.dataset.committedValue, "0");
-});
 
 test("server onroad rejection restores stored value and never claims restart-ready success", async () => {
   const runtime = commitRuntime(1, { fail: true });
@@ -67,7 +58,13 @@ test("all Web locales explicitly explain delayed ON/OFF application", () => {
     let strings;
     const context = { window: { CarrotTranslations: { register: (_locale, data) => { strings = data.strings; } } } };
     vm.runInNewContext(readFileSync(new URL(`../js/translations/${locale}.js`, import.meta.url), "utf8"), context);
-    assert.ok(strings.setting_dk_steering_confirm.length > 20);
-    assert.ok(strings.setting_dk_steering_restart.length > 20);
+    assert.ok(strings.setting_dk_scc_restart.length > 20);
+    assert.equal(strings.setting_dk_steering_confirm, undefined);
+    assert.equal(strings.setting_dk_steering_restart, undefined);
   }
+});
+
+test("retired steering confirmation is absent from the setting flow", () => {
+  assert.equal(source.includes("DkExperimentalSteering"), false);
+  assert.equal(source.includes("setting_dk_steering_confirm"), false);
 });

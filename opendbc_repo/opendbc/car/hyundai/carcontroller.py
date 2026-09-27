@@ -278,6 +278,8 @@ class CarController(CarControllerBase):
     self.is_ldws_car = params.get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
     self.dk_ka4_runtime_branch = _dk_ka4_runtime_branch(params)
+    from openpilot.selfdrive.carrot.dk_scc_scope import dk_scc_experiment_enabled
+    self.dk_experimental_scc = dk_scc_experiment_enabled(params, self.CP)
     self.ka4_stock_scc_standstill_rearm = (
       self.dk_ka4_runtime_branch and
       KA4_STOCK_SCC_EXPERIMENTAL_REARM_ENABLED and _ka4_stock_scc_standstill_supported(self.CP)
@@ -937,7 +939,11 @@ class CarController(CarControllerBase):
         send_button = Buttons.RES_ACCEL
       elif not ka4_physical_stop and target < current and current>= 31 and self.speed_from_pcm != 1:
         send_button = Buttons.SET_DECEL
-      elif not ka4_physical_stop and target > current and current < 160 and self.speed_from_pcm != 1:
+      elif (not ka4_physical_stop and target > current and current < 160 and self.speed_from_pcm != 1
+            and not (self.dk_experimental_scc and self.speed_from_pcm == 2)):
+        # The experiment never restores speed by ordinary RES synchronization,
+        # including when controlsd holds an older OEM speed than card observes.
+        # Explicit departure/keepalive and new engagement remain above this gate.
         send_button = Buttons.RES_ACCEL
     elif CS.out.activateCruise: #CC.cruiseControl.activate:
       if (

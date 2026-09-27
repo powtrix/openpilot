@@ -113,12 +113,13 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 주행 제어는 차량 움직임에 영향을 줄 수 있는 112개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
 
 <a id="start-auto"></a>
-### 시작·오토 — 9개
+### 시작·오토 — 10개
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
 | 시작 동작 | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | 상시 조향, 주행 시작 시 자동 활성화, 저속 조향 제한 |
 | 오토크루즈 | `AutoCruiseControl`, `SoftHoldOnCancel`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | 크루즈 자동 활성화와 취소 후 소프트홀드 |
+| SCC 실험 | `DkExperimentalScc` | 기존 SCC와 0927 감속 목표 실험 선택 |
 
 - `AlwaysLateral`: 크루즈가 켜져 있지 않아도 조향 제어를 허용합니다.
 - `AutoEngage`: `0` 끄기, `1` 조향 ON, `2` 조향 ON과 크루즈 대기입니다.
@@ -126,6 +127,19 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 - `SoftHoldOnCancel`: 크루즈가 취소된 상태에서도 정차 후 소프트홀드를 허용할지 정합니다.
 - `dkcarrot-wip`의 KA4 HDA1 순정 레이더 SCC·비롱컨 및 CRC 보호 대체 `0x1AA` 버튼 구성에는 정차 중 일반 속도동기화 버튼 차단과 제한된 30초 재출발 유지 시험이 별도 스위치 없이 적용됩니다. 정상 재출발 요청은 유효한 최종 계획속도 `0.1 m/s` 초과라는 예전 기준을 복원하여, 느린 출발을 막을 수 있는 `shouldStop=false` 추가 조건을 사용하지 않습니다. 비교·복구용 브랜치와 다른 차량 구성의 동작은 바꾸지 않습니다. 대상은 2023 KA4이며 범위와 실차 검증 한계는 [버튼·프리셋의 KA4 설명](buttons-presets.md#ka4-stock-scc-standstill)을 확인하세요.
 - `DisableMinSteerSpeed`: SMDPS 장착 차량의 저속 조향 제한과 관련된 차량별 설정입니다.
+
+<a id="scc-experiment"></a>
+#### SCC 실험
+
+**설정 → 주행 제어 → 시작·오토 → SCC 실험**의 `DkExperimentalScc`로 선택합니다. 기본값은 **켜기**입니다. `dkcarrot-wip`의 KA4 HDA1 순정 레이더 SCC·대체 버튼 구성에서만 적용되며, 순정 SCC 속도 모드(`SpeedFromPCM=2`)의 감속 목표를 비교하는 실험입니다.
+
+- **켜기:** 유효한 앞차를 따라 감속하는 계획이 있으면 기존 목표보다 낮은 계획속도를 순정 SCC의 속도 변경 목표로 사용합니다. 기존 최저 목표인 30 km/h를 유지합니다.
+- **속도 올리기:** 실험이 켜진 모드 2에서는 일반 자동 설정속도 상향 동기화를 중단합니다. 내비게이션 제한이 끝난 뒤에도 속도를 올리려면 차량 RES 버튼을 사용하세요. 기존 SCC 활성화와 정차 재출발 요청은 유지합니다.
+- **감속 이후:** 주행 중 앞차 신호가 사라지면 추가 감속 계획 적용을 멈추고, 목표를 순정 SCC 설정속도 이하로 제한합니다. 운전자가 RES/SET 버튼을 조작하거나 SCC를 다시 활성화하면 이 유지 상태를 해제합니다. 새로운 유효 앞차 계획에서도 감속 조건이 유지되면 다시 적용될 수 있습니다.
+- **끄기:** 이전 설치 버전(`98abba`, 0920)의 SCC 목표 선택을 사용합니다. 제거된 조향 실험까지 복원하는 스위치는 아닙니다.
+- **적용:** 주차 상태(오프로드)에서 저장하고 장치를 재시작하세요. 켜기와 끄기 모두 다음 제어 시작 때 적용되며 주행 중에는 변경할 수 없습니다.
+
+이 기능은 순정 SCC에 속도 변경을 요청하며 브레이크를 직접 제어하지 않습니다. 차량이 요청을 받아들이지 않으면 감속 목표를 낮춰도 실제 감속은 달라지지 않습니다. 속도 명령 미수락, 정지 차량 인식과 실제 제동 개선은 검증되지 않았습니다. 정차·재출발 요청과 차량 안전 제한은 기존 경로를 유지합니다. 차량 조향의 기존 실험기능은 이번 버전에서 제거되었습니다.
 
 ### 버튼·프리셋 — 15개
 
@@ -141,13 +155,12 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 버튼 설정은 순정 SCC 사용 여부와 차량 버튼 메시지에 따라 체감이 크게 다릅니다. 버튼이 예상과 다르게 작동하면 사용자 모드보다 `CruiseButtonMode=0`의 일반 동작에서 먼저 확인하세요.
 
 <a id="vehicle-steering"></a>
-### 차량 조향 — 37개
+### 차량 조향 — 36개
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
 | 중앙 보정 | `PathOffset`, `CameraYawTrimDeg` | 레인모드 경로의 좌우 위치와 카메라 YAW 미세 보정 |
 | 조향감 | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | 조향 시점, 평활화, 일시중지 각도와 조향비 |
-| 실험용 조향개선 | `DkExperimentalSteering` | 미래 경로를 이용한 코너 진입·자동 복원 목표 보정 시험 |
 | [차로 변경](lane-change.md)·자동 턴 | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | 차로 변경 진입 조건과 ATC 동작 |
 | 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | 레인모드 MPC 가중치와 차선 사용 조건 |
 | 고급 토크·토크 계수 | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | 커스텀 토크 제어 계수 |
@@ -158,20 +171,6 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 `SteerRatioRate`의 기본값 `100%`는 학습된 조향비를 그대로 적용합니다. `CustomSR=0`일 때 사용되며, 저장된 비율이 허용 범위(`30~200%`)를 벗어나면 안전하게 `100%`로 대체됩니다.
 
 `LateralTorqueCustom`과 `CustomSteer*` 계열은 차량의 기본 조향 튜닝과 안전 제한에 영향을 줄 수 있는 고급 항목입니다. 차종별 검증값과 복구 방법이 없으면 변경하지 마세요.
-
-#### 실험용 조향개선
-
-**설정 → 주행 제어 → 차량 조향 → 실험용 조향개선**에서 선택합니다. `DkExperimentalSteering`의 기본값은 **끄기**이며, `dkcarrot-wip`의 KA4 순정 SCC·토크 조향 구성에서만 적용됩니다.
-
-- **켜기:** 미래 경로를 이용해 코너 진입과 출구의 조향 목표를 보정합니다. 운전자가 먼저 핸들을 펴야 작동하는 기능이 아닙니다.
-- **적용 범위:** 모델 모드의 약 **14~60km/h**에서만 보정합니다. 레인모드·차선변경·유효하지 않은 입력에서는 기존 제어로 복귀하며, 남은 보정은 제한 내에서 회수합니다.
-- **끄기:** 기존 조향 계산을 사용합니다. 차량의 조향 안전 제한은 켜기·끄기 모두 유지됩니다.
-- **적용·복구:** 주차된 오프로드 상태에서 값을 저장합니다. 켜기와 끄기 모두 **다음 제어 시작 때 적용**되므로 확실한 적용을 위해 변경 후 **장치를 재시작**하세요. 저장 직후 실행 중인 제어가 전환되지는 않으며, 주행 중 변경 요청은 서버에서도 거부됩니다.
-- **백업:** 실험 기능을 다른 장치나 나중의 복원에서 실수로 켜지 않도록 파일·QR 백업에 포함하지 않고, 복원·프로필로 켜기도 허용하지 않습니다. 켜려면 이 항목에서 직접 선택합니다.
-
-> [!CAUTION]
-> 아직 실차 검증이 완료되지 않은 시험 기능이며 코너 추종이나 자동 복원이 보장되지 않습니다. 다른 차종·브랜치에서는 적용되지 않으며, 언제든 직접 조향할 준비가 필요합니다.
-> 목표 조향값이 보정되어도 출력 제한 때문에 실제 조향 명령은 같을 수 있습니다. 목표값 변화나 로그 재생만으로 실제 복원 효과가 확인된 것은 아닙니다.
 
 ### 속도·감속 — 22개
 

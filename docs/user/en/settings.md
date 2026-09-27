@@ -113,12 +113,13 @@ The current `dkcarrot-wip` `carrot_settings.json` contains **178 parameters**. E
 These 112 settings can affect vehicle motion. Change one item at a time.
 
 <a id="start-auto"></a>
-### Startup and auto — 9 settings
+### Startup and auto — 10 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | Startup | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | Always-on lateral control, automatic engagement, and low-speed steering limits |
 | Auto cruise | `AutoCruiseControl`, `SoftHoldOnCancel`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | Automatic cruise activation and soft hold after cancel |
+| SCC experiment | `DkExperimentalScc` | Compare existing SCC with the 0927 deceleration-target experiment |
 
 - `AlwaysLateral` permits lateral control even when cruise is not engaged.
 - `AutoEngage`: `0` off, `1` lateral on, `2` lateral on with cruise ready.
@@ -126,6 +127,19 @@ These 112 settings can affect vehicle motion. Change one item at a time.
 - `SoftHoldOnCancel` permits soft hold after stopping while cruise is canceled.
 - On `dkcarrot-wip`, ordinary speed-sync buttons are blocked at a stop and the bounded 30-second resume-retention experiment runs without a separate switch on the KA4 HDA1 stock-radar-SCC, non-longitudinal topology with the CRC-protected alternate `0x1AA` button layout. Normal departure requests restore the earlier valid final planned speed above `0.1 m/s` criterion, without the additional `shouldStop=false` condition that can block slow departures. Comparison/recovery branches and other vehicle configurations retain their existing behavior. The validation target is the 2023 KA4; scope and on-car validation limits are documented under [KA4 stock-SCC resume retention](buttons-presets.md#ka4-stock-scc-standstill).
 - `DisableMinSteerSpeed` is vehicle-specific and relates to low-speed steering restrictions on SMDPS-equipped cars.
+
+<a id="scc-experiment"></a>
+#### SCC experiment
+
+Use `DkExperimentalScc` under **Settings → Driving → Startup & Auto → SCC Experiment**. It is **ON by default**. This compares deceleration targets in stock SCC speed mode (`SpeedFromPCM=2`), only for the KA4 HDA1 stock-radar-SCC alternate-button configuration on `dkcarrot-wip`.
+
+- **ON:** When a valid lead-following plan calls for a lower speed, use that planned speed to lower the existing stock SCC speed-change target. The existing 30 km/h minimum target remains.
+- **Raising speed:** With the experiment ON in mode 2, ordinary automatic set-speed increases are suppressed, including after a navigation speed limit ends. Use the vehicle RES button to raise the set speed. Existing SCC activation and standstill resume requests remain in use.
+- **After lowering:** While moving, losing the lead stops further lead-plan reductions and limits the target to the observed stock SCC set speed. A driver RES/SET action or re-engaging SCC releases this hold. A fresh valid lead plan can apply the reduction again if deceleration conditions persist.
+- **OFF:** Use SCC target selection from the previously installed version (`98abba`, 0920). This does not restore the removed steering experiment.
+- **Application:** Save while parked/offroad, then restart the device. Both selections apply when controls next starts; changes while driving are rejected.
+
+This feature requests a stock SCC set-speed change and does not directly command braking. If the vehicle does not accept that request, lowering the target does not change actual deceleration. Speed-command acceptance, stationary-vehicle detection and improved physical braking remain unverified. Existing standstill/resume requests and vehicle safety limits remain in use. The former experimental steering feature is removed in this release.
 
 ### Buttons and presets — 15 settings
 
@@ -141,13 +155,12 @@ Select a section title for the code-based state machine, units, and application 
 The result depends heavily on whether the car uses stock SCC and which button message the vehicle accepts. Diagnose unexpected behavior with the normal `CruiseButtonMode=0` behavior first.
 
 <a id="vehicle-steering"></a>
-### Vehicle steering — 37 settings
+### Vehicle steering — 36 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | Centering | `PathOffset`, `CameraYawTrimDeg` | Path position and camera-yaw trim |
 | Steering feel | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | Timing, smoothing, suspension angle, and steering ratio |
-| Experimental Steering | `DkExperimentalSteering` | Future-path-based corner-entry and automatic turn-exit target correction experiment |
 | [Lane change](lane-change.md) and automatic turn | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | Lane-change entry conditions and ATC behavior |
 | Lane mode | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | Lane-mode MPC weights and lane-line conditions |
 | Advanced torque | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | Custom torque-control gains |
@@ -158,20 +171,6 @@ A larger `SteerActuatorDelay` compensates by commanding earlier. A larger `LatSm
 The default `SteerRatioRate` of `100%` applies the learned steering ratio without scaling. It is used when `CustomSR=0`; a stored rate outside the allowed range (`30–200%`) safely falls back to `100%`.
 
 `LateralTorqueCustom` and `CustomSteer*` are advanced settings that can affect the vehicle tune and safety limits. Do not alter them without a vehicle-specific validated baseline and a recovery path.
-
-#### Experimental Steering Improvement
-
-Open **Settings → Driving → Steering → Experimental Steering**. `DkExperimentalSteering` is **OFF by default** and applies only to KA4 stock-SCC, torque-steering configurations on `dkcarrot-wip`.
-
-- **ON:** Corrects the steering target at corner entry and exit using the future path. The driver does not have to unwind first to trigger the experiment.
-- **Scope:** Corrections apply only in model mode at approximately **14–60 km/h**. Lane mode, lane changes, or invalid inputs return to existing control, withdrawing any residual correction within the limits.
-- **OFF:** Uses the existing steering calculation. Vehicle steering safety limits remain intact with either selection.
-- **Apply or restore:** Save the selection while parked/offroad. Both ON and OFF apply **when controls next starts**; **restart the device** after changing the selection to ensure application. Saving does not switch the currently running controller. The server also rejects changes while driving.
-- **Backups:** The experiment is excluded from file/QR backups and cannot be enabled by restores or profiles, preventing an accidental opt-in on another device or later restore. Enable it directly through this setting.
-
-> [!CAUTION]
-> This experiment has not completed on-road validation and does not guarantee corner tracking or automatic recovery. It does not apply to other vehicles or branches; remain ready to steer manually.
-> Output limits can leave the actual steering command unchanged even when its target is corrected. A changed target or recorded-log replay alone does not establish improved physical steering return.
 
 ### Speed and deceleration — 22 settings
 

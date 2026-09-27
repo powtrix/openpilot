@@ -279,7 +279,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
 
     {"SteerActuatorDelay", {PERSISTENT, INT, "0"}},
     {"LatSmoothSec", {PERSISTENT, INT, "13"}},
-    {"DkExperimentalSteering", {PERSISTENT, BOOL, "0"}},
+    {"DkExperimentalScc", {PERSISTENT, BOOL, "1"}},
     {"LatSuspendAngleDeg", {PERSISTENT, INT, "300"}},
     {"CruiseOnDist", {PERSISTENT, INT, "400"}},
 

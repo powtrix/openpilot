@@ -28,8 +28,8 @@ PARAM_KEYS = (
   'CustomSteerDeltaDownLC', 'LongActuatorDelay', 'VEgoStopping', 'StoppingAccel', 'StopDistanceCarrot',
   'TrafficLightDetectMode', 'ExperimentalMode', 'AlphaLongitudinalEnabled', 'CanfdHDA2',
   'HyundaiCameraSCC', 'EnableRadarTracks', 'CruiseButtonTest1', 'CruiseButtonTest2', 'CruiseButtonTest3',
-  'AutoCruiseControl', 'SpeedFromPCM', 'Ka4StockSccStandstillRearm',
-  'LatSmoothSec', 'DkExperimentalSteering', 'LateralTorqueCustom', 'LateralTorqueAccelFactor', 'LateralTorqueFriction',
+  'AutoCruiseControl', 'SpeedFromPCM', 'Ka4StockSccStandstillRearm', 'DkExperimentalScc',
+  'LatSmoothSec', 'LateralTorqueCustom', 'LateralTorqueAccelFactor', 'LateralTorqueFriction',
   'LateralTorqueKpV', 'LateralTorqueKiV', 'LateralTorqueKf', 'LateralTorqueKd',
 )
 CONTROLLER_FIELDS = (

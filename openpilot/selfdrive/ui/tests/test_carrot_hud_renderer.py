@@ -672,7 +672,7 @@ def test_deployment_metadata_is_loaded_once_when_renderer_starts(hud_module, mon
   assert renderer._dk_deployment_text == "0913 감속"
 
 
-@pytest.mark.parametrize("release_label", ["0917 브레이크게이지/핸들복원로그", "0920 코너/조향 개선"])
+@pytest.mark.parametrize("release_label", ["0917 브레이크게이지/핸들복원로그", "0920 코너/조향 개선", "0927 SCC실험"])
 def test_city_return_release_label_is_below_date_at_unchanged_size(hud_module, monkeypatch, release_label):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)

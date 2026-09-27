@@ -50,6 +50,7 @@ def build_controller(*, alt_buttons=True):
   controller.stock_scc_resume_alert_suppressed = False
   controller.ka4_stock_scc_standstill_rearm = True
   controller.dk_ka4_runtime_branch = True
+  controller.dk_experimental_scc = False
   controller.activateCruise = 0
   controller.last_button_frame = 0
   controller.last_cancel_frame = -1_000_000

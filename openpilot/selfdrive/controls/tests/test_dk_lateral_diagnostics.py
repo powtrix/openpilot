@@ -194,36 +194,42 @@ def diagnostic_statement(node):
   return False
 
 
-def experimental_off_method(node):
-  """Evaluate only the explicit opt-in hooks with the startup option OFF.
+def scc_off_method(node):
+  """Exclude only the exact, independently tested SCC startup/target hooks.
 
-  Retain the pre-existing baseline hashes below: the new option must not turn
-  a test of legacy equivalence into a freshly blessed changed baseline.
+  Matching complete statements at their expected locations prevents this
+  historical lateral baseline check from masking unrelated control changes.
+  The SCC helper's behavior is covered by its own runtime integration tests.
   """
-  class OffPrevious(ast.NodeTransformer):
-    def visit_Name(self, name):
-      if name.id == "smoothing_previous":
-        return ast.copy_location(ast.Attribute(value=ast.Name(id="self", ctx=ast.Load()),
-                                               attr="desired_curvature", ctx=ast.Load()), name)
-      return name
+  def signature(statement):
+    return ast.dump(statement, include_attributes=False)
 
-  retained = []
-  for statement in node.body:
-    if isinstance(statement, ast.Try) and "dk_experimental_steering" in ast.unparse(statement):
-      continue
-    if isinstance(statement, ast.Assign) and any(ast.unparse(target) in (
-        "self.dk_experimental_steering", "dk_experimental", "smoothing_previous") for target in statement.targets):
-      if any(ast.unparse(target) == "smoothing_previous" for target in statement.targets):
-        assert isinstance(statement.value, ast.IfExp)
-        assert ast.unparse(statement.value.orelse) == "self.desired_curvature"
-      continue
-    if isinstance(statement, ast.If) and any(token in ast.unparse(statement.test) for token in (
-        "get_bool('DkExperimentalSteering')", "dk_experimental is not None", "'dk_experimental_steering'")):
-      assert not statement.orelse
-      continue
-    retained.append(statement)
-  node.body = retained
-  return OffPrevious().visit(node)
+  if node.name == "__init__":
+    expected = ast.parse(
+      "self.dk_experimental_scc = None\n"
+      "from openpilot.selfdrive.carrot.dk_scc_scope import dk_scc_experiment_enabled\n"
+      "if dk_scc_experiment_enabled(self.params, self.CP):\n"
+      "  from openpilot.selfdrive.controls.lib.dk_experimental_scc import DkExperimentalScc\n"
+      "  self.dk_experimental_scc = DkExperimentalScc()\n"
+    ).body
+    matches = [i for i in range(len(node.body) - len(expected) + 1)
+               if [signature(s) for s in node.body[i:i + len(expected)]] == [signature(s) for s in expected]]
+    assert len(matches) == 1
+    del node.body[matches[0]:matches[0] + len(expected)]
+  elif node.name == "publish":
+    pcm_blocks = [s for s in node.body if isinstance(s, ast.If) and ast.unparse(s.test) == "self.CP.pcmCruise"]
+    assert len(pcm_blocks) == 1
+    expected = ast.parse(
+      "if self.dk_experimental_scc is not None:\n"
+      "  hudControl.setSpeed = float(self.dk_experimental_scc.update(\n"
+      "    self.sm, CC, hudControl.setSpeed, setSpeed, speed_from_pcm, time.monotonic_ns(),\n"
+      "  ))\n"
+    ).body[0]
+    body = pcm_blocks[0].body
+    matches = [i for i, s in enumerate(body) if signature(s) == signature(expected)]
+    assert len(matches) == 1
+    del body[matches[0]]
+  return node
 
 
 @pytest.mark.parametrize("method,baseline_hash", [
@@ -232,11 +238,12 @@ def experimental_off_method(node):
   ("publish", "ce8c17ca6491eb9d733bed6878514070f721544c2d9ee385ac81e1f9cf9e23b0"),
 ])
 def test_control_math_order_and_publication_are_identical_to_pre_observer_baseline(method, baseline_hash):
-  # Baseline: shipped 6810e4e9bb. With the explicit experiment OFF, removing observer hooks must
-  # leave every existing control expression and ordering byte-for-byte AST equal.
+  # Baseline: shipped 6810e4e9bb. Observer hooks and the exact SCC OFF hooks
+  # aside, every existing expression and ordering remains AST equal. Keep
+  # these historical hashes unchanged when modifying optional control paths.
   node = method_ast(method)
   node.body = [statement for statement in node.body if not diagnostic_statement(statement)]
-  node = experimental_off_method(node)
+  node = scc_off_method(node)
   digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
   assert digest == baseline_hash
 
@@ -297,13 +304,16 @@ def test_emission_is_after_both_original_publications():
 
 
 @pytest.mark.parametrize("lane_mode", [False, True])
-def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(monkeypatch, lane_mode):
+@pytest.mark.parametrize("retired_steering_setting", [False, True])
+def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(monkeypatch, lane_mode, retired_steering_setting):
   from openpilot.cereal import car, log
   from opendbc.car.vehicle_model import VehicleModel
   import openpilot.selfdrive.controls.lib.latcontrol_torque as torque_module
   from openpilot.selfdrive.controls.controlsd import Controls
 
   class FakeParams:
+    bool_reads = []
+
     def get_float(self, key):
       return {"LatSmoothSec": 40.0, "SteerActuatorDelay": 30.0, "SteerRatioRate": 100.0}.get(key, 0.0)
 
@@ -311,7 +321,8 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
       return 0
 
     def get_bool(self, key):
-      return False
+      self.bool_reads.append(key)
+      return retired_steering_setting if key == "DkExperimentalSteering" else False
 
   monkeypatch.setattr(torque_module, "Params", FakeParams)
 
@@ -323,16 +334,11 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
     plan = NS(useLaneLines=lane_mode, mpcSolutionValid=True, modelMonoTime=1_000_000_000,
               curvatures=[0.02] * 17, psis=[0.004 * i for i in range(17)], distances=[i * 0.2 for i in range(17)])
     controls = Controls.__new__(Controls)
-    if mode in ("experiment_throws", "experiment_nan"):
-      def experimental_failure(*args):
-        if mode == "experiment_throws":
-          raise RuntimeError("injected experimental control failure")
-        return float("nan")
-      controls.dk_experimental_steering = NS(legacy_curvature=0.0, update_from_controls=experimental_failure)
     if mode == "legacy_ast":
       from types import MethodType
       import openpilot.selfdrive.controls.controlsd as controls_module
-      legacy_node = experimental_off_method(method_ast("state_control"))
+      legacy_node = method_ast("state_control")
+      legacy_node.body = [statement for statement in legacy_node.body if not diagnostic_statement(statement)]
       namespace = dict(vars(controls_module))
       exec(compile(ast.fix_missing_locations(ast.Module(body=[legacy_node], type_ignores=[])), str(CONTROLSD), "exec"), namespace)
       controls.state_control = MethodType(namespace["state_control"], controls)
@@ -388,12 +394,10 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
       if controls.dk_lateral_diagnostics is observer:
         observer.emit(controls, CC)
       samples.append((CC.to_dict(), lateral.to_dict(), controls.LaC.pid.i, controls.desired_curvature))
-    if mode in ("experiment_throws", "experiment_nan"):
-      assert controls.dk_experimental_steering is None
     return samples, records
 
   baseline, _ = run("disabled")
-  # Compare the actual OFF code path with the pre-experiment method whose
+  # Compare the actual control path with the pre-observer method whose
   # complete AST is independently pinned to the historical hash above.
   assert run("legacy_ast")[0] == baseline
   observed, records = run("enabled")
@@ -402,5 +406,5 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
   assert records[-1]["target_source"] == ("lane" if lane_mode else "model")
   assert run("logger_fails")[0] == baseline
   assert run("hook_fails")[0] == baseline
-  assert run("experiment_throws")[0] == baseline
-  assert run("experiment_nan")[0] == baseline
+  # A stale on-disk value must not be consulted, even when it remains enabled.
+  assert "DkExperimentalSteering" not in FakeParams.bool_reads

@@ -85,11 +85,20 @@ def test_all_initial_param_keys_exist():
     params.get_type(key)
 
 
-def test_experimental_steering_selection_is_recorded_in_session():
+@pytest.mark.parametrize('enabled', [False, True])
+def test_experimental_scc_selection_is_recorded_without_reading_retired_steering_setting(enabled):
+  class SelectedParams(FakeParams):
+    def get(self, key):
+      value = super().get(key)
+      return str(int(enabled)).encode() if key == 'DkExperimentalScc' else value
+
+  params = SelectedParams()
   logs = []
-  observer = make_dk_vehicle_diagnostics(cp(), FakeParams(), logs.append)
+  observer = make_dk_vehicle_diagnostics(cp(), params, logs.append)
   record(observer, *fixture_objects())
-  assert 'DkExperimentalSteering' in logs[0]['initial_params']
+  assert logs[0]['initial_params']['DkExperimentalScc'] == int(enabled)
+  assert 'DkExperimentalSteering' not in logs[0]['initial_params']
+  assert 'DkExperimentalSteering' not in params.read
 
 
 def test_optional_setting_unknown_to_native_params_preserves_existing_diagnostics():
@@ -97,7 +106,7 @@ def test_optional_setting_unknown_to_native_params_preserves_existing_diagnostic
 
   class OlderParams(FakeParams):
     def get(self, key):
-      if key == 'DkExperimentalSteering':
+      if key == 'DkExperimentalScc':
         raise UnknownKeyName(key)
       return super().get(key)
 
@@ -105,7 +114,7 @@ def test_optional_setting_unknown_to_native_params_preserves_existing_diagnostic
   observer = make_dk_vehicle_diagnostics(cp(), OlderParams(), logs.append)
   assert observer is not None
   record(observer, *fixture_objects())
-  assert logs[0]['initial_params']['DkExperimentalSteering'] is None
+  assert logs[0]['initial_params']['DkExperimentalScc'] is None
   assert logs[0]['initial_params']['LatSmoothSec'] == 50.0
 
 

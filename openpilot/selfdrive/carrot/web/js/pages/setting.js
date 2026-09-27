@@ -2864,16 +2864,6 @@ async function renderItems(group, options = {}) {
 
     async function commitSettingValue(next, commitOptions = {}) {
       const previous = val.dataset.committedValue ?? val.dataset.rawValue ?? String(p.default);
-      if (!profile && name === "DkExperimentalSteering" && String(next) !== String(previous)) {
-        const confirmed = await appConfirm(
-          getUIText("setting_dk_steering_confirm", "Save this experimental steering selection? ON and OFF apply when controls next starts. Restart the device after changing it to ensure application. The running controller will not change now; on-road validation is incomplete."),
-          { title: title || name, confirmLabel: getUIText("ok", "OK"), cancelLabel: getUIText("cancel", "Cancel") },
-        );
-        if (!confirmed) {
-          syncSettingControlState(el, previous);
-          return false;
-        }
-      }
       let validationConsentConfirmed = commitOptions.validationConsentConfirmed === true;
       let communityConsentConfirmed = commitOptions.communityConsentConfirmed === true;
       let thirdPartyConsentConfirmed = commitOptions.thirdPartyConsentConfirmed === true;
@@ -2948,7 +2938,7 @@ async function renderItems(group, options = {}) {
             committed = result.value;
           }
           if (result?.restart_recommended === true && result?.applies_at === "controls_start") {
-            showAppToast(getUIText("setting_dk_steering_restart", "Saved for the next controls start. Restart the device to ensure application; the current controller has not changed."));
+            showAppToast(getUIText("setting_dk_scc_restart", "Saved for the next controls start. Restart the device to ensure application; the current controller has not changed."));
           }
         }
         syncSettingControlState(el, committed);

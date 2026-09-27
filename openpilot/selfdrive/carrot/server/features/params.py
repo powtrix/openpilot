@@ -34,10 +34,10 @@ from ..services.params import (
   VALIDATION_AUTO_UPLOAD_PARAM,
 )
 from ..services.settings import get_settings_cached
-from ..services.dk_steering_setting import (
-  DK_EXPERIMENTAL_STEERING_PARAM,
-  require_steering_setting_offroad,
-  steering_setting_value,
+from ..services.dk_scc_setting import (
+  DK_EXPERIMENTAL_SCC_PARAM,
+  require_scc_setting_write,
+  scc_setting_value,
 )
 from ..services.web_consent import (
   WEB_CONSENT_SESSION_TTL_SECONDS,
@@ -163,10 +163,10 @@ async def api_param_set(request: web.Request) -> web.Response:
       "error": "parameter is not writable through the settings API",
     }, status=403)
 
-  if name == DK_EXPERIMENTAL_STEERING_PARAM:
+  if name == DK_EXPERIMENTAL_SCC_PARAM:
     try:
-      value = steering_setting_value(value)
-      require_steering_setting_offroad(request.app.get("params"))
+      value = scc_setting_value(value)
+      require_scc_setting_write(request.app.get("params"))
     except ValueError as exc:
       return web.json_response({"ok": False, "error": str(exc)}, status=400)
     except PermissionError as exc:
@@ -284,7 +284,7 @@ async def api_param_set(request: web.Request) -> web.Response:
     )
 
   result = {"ok": True, "name": name, "value": value, "has_params": HAS_PARAMS}
-  if name == DK_EXPERIMENTAL_STEERING_PARAM:
+  if name == DK_EXPERIMENTAL_SCC_PARAM:
     result["applies_at"] = "controls_start"
     result["restart_recommended"] = True
   return web.json_response(result)

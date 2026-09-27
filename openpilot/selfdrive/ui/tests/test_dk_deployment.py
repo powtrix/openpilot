@@ -36,8 +36,8 @@ def test_release_label_is_configurable_and_date_prefix_tracks_metadata(tmp_path,
   assert load_dk_deployment_text("dkcarrot-wip", path) == f"1231 {label}"
 
 
-def test_installed_release_displays_requested_corner_and_steering_label():
-  assert load_dk_deployment_text("dkcarrot-wip") == "0920 코너/조향 개선"
+def test_installed_release_displays_requested_scc_label():
+  assert load_dk_deployment_text("dkcarrot-wip") == "0927 SCC실험"
 
 
 def test_explicit_label_date_does_not_invent_deployment_timestamp(tmp_path):

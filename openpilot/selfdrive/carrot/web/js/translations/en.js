@@ -5,8 +5,7 @@ window.CarrotTranslations.register("en", {
   nativeName: "English",
   shortName: "EN",
   strings: {
-    setting_dk_steering_confirm: "Save this experimental steering selection? ON and OFF apply when controls next starts. Restart the device after changing it to ensure application. The running controller will not change now; on-road validation is incomplete.",
-    setting_dk_steering_restart: "Saved for the next controls start. Restart the device to ensure application; the current controller has not changed.",
+    setting_dk_scc_restart: "Saved for the next controls start. Restart the device to ensure application; the current controller has not changed.",
     egpu_model_title: "eGPU big model",
     egpu_model_checking: "Checking model",
     egpu_model_downloading: "Downloading",

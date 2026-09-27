@@ -207,6 +207,8 @@ def test_configuration_uses_exact_current_observer_keys_and_identity():
   assert config["initial_params"]["AlphaLongitudinalEnabled"] == 50
   assert config["initial_params"]["CustomSteerDeltaDownLC"] == 50
   assert config["initial_params"]["LatSmoothSec"] == 50
+  assert config["initial_params"]["DkExperimentalScc"] == 50
+  assert "DkExperimentalSteering" not in config["initial_params"]
   assert config["initial_params"]["LateralTorqueKd"] == 50
 
 

@@ -160,6 +160,12 @@ Scope and exclusions:
 > [!WARNING]
 > Values that are too large can flood button messages or make stock SCC miss inputs. Values that are too small can slow or prevent synchronization. Keep the initial Params values `8 / 30 / 1` if there is no problem.
 
+### Speed synchronization in the KA4 SCC experiment
+
+Enabling the [Startup & Auto SCC experiment](settings.md#scc-experiment) allows a valid lead plan to lower the target in `SpeedFromPCM=2` on the supported KA4. Ordinary automatic RES speed increases are suppressed, including after navigation restrictions end; use the vehicle RES button to raise the set speed. Existing SCC activation, the standstill resume behavior below, and driver RES/SET input retain their existing paths.
+
+Turn the switch off and restart to use the previously installed SCC speed synchronization. CAN buses and vehicle safety limits are unchanged. A lower target or a transmission record does not establish that stock SCC accepted the request or that physical braking improved.
+
 <a id="ka4-stock-scc-standstill"></a>
 ### KA4 stock-SCC 30-second resume-retention experiment
 

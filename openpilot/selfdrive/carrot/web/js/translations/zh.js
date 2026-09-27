@@ -5,8 +5,7 @@ window.CarrotTranslations.register("zh", {
   nativeName: "中文",
   shortName: "ZH",
   strings: {
-    setting_dk_steering_confirm: "保存实验性转向选择？开启和关闭均在下次控制启动时生效。为确保应用更改，请在保存后重启设备。当前控制器不会立即改变，实车验证尚未完成。",
-    setting_dk_steering_restart: "已保存，下次控制启动时生效。为确保应用更改，请重启设备；当前控制尚未改变。",
+    setting_dk_scc_restart: "已保存，下次控制启动时生效。为确保应用更改，请重启设备；当前控制尚未改变。",
     egpu_model_title: "eGPU 大模型",
     egpu_model_checking: "正在检查模型",
     egpu_model_downloading: "正在下载",

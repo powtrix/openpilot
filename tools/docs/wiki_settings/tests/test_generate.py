@@ -95,8 +95,10 @@ class WikiSettingsGeneratorTest(unittest.TestCase):
       if GENERATOR.GENERATED_PAGE_RE.fullmatch(name)
     }
     self.assertEqual(len(setting_pages), 178 * 3)
-    self.assertIn("재시작", result.pages["KO-실험용-조향개선.md"])
-    self.assertIn("OFF uses the existing steering calculation", result.pages["EN-Experimental-Steering-Improvement.md"])
+    self.assertIn("재시작", result.pages["KO-SCC-실험.md"])
+    self.assertNotIn("KO-실험용-조향개선.md", result.pages)
+    self.assertIn("98abba", result.pages["EN-SCC-Experiment.md"])
+    self.assertNotIn("EN-Experimental-Steering-Improvement.md", result.pages)
     self.assertTrue(all(text.count("<!-- CARROT:SETTING:BEGIN ") == 1 for text in setting_pages.values()))
     for name, text in result.pages.items():
       if name.endswith(".md"):

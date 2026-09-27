@@ -10,10 +10,10 @@ import threading
 import zlib
 from typing import Any, Dict, List, Optional
 
-from .dk_steering_setting import (
-  DK_EXPERIMENTAL_STEERING_PARAM,
-  require_steering_setting_offroad,
-  steering_setting_value,
+from .dk_scc_setting import (
+  DK_EXPERIMENTAL_SCC_PARAM,
+  require_scc_setting_write,
+  scc_setting_value,
 )
 
 try:
@@ -74,8 +74,14 @@ _qr_dependency_lock = threading.Lock()
 VALIDATION_AUTO_UPLOAD_PARAM = "CarrotValidationAutoUpload"
 COMMUNITY_DATA_SHARING_PARAM = "CarrotCommunityDataSharing"
 THIRD_PARTY_DATA_SHARING_PARAM = "DkThirdPartyDataSharing"
+NON_PORTABLE_SETTING_PARAMS = frozenset({
+  DK_EXPERIMENTAL_SCC_PARAM,
+  # Drop the retired selection even if an older native Params table still
+  # recognizes its key while the new build is being prepared.
+  "DkExperimentalSteering",
+})
 BACKUP_EXCLUDED_PARAMS = frozenset({
-  DK_EXPERIMENTAL_STEERING_PARAM,
+  *NON_PORTABLE_SETTING_PARAMS,
   VALIDATION_AUTO_UPLOAD_PARAM,
   COMMUNITY_DATA_SHARING_PARAM,
   THIRD_PARTY_DATA_SHARING_PARAM,
@@ -406,12 +412,12 @@ def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None, *
                     allow_validation_auto_upload_enable: bool = False,
                     allow_community_data_sharing_enable: bool = False,
                     allow_third_party_data_sharing_enable: bool = False) -> None:
-  if name == DK_EXPERIMENTAL_STEERING_PARAM:
-    value = steering_setting_value(value)
+  if name == DK_EXPERIMENTAL_SCC_PARAM:
+    value = scc_setting_value(value)
     # Central policy also covers profiles, QR/file restores and tool writes.
     # Neither ON nor OFF may be queued while driving; controls latches the
-    # choice only when it starts, so saving never hot-switches lateral control.
-    require_steering_setting_offroad(Params() if HAS_PARAMS and Params is not None else None)
+    # choice only when it starts, so saving never hot-switches SCC behavior.
+    require_scc_setting_write(Params() if HAS_PARAMS and Params is not None else None)
   if (
     name == VALIDATION_AUTO_UPLOAD_PARAM
     and not _explicit_consent_is_disabled(value)
@@ -585,7 +591,7 @@ def restore_param_values_from_backup(values: Dict[str, Any], source: str = "rest
   fails = []
 
   for key, value in values.items():
-    if key in BACKUP_EXCLUDED_PARAMS and not _explicit_consent_is_disabled(value):
+    if key in NON_PORTABLE_SETTING_PARAMS or (key in BACKUP_EXCLUDED_PARAMS and not _explicit_consent_is_disabled(value)):
       continue
     try:
       definition = definitions.get(key)
@@ -1348,9 +1354,9 @@ def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional
     type_name = "unknown"
     normalized_value: Any = raw_value
 
-    if key in BACKUP_EXCLUDED_PARAMS and not _explicit_consent_is_disabled(raw_value):
+    if key in NON_PORTABLE_SETTING_PARAMS or (key in BACKUP_EXCLUDED_PARAMS and not _explicit_consent_is_disabled(raw_value)):
       status = "skipped"
-      reason = "explicit consent required"
+      reason = "setting is not restored through backups" if key in NON_PORTABLE_SETTING_PARAMS else "explicit consent required"
       can_apply = False
       current_value = current_values.get(key, "")
     else:
