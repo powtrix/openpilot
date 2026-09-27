@@ -205,13 +205,13 @@ def scc_off_method(node):
     return ast.dump(statement, include_attributes=False)
 
   if node.name == "__init__":
-    expected = ast.parse(
-      "self.dk_experimental_scc = None\n"
-      "from openpilot.selfdrive.carrot.dk_scc_scope import dk_scc_experiment_enabled\n"
-      "if dk_scc_experiment_enabled(self.params, self.CP):\n"
-      "  from openpilot.selfdrive.controls.lib.dk_experimental_scc import DkExperimentalScc\n"
-      "  self.dk_experimental_scc = DkExperimentalScc()\n"
-    ).body
+    expected = ast.parse("\n".join([
+      "self.dk_experimental_scc = None",
+      "from openpilot.selfdrive.carrot.dk_scc_scope import dk_scc_experiment_enabled",
+      "if dk_scc_experiment_enabled(self.params, self.CP):",
+      "  from openpilot.selfdrive.controls.lib.dk_experimental_scc import DkExperimentalScc",
+      "  self.dk_experimental_scc = DkExperimentalScc()",
+    ])).body
     matches = [i for i in range(len(node.body) - len(expected) + 1)
                if [signature(s) for s in node.body[i:i + len(expected)]] == [signature(s) for s in expected]]
     assert len(matches) == 1
@@ -219,17 +219,63 @@ def scc_off_method(node):
   elif node.name == "publish":
     pcm_blocks = [s for s in node.body if isinstance(s, ast.If) and ast.unparse(s.test) == "self.CP.pcmCruise"]
     assert len(pcm_blocks) == 1
-    expected = ast.parse(
-      "if self.dk_experimental_scc is not None:\n"
-      "  hudControl.setSpeed = float(self.dk_experimental_scc.update(\n"
-      "    self.sm, CC, hudControl.setSpeed, setSpeed, speed_from_pcm, time.monotonic_ns(),\n"
-      "  ))\n"
-    ).body[0]
+    expected = ast.parse("\n".join([
+      "if self.dk_experimental_scc is not None:",
+      "  hudControl.setSpeed = float(self.dk_experimental_scc.update(",
+      "    self.sm, CC, hudControl.setSpeed, setSpeed, speed_from_pcm, time.monotonic_ns(),",
+      "  ))",
+    ])).body[0]
     body = pcm_blocks[0].body
     matches = [i for i, s in enumerate(body) if signature(s) == signature(expected)]
     assert len(matches) == 1
     del body[matches[0]]
   return node
+
+
+def steering_unavailable_method(node):
+  """Remove only exact preview hooks to check the out-of-scope legacy path.
+
+  Full preview-enabled methods are separately pinned to 98abba's ON behavior,
+  including their position relative to filtering, clipping and publication.
+  """
+  expected = {
+    "__init__": ["7cdacc359e1d3259ec27010fedbd95c7f4dac5cbd4439827db1945044105b076",
+                 "22b8015f79559806a46a5daa2104965f31cbb008a7202c4c0ee895e139e7ca8f"],
+    "state_control": ["b8b9031c9c0713ed93414db7329b42678b03d7d5df3a4f921aaf66dccc24bf25",
+                      "2abc8581d02a90d25462c1cca8a608a9e9eaa5be9e6f478ceecd3ee53d45be83",
+                      "dd4dfa4ace457465223b455ff548f78bf7bb33e8ca712bdce7ba35d226ba951f"],
+    "publish": ["6e1dd772b0c7b7315a14b777ded3b4fe7fe831c6dce2b5f3f8365779db3ec5eb"],
+  }[node.name]
+  for digest in expected:
+    matches = [i for i, s in enumerate(node.body)
+               if hashlib.sha256(ast.dump(s, include_attributes=False).encode()).hexdigest() == digest]
+    assert len(matches) == 1
+    del node.body[matches[0]]
+
+  class LegacySmoothing(ast.NodeTransformer):
+    def visit_Name(self, value):
+      if value.id == "smoothing_previous":
+        assert isinstance(value.ctx, ast.Load)
+        return ast.Attribute(value=ast.Name(id="self", ctx=ast.Load()), attr="desired_curvature", ctx=ast.Load())
+      return value
+
+  if node.name == "state_control":
+    assert sum(isinstance(n, ast.Name) and n.id == "smoothing_previous" for n in ast.walk(node)) == 3
+    node = LegacySmoothing().visit(node)
+  return node
+
+
+@pytest.mark.parametrize("method,original_on_hash", [
+  ("__init__", "b8bed37c165f6c5bf777ad47ec4bfde9b0786d8b31d95c0c5a08c4abaca3e31b"),
+  ("state_control", "728d43aadb383c9db19cd44a49b89a8128257eb419d1407f979315cae3898369"),
+  ("publish", "6c4599468162a6997563cf21d9fdd9087da71c32d38cebf18333917c3c452261"),
+])
+def test_preview_enabled_control_path_matches_original_98abba_on(method, original_on_hash):
+  # Derived from 98abba097d8d09d5edb09ccd8f3fdbabff61d912 with ONLY helper/
+  # variable/error-text renames and removal of the old startup Param conjunct.
+  # Keep SCC's separately tested hooks; exclude only their exact AST for this comparison.
+  node = scc_off_method(method_ast(method))
+  assert hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest() == original_on_hash
 
 
 @pytest.mark.parametrize("method,baseline_hash", [
@@ -238,12 +284,13 @@ def scc_off_method(node):
   ("publish", "ce8c17ca6491eb9d733bed6878514070f721544c2d9ee385ac81e1f9cf9e23b0"),
 ])
 def test_control_math_order_and_publication_are_identical_to_pre_observer_baseline(method, baseline_hash):
-  # Baseline: shipped 6810e4e9bb. Observer hooks and the exact SCC OFF hooks
+  # Baseline: shipped 6810e4e9bb. Observer, preview-unavailable and exact SCC OFF hooks
   # aside, every existing expression and ordering remains AST equal. Keep
   # these historical hashes unchanged when modifying optional control paths.
   node = method_ast(method)
   node.body = [statement for statement in node.body if not diagnostic_statement(statement)]
   node = scc_off_method(node)
+  node = steering_unavailable_method(node)
   digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
   assert digest == baseline_hash
 
@@ -304,7 +351,7 @@ def test_emission_is_after_both_original_publications():
 
 
 @pytest.mark.parametrize("lane_mode", [False, True])
-@pytest.mark.parametrize("retired_steering_setting", [False, True])
+@pytest.mark.parametrize("retired_steering_setting", [None, False, True])
 def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(monkeypatch, lane_mode, retired_steering_setting):
   from openpilot.cereal import car, log
   from opendbc.car.vehicle_model import VehicleModel
@@ -329,7 +376,7 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
   def broken(*args):
     raise RuntimeError("injected observer failure")
 
-  def run(mode):
+  def run(mode, scc_enabled=False):
     records = []
     plan = NS(useLaneLines=lane_mode, mpcSolutionValid=True, modelMonoTime=1_000_000_000,
               curvatures=[0.02] * 17, psis=[0.004 * i for i in range(17)], distances=[i * 0.2 for i in range(17)])
@@ -339,6 +386,7 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
       import openpilot.selfdrive.controls.controlsd as controls_module
       legacy_node = method_ast("state_control")
       legacy_node.body = [statement for statement in legacy_node.body if not diagnostic_statement(statement)]
+      legacy_node = steering_unavailable_method(legacy_node)
       namespace = dict(vars(controls_module))
       exec(compile(ast.fix_missing_locations(ast.Module(body=[legacy_node], type_ignores=[])), str(CONTROLSD), "exec"), namespace)
       controls.state_control = MethodType(namespace["state_control"], controls)
@@ -364,6 +412,9 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
                       reset=lambda: None, update=lambda *args: (0.0, 0.0, 0.0))
     controls.carrot_controls = NS(lat_suspend_control=lambda state, active: active)
     controls.curvature, controls.desired_curvature = 0.0, 0.0
+    if mode in ("preview_throws", "preview_nan"):
+      controls.dk_steering_preview = NS(legacy_curvature=0.0,
+                                      update_from_controls=broken if mode == "preview_throws" else lambda *args: math.nan)
     controls.is_vw_meb, controls.steer_limited_by_safety = False, False
     CP.mass, CP.rotationalInertia = 2400, 4000
     CP.wheelbase, CP.centerToFront, CP.steerRatio = 3.1, 1.2, 15.8
@@ -381,6 +432,25 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
     controls.sm.alive = dict(controls.sm.valid)
     controls.sm["carState"].vEgo = 8.0
     controls.sm["carState"].steeringAngleDeg = 25.0
+    if mode == "preview":
+      from openpilot.selfdrive.controls.lib.dk_experimental_scc import DkExperimentalScc
+      from openpilot.selfdrive.controls.lib.dk_steering_preview import DkSteeringPreview, SOURCE_MAX_AGE
+      from openpilot.selfdrive.controls.tests.test_dk_steering_preview import EXIT, model_for
+      controls.dk_experimental_scc = DkExperimentalScc() if scc_enabled else None
+      controls.dk_steering_preview = DkSteeringPreview(clock=lambda: controls.sm.frame * 10_000_000)
+      controls.dk_steering_preview.legacy_curvature = controls.desired_curvature = .025
+      geometry = model_for(EXIT)
+      for group in ("position", "orientation", "orientationRate", "velocity"):
+        for key, value in vars(getattr(geometry, group)).items():
+          setattr(getattr(model, group), key, value)
+      controls.sm["carState"].canValid = True
+      controls.sm["carState"].steeringAngleDeg = -math.degrees(controls.VM.get_steer_from_curvature(.025, 8., 0.))
+      controls.sm["liveParameters"].valid = controls.sm["liveParameters"].sensorValid = True
+      controls.sm["livePose"] = NS(inputsOK=True, posenetOK=True, sensorsOK=True, angularVelocityDevice=NS(valid=True))
+      controls.calibrated_pose = NS(angular_velocity=NS(yaw=.2))
+      controls.pose_calibrator = NS(calib_valid=True)
+      controls.sm.valid.update(dict.fromkeys(SOURCE_MAX_AGE, True))
+      controls.sm.alive.update(dict.fromkeys(SOURCE_MAX_AGE, True))
     observer = DkLateralDiagnostics(broken if mode == "logger_fails" else records.append,
                                      lambda: controls.sm.frame * 10_000_000)
     controls.dk_lateral_diagnostics = (None if mode in ("disabled", "legacy_ast") else
@@ -390,9 +460,19 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
       controls.sm.frame = frame
       controls.sm["modelV2"].action.desiredCurvature = 0.02 if frame < 15 else -0.005
       plan.curvatures = [0.02 if frame < 15 else -0.005] * 17
+      if mode == "preview":
+        model.action.desiredCurvature = .025
+        for service in SOURCE_MAX_AGE:
+          if service != "modelV2" or frame % 5 == 1:
+            controls.sm.logMonoTime[service] = frame * 10_000_000
+        model.frameId = (frame - 1) // 5 + 1
       CC, lateral = controls.state_control()
+      if mode in ("preview_throws", "preview_nan"):
+        assert controls.dk_steering_preview is None
       if controls.dk_lateral_diagnostics is observer:
         observer.emit(controls, CC)
+      if mode == "preview":
+        controls.dk_steering_preview.emit(float(CC.actuators.torque), controls.desired_curvature)
       samples.append((CC.to_dict(), lateral.to_dict(), controls.LaC.pid.i, controls.desired_curvature))
     return samples, records
 
@@ -406,5 +486,14 @@ def test_actual_control_and_torque_pid_outputs_identical_with_optional_observer(
   assert records[-1]["target_source"] == ("lane" if lane_mode else "model")
   assert run("logger_fails")[0] == baseline
   assert run("hook_fails")[0] == baseline
+  assert run("preview_throws")[0] == baseline
+  assert run("preview_nan")[0] == baseline
+  # Run actual state_control + the real torque PID with an active preview.
+  # The SCC helper's presence must not alter any lateral output or PID state.
+  preview_off, _ = run("preview", scc_enabled=False)
+  preview_on, _ = run("preview", scc_enabled=True)
+  assert preview_on == preview_off
+  if not lane_mode:
+    assert preview_on[-1][-1] < .025  # Exercise a real admitted correction.
   # A stale on-disk value must not be consulted, even when it remains enabled.
   assert "DkExperimentalSteering" not in FakeParams.bool_reads

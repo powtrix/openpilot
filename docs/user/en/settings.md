@@ -136,10 +136,10 @@ Use `DkExperimentalScc` under **Settings → Driving → Startup & Auto → SCC 
 - **ON:** When a valid lead-following plan calls for a lower speed, use that planned speed to lower the existing stock SCC speed-change target. The existing 30 km/h minimum target remains.
 - **Raising speed:** With the experiment ON in mode 2, ordinary automatic set-speed increases are suppressed, including after a navigation speed limit ends. Use the vehicle RES button to raise the set speed. Existing SCC activation and standstill resume requests remain in use.
 - **After lowering:** While moving, losing the lead stops further lead-plan reductions and limits the target to the observed stock SCC set speed. A driver RES/SET action or re-engaging SCC releases this hold. A fresh valid lead plan can apply the reduction again if deceleration conditions persist.
-- **OFF:** Use SCC target selection from the previously installed version (`98abba`, 0920). This does not restore the removed steering experiment.
+- **OFF:** Use SCC behavior from the previously installed version (`98abba`, 0920). The built-in [corner entry and exit correction](#corner-steering-preview) remains active with the SCC experiment either ON or OFF.
 - **Application:** Save while parked/offroad, then restart the device. Both selections apply when controls next starts; changes while driving are rejected.
 
-This feature requests a stock SCC set-speed change and does not directly command braking. If the vehicle does not accept that request, lowering the target does not change actual deceleration. Speed-command acceptance, stationary-vehicle detection and improved physical braking remain unverified. Existing standstill/resume requests and vehicle safety limits remain in use. The former experimental steering feature is removed in this release.
+This feature requests a stock SCC set-speed change and does not directly command braking. If the vehicle does not accept that request, lowering the target does not change actual deceleration. Speed-command acceptance, stationary-vehicle detection and improved physical braking remain unverified. Existing standstill/resume requests and vehicle safety limits remain in use.
 
 ### Buttons and presets — 15 settings
 
@@ -171,6 +171,15 @@ A larger `SteerActuatorDelay` compensates by commanding earlier. A larger `LatSm
 The default `SteerRatioRate` of `100%` applies the learned steering ratio without scaling. It is used when `CustomSR=0`; a stored rate outside the allowed range (`30–200%`) safely falls back to `100%`.
 
 `LateralTorqueCustom` and `CustomSteer*` are advanced settings that can affect the vehicle tune and safety limits. Do not alter them without a vehicle-specific validated baseline and a recovery path.
+
+<a id="corner-steering-preview"></a>
+#### Corner entry and exit correction — built-in behavior
+
+The former steering experiment's ON behavior is retained as a built-in feature without a separate switch. It applies on `dkcarrot-wip` to the KA4 HDA1 CAN FD stock-radar-SCC, non-longitudinal, alternate-button configuration using torque steering and torque tuning. Angle steering is outside this scope, and the feature operates independently of the SCC experiment setting.
+
+With lateral control active and a laneless path in use, it previews the model path at approximately 14.4–60.1 km/h. It compares bounded increases in the same steering direction during corner entry and hold, and reductions during exit. A correction is applied only when at least three consecutive model inputs maintain the same phase and the candidate reduces predicted tracking error across several response-delay conditions while respecting the near-path error allowance.
+
+Lane changes, driver steering input, stale inputs, or invalid vehicle state withdraw the additional correction. Existing curvature, steering-torque, and rate limits continue to apply. This feature does not control speed or braking.
 
 ### Speed and deceleration — 22 settings
 

@@ -85,6 +85,7 @@ jobs:
             openpilot/selfdrive/carrot/tests/test_dk_diagnosticsd.py \
             openpilot/selfdrive/carrot/tests/test_dk_log_transfer.py \
             openpilot/selfdrive/controls/tests/test_dk_lateral_diagnostics.py \
+            openpilot/selfdrive/controls/tests/test_dk_steering_preview.py \
             openpilot/selfdrive/controls/tests/test_dk_experimental_scc.py \
             openpilot/selfdrive/controls/tests/test_ka4_lateral_sign.py \
             openpilot/selfdrive/carrot/server/tests/test_dk_scc_setting.py \

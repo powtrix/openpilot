@@ -144,6 +144,19 @@ class Controls:
     except Exception:
       pass
 
+    # Normal KA4 steering preview in its original torque/stock-SCC scope.
+    # No user toggle: stale experiment Params and the SCC experiment are independent.
+    self.dk_steering_preview = None
+    try:
+      if (self.dk_ka4_stock_scc_resume_gate and
+          self.CP.steerControlType == car.CarParams.SteerControlType.torque and
+          not self.CP.flags & HyundaiFlags.ANGLE_CONTROL and
+          self.CP.lateralTuning.which() == 'torque'):
+        from openpilot.selfdrive.controls.lib.dk_steering_preview import DkSteeringPreview
+        self.dk_steering_preview = DkSteeringPreview(cloudlog.debug)
+    except Exception:
+      cloudlog.exception("DK steering preview unavailable; retaining legacy control")
+
   def update(self):
     self.sm.update(15)
     if self.sm.updated["liveCalibration"]:
@@ -235,6 +248,10 @@ class Controls:
       alpha = 1 - np.exp(-DT_CTRL / tau) if tau > 0 else 1
       return alpha * val + (1 - alpha) * prev_val
 
+    dk_steering_preview = getattr(self, 'dk_steering_preview', None)
+    # Keep the legacy filter independent of the preview's previous correction.
+    smoothing_previous = (dk_steering_preview.legacy_curvature if dk_steering_preview is not None
+                          else self.desired_curvature)
     if not CC.latActive:
       new_desired_curvature = self.curvature
     elif self.is_vw_meb:
@@ -244,7 +261,7 @@ class Controls:
       if self.lanefull_mode_enabled and len(lat_plan.curvatures) > 0:
         curvature = get_lag_adjusted_curvature(self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
                                                steer_actuator_delay + lat_smooth_seconds, lat_plan.distances)
-        new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
+        new_desired_curvature = smooth_value(curvature, smoothing_previous, lat_smooth_seconds)
       else:
         new_desired_curvature = float(model_v2.action.desiredCurvature)  # raw 모델곡률 (if2 기본과 동일)
     elif self.lanefull_mode_enabled:
@@ -255,9 +272,19 @@ class Controls:
           self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
           steer_actuator_delay + lat_smooth_seconds, lat_plan.distances,
         )
-        new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
+        new_desired_curvature = smooth_value(curvature, smoothing_previous, lat_smooth_seconds)
     else:
-      new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, self.desired_curvature, 0.1)
+      new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, smoothing_previous, 0.1)
+
+    if dk_steering_preview is not None:
+      try:
+        preview_curvature = float(dk_steering_preview.update_from_controls(self, CC, new_desired_curvature, steer_actuator_delay))
+        if not math.isfinite(preview_curvature):
+          raise ValueError("nonfinite steering preview proposal")
+        new_desired_curvature = preview_curvature
+      except Exception:
+        self.dk_steering_preview = None
+        cloudlog.exception("DK steering preview disabled after failure")
 
     dk_previous_desired_curvature = self.desired_curvature  # observation only
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
@@ -510,6 +537,12 @@ class Controls:
     cc_send.valid = CS.canValid
     cc_send.carControl = CC
     self.pm.send('carControl', cc_send)
+
+    if getattr(self, 'dk_steering_preview', None) is not None:
+      try:
+        self.dk_steering_preview.emit(float(CC.actuators.torque), float(self.desired_curvature))
+      except Exception:
+        pass
 
     # Runs after both existing publications; diagnostic state is never an input
     # to the control calculations. The helper bounds logging to at most 10 Hz.
